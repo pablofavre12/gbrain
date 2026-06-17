@@ -32,7 +32,7 @@ import { stripCodeBlocks } from './link-extraction.ts';
 
 /** D2: hardcoded entity types for v1. Pack-aware extension is TODO-1. */
 // TODO: ideally driven by the active schema pack's entity types instead of hardcoded.
-export const LINKABLE_ENTITY_TYPES = ['person', 'company', 'organization', 'organizacion', 'entity', 'establecimiento'] as const;
+export const LINKABLE_ENTITY_TYPES = ['person', 'company', 'organization', 'organizacion', 'entity', 'establecimiento', 'atom'] as const;
 
 /**
  * Minimum title length for gazetteer inclusion. Filters out 2-3 char names

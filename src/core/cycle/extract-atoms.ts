@@ -708,6 +708,23 @@ export async function runPhaseExtractAtoms(
             { sourceId },
           );
           totalAtomsExtracted++;
+          // v0.41-perennia: link the source page to the atom so atoms aren't orphans.
+          if (item.kind === 'page') {
+            try {
+              await engine.addLink(
+                item.slug,
+                slug,
+                atom.source_quote ?? '',
+                'has_atom',
+                'derived',
+                item.slug,
+                'source_slug',
+                { fromSourceId: sourceId, toSourceId: sourceId },
+              );
+            } catch (linkErr) {
+              console.error(`[extract_atoms] addLink failed: ${(linkErr as Error).message}`);
+            }
+          }
         }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
