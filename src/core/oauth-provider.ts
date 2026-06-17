@@ -638,7 +638,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     try {
       oauthRows = await this.sql`
         SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
-               c.source_id, c.federated_read, c.bound_slug_prefixes
+               c.source_id, c.federated_read, c.federated_write, c.bound_slug_prefixes
         FROM oauth_tokens t
         LEFT JOIN oauth_clients c ON c.client_id = t.client_id
         WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
@@ -656,19 +656,20 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // rethrows once the narrowest one still fails. (Branching on the name
       // is what made the first cut of this hard-fail every token
       // verification on a pre-v61 brain.)
-      // Any of the three optional columns may be the missing one, and on the
+      // Any optional column may be the missing one, and on the
       // message-fallback path (drivers that don't surface SQLSTATE) the name
       // is what identifies it — so probe all three at every rung.
       const missingOAuthColumn = (e: unknown): boolean =>
         isUndefinedColumnError(e, 'bound_slug_prefixes') ||
+        isUndefinedColumnError(e, 'federated_write') ||
         isUndefinedColumnError(e, 'federated_read') ||
         isUndefinedColumnError(e, 'source_id');
       if (!missingOAuthColumn(err)) throw err;
       try {
-        // v85 missing: keep source_id + federated_read, drop the fence column.
+        // Drop federated_write first, retaining the older source and fence axes.
         oauthRows = await this.sql`
           SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
-                 c.source_id, c.federated_read
+                 c.source_id, c.federated_read, c.bound_slug_prefixes
           FROM oauth_tokens t
           LEFT JOIN oauth_clients c ON c.client_id = t.client_id
           WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
@@ -676,22 +677,34 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       } catch (err2) {
         if (!missingOAuthColumn(err2)) throw err2;
         try {
-          // v61 missing: source_id only.
+          // Drop the fence column next, retaining source_id + federated_read.
           oauthRows = await this.sql`
-            SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name, c.source_id
+            SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
+                   c.source_id, c.federated_read
             FROM oauth_tokens t
             LEFT JOIN oauth_clients c ON c.client_id = t.client_id
             WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
           `;
         } catch (err3) {
           if (!missingOAuthColumn(err3)) throw err3;
-          // Truly pre-v60: pre-v0.34 projection.
+          // v61 missing: source_id only.
+          try {
           oauthRows = await this.sql`
-            SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
+            SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name, c.source_id
             FROM oauth_tokens t
             LEFT JOIN oauth_clients c ON c.client_id = t.client_id
             WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
           `;
+          } catch (err4) {
+            if (!missingOAuthColumn(err4)) throw err4;
+            // Truly pre-v60: pre-v0.34 projection.
+            oauthRows = await this.sql`
+              SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
+              FROM oauth_tokens t
+              LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+              WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
+            `;
+          }
         }
       }
     }
@@ -744,6 +757,15 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       // restored dump missing one column) where bindings DO exist and every
       // bound client would otherwise be silently unfenced.
       const fenceProjectionDegraded = !('bound_slug_prefixes' in row);
+      // v118: federated_write normalization, same shape as federated_read.
+      // Array (post-v118 brain) → the write-scope set; undefined (pre-v118
+      // projection ran) → column missing on this brain. resolveWriteSource in
+      // operations.ts treats undefined the same as empty: writes stay locked to
+      // sourceId until an operator grants federated_write.
+      const federatedWriteRaw = row.federated_write;
+      const federatedWrite = Array.isArray(federatedWriteRaw)
+        ? (federatedWriteRaw as string[])
+        : undefined;
       return {
         token,
         clientId: row.client_id as string,
@@ -763,6 +785,9 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // operations.ts on every direct slug-mutating write op.
         boundSlugPrefixes,
         ...(fenceProjectionDegraded ? { fenceProjectionDegraded: true } : {}),
+        // v118: federated write scope. resolveWriteSource in operations.ts
+        // authorizes a per-call write target against sourceId ∪ federatedWrite.
+        federatedWrite,
       } as CoreAuthInfo as SdkAuthInfo;
     }
 
@@ -979,6 +1004,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     federatedRead?: string[],
     tokenEndpointAuthMethod?: string,
     agentBindings?: AgentClientBindings,
+    federatedWrite?: string[],
   ): Promise<{ clientId: string; clientSecret?: string }> {
     // v0.28: ALLOWED_SCOPES allowlist. Reject `--scopes "read flying-unicorn"`
     // at registration so meaningless scope strings can't pile up in the DB.
@@ -1024,6 +1050,60 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     //   federated_read = [source_id] when omitted (a non-federated client
     //                    has read scope == write scope, the v0.33 default)
     const federated = federatedRead && federatedRead.length > 0 ? federatedRead : [sourceId];
+    // v118: federated_write is the WRITE-side mirror. Default '{}' (empty) when
+    // omitted — writes locked to source_id, the pre-v118 behavior. UNLIKE
+    // federated_read it does NOT default to [sourceId]: resolveWriteSource
+    // already admits ctx.sourceId, so an empty set is the no-op default.
+    const federatedW = federatedWrite && federatedWrite.length > 0 ? federatedWrite : [];
+    try {
+      if (agentBindings) {
+        await this.sql`
+          INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
+                                      grant_types, scope, token_endpoint_auth_method,
+                                      client_id_issued_at,
+                                      source_id, federated_read, federated_write,
+                                      bound_tools, bound_source_id, bound_brain_id,
+                                      bound_slug_prefixes, bound_max_concurrent, budget_usd_per_day)
+          VALUES (${clientId}, ${secretHash}, ${name},
+                  ${pgArray(redirectUris)}, ${pgArray(grantTypes)}, ${scopes}, ${authMethod}, ${now},
+                  ${sourceId}, ${pgArray(federated)}, ${pgArray(federatedW)},
+                  ${agentBindings.boundTools ? pgArray(agentBindings.boundTools) : null},
+                  ${agentBindings.boundSourceId ?? null}, ${agentBindings.boundBrainId ?? null},
+                  ${agentBindings.boundSlugPrefixes ? pgArray(agentBindings.boundSlugPrefixes) : null},
+                  ${agentBindings.boundMaxConcurrent ?? 1}, ${agentBindings.budgetUsdPerDay ?? null})
+        `;
+      } else {
+        await this.sql`
+          INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
+                                      grant_types, scope, token_endpoint_auth_method,
+                                      client_id_issued_at,
+                                      source_id, federated_read, federated_write)
+          VALUES (${clientId}, ${secretHash}, ${name},
+                  ${pgArray(redirectUris)}, ${pgArray(grantTypes)}, ${scopes}, ${authMethod}, ${now},
+                  ${sourceId}, ${pgArray(federated)}, ${pgArray(federatedW)})
+        `;
+      }
+      return { clientId, clientSecret };
+    } catch (errW) {
+      // Pre-v118 brain: federated_write column missing. Fall back to the
+      // pre-v118 INSERT (source_id + federated_read), which carries its own
+      // cascade for pre-v60/pre-v61 brains. The federated_write grant is
+      // dropped until the operator runs apply-migrations — the client lands
+      // with writes locked to source_id (the safe pre-v118 default).
+      if (agentBindings && (
+        isUndefinedColumnError(errW, 'bound_tools') ||
+        isUndefinedColumnError(errW, 'bound_source_id') ||
+        isUndefinedColumnError(errW, 'bound_brain_id') ||
+        isUndefinedColumnError(errW, 'bound_slug_prefixes') ||
+        isUndefinedColumnError(errW, 'bound_max_concurrent') ||
+        isUndefinedColumnError(errW, 'budget_usd_per_day')
+      )) {
+        throw new Error('register-client --bound-* flags require an up-to-date OAuth schema; run `gbrain apply-migrations --yes` and retry.');
+      }
+      if (!isUndefinedColumnError(errW, 'federated_write')) {
+        throw errW;
+      }
+    }
     try {
       if (agentBindings) {
         await this.sql`

@@ -1076,6 +1076,8 @@ export class PGLiteEngine implements BrainEngine {
           DEFAULT 'default' REFERENCES sources(id) ON DELETE SET NULL;
         ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_read TEXT[]
           NOT NULL DEFAULT '{}';
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_write TEXT[]
+          NOT NULL DEFAULT '{}';
       `);
     }
 
