@@ -2485,15 +2485,24 @@ const add_tag: Operation = {
   params: {
     slug: { type: 'string', required: true },
     tag: { type: 'string', required: true },
+    // Mirrors `put_page.source` (v118): target sala/source to operate on.
+    // Authorized against `{ctx.sourceId} ∪ ctx.auth.federatedWrite` via
+    // resolveWriteSource. Omitted → client's default ctx.sourceId.
+    source: { type: 'string', required: false, description: 'Target source/sala to operate on. Must be the client\'s source_id or one of its federated_write sources. Omit to use the client\'s default source_id.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.slug as string, 'add_tag');
-    if (ctx.dryRun) return { dry_run: true, action: 'add_tag', slug: p.slug, tag: p.tag };
-    // v0.31.8 (D7): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.addTag(p.slug as string, p.tag as string, sourceOpts);
+    // Closes the multi-source gap (v0.31.8 D7 only threaded the scalar default):
+    // a federated-write client whose default source is `directorio` could not
+    // tag a page that lives in `campo`, even when `campo` was in its grant. The
+    // per-call `source` param authorizes through resolveWriteSource — same
+    // semantics as put_page. Runs BEFORE the dry-run short-circuit so preview
+    // calls surface a permission rejection (matches put_page).
+    const sourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    if (ctx.dryRun) return { dry_run: true, action: 'add_tag', slug: p.slug, tag: p.tag, source: sourceId };
+    await ctx.engine.addTag(p.slug as string, p.tag as string, { sourceId });
     return { status: 'ok' };
   },
   cliHints: { name: 'tag', positional: ['slug', 'tag'] },
@@ -2505,14 +2514,15 @@ const remove_tag: Operation = {
   params: {
     slug: { type: 'string', required: true },
     tag: { type: 'string', required: true },
+    source: { type: 'string', required: false, description: 'Target source/sala to operate on. Must be the client\'s source_id or one of its federated_write sources. Omit to use the client\'s default source_id.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.slug as string, 'remove_tag');
-    if (ctx.dryRun) return { dry_run: true, action: 'remove_tag', slug: p.slug, tag: p.tag };
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.removeTag(p.slug as string, p.tag as string, sourceOpts);
+    const sourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    if (ctx.dryRun) return { dry_run: true, action: 'remove_tag', slug: p.slug, tag: p.tag, source: sourceId };
+    await ctx.engine.removeTag(p.slug as string, p.tag as string, { sourceId });
     return { status: 'ok' };
   },
   cliHints: { name: 'untag', positional: ['slug', 'tag'] },
@@ -2559,6 +2569,11 @@ const add_link: Operation = {
     link_type: { type: 'string', description: 'Link type (e.g., invested_in, works_at)' },
     context: { type: 'string', description: 'Context for the link' },
     link_source: { type: 'string', description: "Provenance tag (kebab-case, e.g. 'citation-graph'). Defaults to 'manual'. Reconciliation-managed built-ins (markdown/frontmatter/mentions/wikilink-resolved) are rejected." },
+    // Mirrors `put_page.source` (v118): target sala/source for both endpoints.
+    // Authorized against `{ctx.sourceId} ∪ ctx.auth.federatedWrite` via
+    // resolveWriteSource. Cross-source links (from in A, to in B) remain out
+    // of scope here — use the engine API directly for that edge case.
+    source: { type: 'string', required: false, description: 'Target source/sala the from/to pages live in. Must be the client\'s source_id or one of its federated_write sources. Omit to use the client\'s default source_id.' },
   },
   mutating: true,
   scope: 'write',
@@ -2567,7 +2582,6 @@ const add_link: Operation = {
     // (and renders on) the from page; linking TO a page outside the
     // binding is a reference, not a mutation of the target.
     enforceClientSlugFence(ctx, p.from as string, 'add_link');
-    if (ctx.dryRun) return { dry_run: true, action: 'add_link', from: p.from, to: p.to };
     // v114 (#1941): default omitted provenance to 'manual' (NOT the engine's
     // 'markdown' default) so hand/tool-created CLI edges are honestly manual,
     // and forbid forging the reconciliation-managed built-ins.
@@ -2578,12 +2592,18 @@ const add_link: Operation = {
         `use 'manual' (the default) or a custom kebab tag like 'citation-graph'`,
       );
     }
-    // v0.31.8 (D7): single ctx.sourceId scopes both endpoints + origin. Cross-
-    // source link creation is out of scope for this wave; use the engine API
-    // directly for that edge case.
-    const linkOpts = ctx.sourceId
-      ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId, originSourceId: ctx.sourceId }
-      : undefined;
+    // Closes the multi-source gap left by the v0.31.8 D7 thread-the-default
+    // wave: a federated_write client whose default is `directorio` couldn't
+    // link pages living in `campo`. resolveWriteSource enforces the same
+    // {sourceId ∪ federatedWrite} authorization put_page uses. Runs BEFORE
+    // the dry-run short-circuit so preview surfaces the rejection.
+    const sourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    if (ctx.dryRun) return { dry_run: true, action: 'add_link', from: p.from, to: p.to, source: sourceId };
+    const linkOpts = {
+      fromSourceId: sourceId,
+      toSourceId: sourceId,
+      originSourceId: sourceId,
+    };
     await ctx.engine.addLink( // gbrain-allow-direct-insert: add_link MCP op is the explicit canonical surface for manual link creation; auto-link reconciliation runs separately via auto_link post-hook
       p.from as string, p.to as string,
       (p.context as string) || '', (p.link_type as string) || '',
@@ -2603,15 +2623,15 @@ const remove_link: Operation = {
     to: { type: 'string', required: true },
     link_type: { type: 'string', description: 'Only remove edges of this link type (omit = all types)' },
     link_source: { type: 'string', description: 'Only remove edges of this provenance (e.g. citation-graph); omit = any provenance' },
+    source: { type: 'string', required: false, description: 'Target source/sala the from/to pages live in. Must be the client\'s source_id or one of its federated_write sources. Omit to use the client\'s default source_id.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.from as string, 'remove_link');
-    if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to };
-    const linkOpts = ctx.sourceId
-      ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
-      : undefined;
+    const sourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to, source: sourceId };
+    const linkOpts = { fromSourceId: sourceId, toSourceId: sourceId };
     await ctx.engine.removeLink(
       p.from as string, p.to as string,
       (p.link_type as string) || undefined,

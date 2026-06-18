@@ -636,4 +636,140 @@ describe('v0.31.8 op-handler ctx.sourceId threading', () => {
     const defRd = await engine.getRawData(TAG_SLUG, 'unit-test', { sourceId: 'default' });
     expect(defRd.length).toBe(0);
   });
+
+  // v0.42.46.0 — per-call `source` param on add_link / add_tag / remove_link /
+  // remove_tag. Reproduces the original failure mode: a client whose default
+  // source is `default` (or `directorio` in production) tries to write a link
+  // into pages that live in `testsrc` (or `campo`). Pre-fix this was blocked at
+  // the dispatcher because the op handlers had no way to override `ctx.sourceId`
+  // per call; the user had to mint a separate token for the other sala.
+  describe('v0.42.46.0 per-call source param honors federated_write', () => {
+    const PER_CALL_FROM = 'topics/per-call-from';
+    const PER_CALL_TO = 'topics/per-call-to';
+
+    beforeAll(async () => {
+      // Seed both endpoints in testsrc only (intentionally NOT in default — that
+      // matches the production failure: page only exists in `campo`).
+      await engine.putPage(PER_CALL_FROM, {
+        type: 'concept', title: 'From', compiled_truth: '.',
+      }, { sourceId: 'testsrc' });
+      await engine.putPage(PER_CALL_TO, {
+        type: 'concept', title: 'To', compiled_truth: '.',
+      }, { sourceId: 'testsrc' });
+    });
+
+    function federatedCtx(): OperationContext {
+      // Client default = 'default'; federated_write includes 'testsrc'.
+      // Production equivalent: sourceId='directorio', federatedWrite=['campo'].
+      return makeCtx(engine, {
+        sourceId: 'default',
+        remote: true,
+        auth: {
+          token: 'stub',
+          clientId: 'gbrain_cl_per_call',
+          scopes: ['read', 'write'],
+          sourceId: 'default',
+          federatedWrite: ['testsrc'],
+        },
+      });
+    }
+
+    test('add_link with source=testsrc on a default-default client creates the edge in testsrc', async () => {
+      const op = getOp('add_link');
+      await op.handler(federatedCtx(), {
+        from: PER_CALL_FROM, to: PER_CALL_TO,
+        link_type: 'mentions', context: 'per-call-test',
+        source: 'testsrc',
+      });
+
+      const rows = await engine.executeRaw<{ from_source: string; to_source: string }>(
+        `SELECT f.source_id AS from_source, t.source_id AS to_source
+         FROM links l JOIN pages f ON f.id = l.from_page_id
+                      JOIN pages t ON t.id = l.to_page_id
+         WHERE f.slug = $1 AND t.slug = $2 AND l.link_type = 'mentions'`,
+        [PER_CALL_FROM, PER_CALL_TO],
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].from_source).toBe('testsrc');
+      expect(rows[0].to_source).toBe('testsrc');
+    });
+
+    test('add_link WITHOUT source on a default-default client falls back to ctx.sourceId and fails (pre-fix behavior preserved when source is omitted)', async () => {
+      const op = getOp('add_link');
+      // No `source` arg → resolveWriteSource returns ctx.sourceId ('default').
+      // The pages don't exist in 'default', so the engine throws.
+      const promise = op.handler(federatedCtx(), {
+        from: PER_CALL_FROM, to: PER_CALL_TO, link_type: 'mentions',
+      });
+      await expect(promise).rejects.toThrow(/not found|source=default/);
+    });
+
+    test('add_link with source not in federated_write set is rejected with permission_denied', async () => {
+      const op = getOp('add_link');
+      const promise = op.handler(federatedCtx(), {
+        from: PER_CALL_FROM, to: PER_CALL_TO, source: 'finanzas',
+      });
+      await expect(promise).rejects.toThrow(/federated_write/);
+    });
+
+    test('add_tag with source=testsrc tags the testsrc row even on a default-default client', async () => {
+      const op = getOp('add_tag');
+      await op.handler(federatedCtx(), {
+        slug: PER_CALL_FROM, tag: 'per-call-tag', source: 'testsrc',
+      });
+
+      const rows = await engine.executeRaw<{ source_id: string }>(
+        `SELECT p.source_id FROM tags t JOIN pages p ON p.id = t.page_id
+         WHERE p.slug = $1 AND t.tag = $2`,
+        [PER_CALL_FROM, 'per-call-tag'],
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].source_id).toBe('testsrc');
+    });
+
+    test('remove_tag with source=testsrc removes only the testsrc tag', async () => {
+      // Seed a tag at testsrc.
+      await engine.addTag(PER_CALL_FROM, 'to-remove', { sourceId: 'testsrc' });
+      // Confirm.
+      const before = await engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM tags t JOIN pages p ON p.id = t.page_id
+         WHERE p.slug = $1 AND t.tag = $2 AND p.source_id = 'testsrc'`,
+        [PER_CALL_FROM, 'to-remove'],
+      );
+      expect(before[0].count).toBe('1');
+
+      // Remove with per-call source.
+      const op = getOp('remove_tag');
+      await op.handler(federatedCtx(), {
+        slug: PER_CALL_FROM, tag: 'to-remove', source: 'testsrc',
+      });
+
+      const after = await engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM tags t JOIN pages p ON p.id = t.page_id
+         WHERE p.slug = $1 AND t.tag = $2 AND p.source_id = 'testsrc'`,
+        [PER_CALL_FROM, 'to-remove'],
+      );
+      expect(after[0].count).toBe('0');
+    });
+
+    test('remove_link with source=testsrc removes only the testsrc edge', async () => {
+      // The earlier add_link test seeded an edge in testsrc.
+      const op = getOp('remove_link');
+      await op.handler(federatedCtx(), {
+        from: PER_CALL_FROM, to: PER_CALL_TO,
+        link_type: 'mentions',
+        source: 'testsrc',
+      });
+
+      const rows = await engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+         WHERE f.slug = $1 AND t.slug = $2 AND l.link_type = 'mentions'
+           AND f.source_id = 'testsrc' AND t.source_id = 'testsrc'`,
+        [PER_CALL_FROM, PER_CALL_TO],
+      );
+      expect(rows[0].count).toBe('0');
+    });
+  });
 });
