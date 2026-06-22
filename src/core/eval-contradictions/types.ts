@@ -59,8 +59,9 @@ export type Verdict =
  *
  * - temporal_supersede     → render `gbrain takes supersede ... --since <date>`
  * - flag_for_review        → informational; no CLI command rendered
- * - log_timeline_change    → render a hint pointing at the future
- *                             timeline-writer subcommand (deferred)
+ * - log_timeline_change    → materialized by `gbrain timeline-apply` (op
+ *                             apply_timeline_from_contradictions): writes an
+ *                             idempotent timeline entry for the evolution.
  */
 export type ResolutionKind =
   | 'takes_supersede'

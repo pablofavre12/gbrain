@@ -143,6 +143,7 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'skillopt',                    // v0.42.0.0 — self-evolving skills (default OFF)
   'embed',
   'orphans',
+  'timeline_apply',              // contradiction-probe timeline writer (after orphans)
   'schema-suggest',              // v0.39.0.0 — passive schema-suggest after orphans
   'purge',                       // v0.26.5
 ];

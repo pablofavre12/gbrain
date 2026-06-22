@@ -47,10 +47,9 @@ describe('PHASE_SCOPE coverage', () => {
     // master merge brought in the 17th phase (`schema-suggest`); v0.41
     // adds 'extract_atoms' + 'synthesize_concepts' (T9 lens packs) +
     // 'conversation_facts_backfill' (v0.41.11.0) for 20; v0.41.39 (#1700)
-    // adds 'enrich_thin' and v0.42.0.0 adds 'skillopt' for a total of 22;
-    // #2653 adds 'drift' for 23.
-    expect(ALL_PHASES.length).toBe(23);
-    expect(Object.keys(PHASE_SCOPE).length).toBe(23);
+    // Upstream adds `drift` for 23; the fork adds `timeline_apply` for 24.
+    expect(ALL_PHASES.length).toBe(24);
+    expect(Object.keys(PHASE_SCOPE).length).toBe(24);
   });
 
   test('embed remains global (the headline brain-wide phase)', () => {

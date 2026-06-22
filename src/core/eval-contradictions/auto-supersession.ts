@@ -141,17 +141,19 @@ export function renderResolutionCommand(
         if (olderTakeId !== null) {
           return `gbrain takes supersede ${olderSide.slug} --row ${olderTakeId} --since ${newerDate}`;
         }
-        return `# temporal_supersession: ${olderSide.slug} (${aDate < bDate ? aDate : bDate}) superseded by ${newerDate}`;
+        return `# temporal_supersession: ${olderSide.slug} (${aDate < bDate ? aDate : bDate}) superseded by ${newerDate}; run \`gbrain timeline-apply\` to record it in the timeline`;
       }
       return `# temporal_supersession: ${pair.a.slug} vs ${pair.b.slug} (date order unclear)`;
     }
     case 'log_timeline_change': {
-      // v0.34 / Lane A2: timeline-writer subcommand is deferred (see plan
-      // TODOs). Render a hint pointing at the future command shape so the
-      // operator can paste a follow-up note manually for now.
+      // The timeline writer landed: `gbrain timeline-apply` (op
+      // apply_timeline_from_contradictions) reads this finding from the
+      // persisted probe run and materializes it as an idempotent timeline
+      // entry. The command is brain-wide (applies every temporal finding in
+      // the latest run), so it's rendered as a hint rather than per-pair argv.
       const aDate = pair.a.effective_date ?? '<date-a>';
       const bDate = pair.b.effective_date ?? '<date-b>';
-      return `# temporal_evolution: ${pair.a.slug} (${aDate}) → ${pair.b.slug} (${bDate}); record in timeline when the gbrain timeline writer lands`;
+      return `# temporal_evolution: ${pair.a.slug} (${aDate}) → ${pair.b.slug} (${bDate}); run \`gbrain timeline-apply\` to record it in the timeline`;
     }
     case 'flag_for_review': {
       // v0.34 / Lane A2: informational; covers temporal_regression and

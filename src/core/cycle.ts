@@ -71,6 +71,10 @@ export type CyclePhase =
   // (writes reports/drift-<date>; auto_update mutates nothing).
   | 'drift'
   | 'embed' | 'orphans' | 'purge'
+  // timeline writer: materializes the contradiction probe's temporal findings
+  // (temporal_evolution / temporal_supersession) as idempotent timeline
+  // entries. Cheap + deterministic (no LLM); self-heals timeline_coverage.
+  | 'timeline_apply'
   // v0.39 T12: schema-suggest passive trigger (D3 + D4 plan-eng-review).
   // Wraps runSuggest() — same library the CLI verb + EIIRP call.
   | 'schema-suggest'
@@ -183,6 +187,12 @@ export const ALL_PHASES: CyclePhase[] = [
   'skillopt',
   'embed',
   'orphans',
+  // timeline writer: materialize the contradiction probe's temporal findings
+  // as idempotent timeline entries. Cheap + deterministic (no LLM). Position
+  // MUST match the dispatch block in runCycle — pinned by the
+  // `report.phases.map(p => p.phase)).toEqual(ALL_PHASES)` assertion in
+  // test/core/cycle.serial.test.ts.
+  'timeline_apply',
   // v0.39 T12: passive schema-suggest. Runs LATE so post-sync brain state
   // is settled; thin wrapper around runSuggest() library. Cheap (heuristic
   // by default; LLM only when chat provider configured).
@@ -236,6 +246,7 @@ export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
   drift: 'global',
   embed: 'global',
   orphans: 'global',
+  timeline_apply: 'global',
   purge: 'global',
   'schema-suggest': 'source',
   // v0.41 T9 — extract_atoms is naturally per-source (each source's
@@ -319,6 +330,8 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   // entry covers the cycle-level coordination.
   'skillopt',
   'embed',
+  // timeline writer: inserts timeline_entries rows; coordinate via cycle lock.
+  'timeline_apply',
   'purge',
 ]);
 
@@ -2434,6 +2447,37 @@ export async function runCycle(
       } else {
         progress.start('cycle.orphans');
         const { result, duration_ms } = await timePhase(() => runPhaseOrphans(engine, orphansSourceId));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── timeline_apply ──────────────────────────────────────────
+    // Materialize the contradiction probe's temporal findings as idempotent
+    // timeline entries. Cheap + deterministic (no LLM); no-ops when there's no
+    // probe run to read. Self-heals timeline_coverage over successive cycles.
+    if (phases.includes('timeline_apply')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'timeline_apply',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.timeline_apply');
+        const { runPhaseTimelineApply } = await import('./cycle/timeline-apply.ts');
+        const { result, duration_ms } = await timePhase(() =>
+          runPhaseTimelineApply(engine, {
+            dryRun,
+            ...(cycleSourceId ? { sourceId: cycleSourceId } : {}),
+            ...(opts.signal ? { signal: opts.signal } : {}),
+          }),
+        );
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();

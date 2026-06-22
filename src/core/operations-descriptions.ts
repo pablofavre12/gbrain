@@ -106,6 +106,20 @@ export const FIND_CONTRADICTIONS_DESCRIPTION =
   "Reads the cached run row — does NOT trigger a new probe; users run " +
   "`gbrain eval suspected-contradictions` for that.";
 
+export const APPLY_TIMELINE_FROM_CONTRADICTIONS_DESCRIPTION =
+  "Materialize the temporal findings from the most recent " +
+  "`gbrain eval suspected-contradictions` probe run as timeline entries. For each " +
+  "temporal_evolution / temporal_supersession finding it writes one idempotent " +
+  "row onto the later-dated (current-state) page, dated at the change point. This " +
+  "is the writer the probe's `log_timeline_change` resolution hints point at. Use " +
+  "when the user asks to 'record the temporal changes in the timeline', 'apply the " +
+  "contradiction probe's timeline suggestions', or wants to raise timeline " +
+  "coverage from detected evolutions. Idempotent: re-runs are no-ops via the " +
+  "(page_id, date, summary, source) dedup key. Reads the cached run row — does NOT " +
+  "trigger a new probe. Returns " +
+  "{run_id, ran_at, considered, skipped_no_date, skipped_no_slug, created, " +
+  "entries, no_run, dry_run}.";
+
 export const FIND_TRAJECTORY_DESCRIPTION =
   "v0.35.4 — return the chronological claim trajectory for an entity (typed " +
   "metric values over time, plus auto-detected regressions and narrative drift). " +
