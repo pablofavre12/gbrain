@@ -1,0 +1,118 @@
+# Upstream sync — keep the perennia fork current with garrytan/gbrain.
+#
+# Frequent small merges beat a yearly big-bang merge. This workflow attempts a
+# merge of upstream `master` into a fresh branch off `perennia` on a schedule
+# (and on demand), runs typecheck + the unit suite, and opens a PR for human
+# review — or opens an issue when the merge conflicts. See FORK.md for the
+# manual process and the migration-band rule this protects.
+name: upstream-sync
+
+on:
+  schedule:
+    # Mondays 09:00 UTC. Cheap, frequent cadence so drift stays small.
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {}
+
+# Never let two sync runs race on the same branch namespace.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write       # push the sync branch
+  pull-requests: write  # open the sync PR
+  issues: write         # open a conflict issue
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: https://github.com/garrytan/gbrain.git
+      BASE_BRANCH: perennia
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: perennia
+          fetch-depth: 0  # full history so the merge has the real base
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+
+      - name: Configure git
+        run: |
+          git config user.name  "perennia-upstream-sync[bot]"
+          git config user.email "noreply@perennia-regen.dev"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL" || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch upstream master --no-tags
+
+      - name: Short-circuit if already up to date
+        id: ahead
+        run: |
+          behind=$(git rev-list --count HEAD..upstream/master)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" = "0" ]; then
+            echo "Fork is already current with upstream/master. Nothing to do."
+          else
+            echo "Fork is $behind commit(s) behind upstream/master."
+          fi
+
+      - name: Attempt merge
+        if: steps.ahead.outputs.behind != '0'
+        id: merge
+        run: |
+          DATE=$(date +%Y%m%d)
+          BRANCH="sync/upstream-$DATE"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git switch -c "$BRANCH"
+          if git merge --no-edit upstream/master; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            # Capture conflicting paths, then abort so the tree is clean.
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
+            git merge --abort || true
+          fi
+
+      - name: Open conflict issue
+        if: steps.merge.outputs.conflict == 'true'
+        run: |
+          BODY=$(printf 'Automated upstream sync hit merge conflicts merging `upstream/master` into `%s`.\n\nConflicting files:\n\n```\n%s\n```\n\nResolve manually — see FORK.md "Sync process" and the migration-band rule:\n\n```bash\ngit fetch origin\ngit switch -c sync/upstream-manual %s\ngit merge origin/master\n```\n' "$BASE_BRANCH" "$(cat /tmp/conflicts.txt)" "$BASE_BRANCH")
+          # Try with the label; if it doesn't exist, retry without it.
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Upstream sync conflict $(date +%Y-%m-%d)" \
+            --body "$BODY" --label "upstream-sync" \
+          || gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "Upstream sync conflict $(date +%Y-%m-%d)" \
+            --body "$BODY"
+
+      - name: Install, typecheck, test (clean merge)
+        if: steps.merge.outputs.conflict == 'false'
+        id: verify
+        continue-on-error: true
+        run: |
+          bun install --frozen-lockfile || bun install
+          bun run typecheck
+          bun run test
+
+      - name: Push branch and open PR (clean merge)
+        if: steps.merge.outputs.conflict == 'false'
+        run: |
+          BRANCH="${{ steps.merge.outputs.branch }}"
+          # In CI, `origin` is this repo (the fork). The checkout token has
+          # contents:write, so this pushes the sync branch back to the fork.
+          git push origin "$BRANCH"
+          if [ "${{ steps.verify.outcome }}" = "success" ]; then
+            STATUS="✅ typecheck + unit suite passed in CI."
+          else
+            STATUS="⚠️ typecheck or unit suite FAILED in the sync job — review before merge."
+          fi
+          BODY=$(printf 'Automated upstream sync: merges `upstream/master` (garrytan/gbrain) into `%s`.\n\n%s\n\nReview against FORK.md:\n- migration band intact (`test/migration-fork-band.test.ts`)\n- conflict hotspots (operations.ts, engines, oauth) resolved sanely\n- no upstream migration silently shadowed\n\n%s commit(s) of upstream picked up.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$BASE_BRANCH" "$STATUS" "${{ steps.ahead.outputs.behind }}")
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH" \
+            --title "Upstream sync $(date +%Y-%m-%d)" \
+            --body "$BODY" || echo "PR may already exist for $BRANCH"
