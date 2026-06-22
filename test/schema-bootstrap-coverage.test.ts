@@ -872,6 +872,19 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   'minion_jobs.budget_remaining_cents',
   'minion_jobs.budget_owner_job_id',
   'minion_jobs.budget_root_owner_id',
+  // [fork] migration v9002 (write_attribution_columns) — author attribution.
+  // Same precedent as pages.source_path / pages.chunker_version above:
+  // column-only additions with NO forward-reference index in PGLITE_SCHEMA_SQL
+  // and no downstream filter that breaks on old brains (rowToPage reads them
+  // three-state; the digest tolerates NULL). The migration handles every path
+  // via ADD COLUMN IF NOT EXISTS (fresh: schema blob then migration; old brain:
+  // ALTER adds; already-migrated: no-op). A bootstrap probe would be pure
+  // overhead. Unlike oauth_clients.federated_write (which has a GIN index and
+  // therefore DOES need bootstrap), nothing forward-references these.
+  'pages.last_write_client_id',
+  'pages.last_write_client_name',
+  'ingest_log.last_write_client_id',
+  'ingest_log.last_write_client_name',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {
