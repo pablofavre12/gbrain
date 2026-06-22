@@ -310,6 +310,15 @@ export async function importFromContent(
     source_uri?: string | null;
     ingested_via?: string | null;
     /**
+     * Author attribution (migration v9002). The writer's server-resolved OAuth
+     * identity, threaded by the put_page op handler from `OperationContext.auth`.
+     * NULL for identity-less callers (sync, import CLI). The engine's putPage
+     * applies COALESCE-preserve UPDATE so an identity-less re-write keeps the
+     * prior author rather than blanking it.
+     */
+    last_write_client_id?: string | null;
+    last_write_client_name?: string | null;
+    /**
      * v0.42 (#1699 trust boundary). When `true` (untrusted caller — remote MCP
      * put_page), gate-owned frontmatter markers (`quarantine`, `content_flag`,
      * `embed_skip`) are STRIPPED from the incoming content before the content-
@@ -865,6 +874,11 @@ export async function importFromContent(
       ingested_via: opts.ingested_via ?? null,
       // ingested_at is server-stamped at the engine layer when any
       // provenance write fires; never client-controlled.
+      // Author attribution (migration v9002). Resolved from OperationContext.auth
+      // by the put_page op handler; NULL for identity-less callers (sync,
+      // import CLI). Engine applies COALESCE-preserve UPDATE.
+      last_write_client_id: opts.last_write_client_id ?? null,
+      last_write_client_name: opts.last_write_client_name ?? null,
     }, txOpts);
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside

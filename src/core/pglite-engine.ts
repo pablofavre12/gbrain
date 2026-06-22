@@ -1344,9 +1344,14 @@ export class PGLiteEngine implements BrainEngine {
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date().toISOString() : null;
+    // Author attribution (migration v9002). COALESCE-preserve UPDATE so an
+    // identity-less write (NULL — local CLI / sync / migrations) keeps the
+    // prior author. Mirrors postgres-engine.ts.
+    const lastWriteClientId = page.last_write_client_id ?? null;
+    const lastWriteClientName = page.last_write_client_name ?? null;
     const { rows } = await this.db.query(
-      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, ${MARKDOWN_CHUNKER_VERSION}), $14, $15, $16, $17, $18::timestamptz)
+      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at, last_write_client_id, last_write_client_name)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, ${MARKDOWN_CHUNKER_VERSION}), $14, $15, $16, $17, $18::timestamptz, $19, $20)
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          page_kind = EXCLUDED.page_kind,
@@ -1356,18 +1361,20 @@ export class PGLiteEngine implements BrainEngine {
          frontmatter = EXCLUDED.frontmatter,
          content_hash = EXCLUDED.content_hash,
          updated_at = now(),
-         deleted_at = NULL,
-         effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
-         effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
-         import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
-         chunker_version       = COALESCE(EXCLUDED.chunker_version,       pages.chunker_version),
-         source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
-         source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
-         source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
-         ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
-         ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
-       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
-      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt]
+          deleted_at = NULL,
+         effective_date         = COALESCE(EXCLUDED.effective_date,         pages.effective_date),
+         effective_date_source  = COALESCE(EXCLUDED.effective_date_source,  pages.effective_date_source),
+         import_filename        = COALESCE(EXCLUDED.import_filename,        pages.import_filename),
+         chunker_version        = COALESCE(EXCLUDED.chunker_version,        pages.chunker_version),
+         source_path            = COALESCE(EXCLUDED.source_path,            pages.source_path),
+         source_kind            = COALESCE(EXCLUDED.source_kind,            pages.source_kind),
+         source_uri             = COALESCE(EXCLUDED.source_uri,             pages.source_uri),
+         ingested_via           = COALESCE(EXCLUDED.ingested_via,           pages.ingested_via),
+         ingested_at            = COALESCE(EXCLUDED.ingested_at,            pages.ingested_at),
+         last_write_client_id   = COALESCE(EXCLUDED.last_write_client_id,   pages.last_write_client_id),
+         last_write_client_name = COALESCE(EXCLUDED.last_write_client_name, pages.last_write_client_name)
+       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at, last_write_client_id, last_write_client_name`,
+       [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, lastWriteClientId, lastWriteClientName]
     );
     // PGLite can return zero rows from INSERT ... ON CONFLICT DO UPDATE ...
     // RETURNING in no-op/trigger edge cases, which made rowToPage(undefined)
@@ -5818,10 +5825,14 @@ export class PGLiteEngine implements BrainEngine {
     // v0.31.2 (codex P1 #3): source_id threaded so multi-source brains can
     // scope ingest_log queries. Default 'default' matches the column DEFAULT.
     const sourceId = entry.source_id ?? 'default';
+    // Author attribution (migration v9002). Append-only log: each row records
+    // the writer's identity at insert time (NULL for identity-less callers).
+    const lastWriteClientId = entry.last_write_client_id ?? null;
+    const lastWriteClientName = entry.last_write_client_name ?? null;
     await this.db.query(
-      `INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary)
-       VALUES ($1, $2, $3, $4::jsonb, $5)`,
-      [sourceId, entry.source_type, entry.source_ref, JSON.stringify(entry.pages_updated), entry.summary]
+      `INSERT INTO ingest_log (source_id, source_type, source_ref, pages_updated, summary, last_write_client_id, last_write_client_name)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+      [sourceId, entry.source_type, entry.source_ref, JSON.stringify(entry.pages_updated), entry.summary, lastWriteClientId, lastWriteClientName]
     );
   }
 

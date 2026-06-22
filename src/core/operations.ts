@@ -1388,6 +1388,14 @@ const put_page: Operation = {
       source_kind: provenanceKind,
       source_uri: provenanceUri,
       ingested_via: provenanceVia,
+      // Author attribution (migration v9002). The writer's identity comes from
+      // the SERVER-RESOLVED OAuth context (ctx.auth, set at token-verification
+      // time), NOT from any wire param — so it can't be spoofed and is safe to
+      // stamp for remote callers (unlike provenance). NULL when the caller
+      // carries no identity (local CLI, sync). The engine COALESCE-preserves
+      // so an identity-less re-write keeps the prior author.
+      last_write_client_id: ctx.auth?.clientId ?? null,
+      last_write_client_name: ctx.auth?.clientName ?? null,
     });
 
     // The dedup pre-check in importFromContent can resolve the write to a
@@ -3367,6 +3375,10 @@ const log_ingest: Operation = {
       source_ref: p.source_ref as string,
       pages_updated: p.pages_updated as string[],
       summary: p.summary as string,
+      // Author attribution (migration v9002). Server-resolved OAuth identity from
+      // ctx.auth (never a wire param); NULL for identity-less callers.
+      last_write_client_id: ctx.auth?.clientId ?? null,
+      last_write_client_name: ctx.auth?.clientName ?? null,
     });
     return { status: 'ok' };
   },

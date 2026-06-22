@@ -158,6 +158,16 @@ export interface Page {
   ingested_via?: string | null;
   /** Server-stamped first-write audit timestamp; CV12 COALESCE-preserved across edits. */
   ingested_at?: Date | null;
+  // Author attribution (migration v9002). Server-resolved OAuth identity of the
+  // last write that carried one — `oauth_clients.client_id` / `client_name`,
+  // threaded from `OperationContext.auth`, never client-supplied. NULL on
+  // identity-less writes (local CLI, sync, migrations). Three-state read like
+  // the provenance columns above: undefined when the SELECT projection omits
+  // the column, null when the column is NULL, populated when a writer stamped it.
+  /** OAuth client_id of the last identity-carrying writer. */
+  last_write_client_id?: string | null;
+  /** Human-readable agent name of the last identity-carrying writer. */
+  last_write_client_name?: string | null;
   /**
    * v0.40.3.0 (renumbered from v0.40.3.0 v81 to v90 on master merge):
    * which contextual retrieval tier the page was last embedded under. One
@@ -284,6 +294,17 @@ export interface PageInput {
    * NULL on historical rows that pre-date v0.38.
    */
   ingested_at?: Date | null;
+
+  // Author attribution (migration v9002). The writer's server-resolved OAuth
+  // identity, threaded by the put_page op handler from `OperationContext.auth`
+  // (NEVER a wire param — can't be spoofed). NULL when the caller carries no
+  // identity (local CLI, sync, migrations). The engine's putPage UPDATE is
+  // COALESCE-preserve: a NULL here keeps the prior author, so an identity-less
+  // edit doesn't erase who authored the page.
+  /** OAuth client_id of the writer; NULL for identity-less callers. */
+  last_write_client_id?: string | null;
+  /** Human-readable agent name of the writer; NULL for identity-less callers. */
+  last_write_client_name?: string | null;
 }
 
 export interface PageFilters {
@@ -1552,6 +1573,11 @@ export interface IngestLogEntry {
   pages_updated: string[];
   summary: string;
   created_at: Date;
+  // Author attribution (migration v9002). OAuth identity of the caller that
+  // logged the event; NULL for identity-less callers (sync, import CLI).
+  // Three-state read: undefined when the SELECT omits the column.
+  last_write_client_id?: string | null;
+  last_write_client_name?: string | null;
 }
 
 export interface IngestLogInput {
@@ -1561,6 +1587,10 @@ export interface IngestLogInput {
   source_ref: string;
   pages_updated: string[];
   summary: string;
+  // Author attribution (migration v9002). Threaded by the log_ingest op handler
+  // from `OperationContext.auth`. NULL for identity-less callers.
+  last_write_client_id?: string | null;
+  last_write_client_name?: string | null;
 }
 
 // Eval capture (v0.25.0)

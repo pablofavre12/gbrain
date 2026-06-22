@@ -116,6 +116,11 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const contextualRetrievalMode = row.contextual_retrieval_mode === undefined
     ? undefined
     : (row.contextual_retrieval_mode as Page['contextual_retrieval_mode']);
+  // Author attribution (migration v9002). Three-state read mirrors provenance:
+  // absent SELECT projections compile unchanged (undefined), NULL columns map
+  // to null, populated columns carry the writer identity.
+  const lastWriteClientId = row.last_write_client_id === undefined ? undefined : (row.last_write_client_id as string | null);
+  const lastWriteClientName = row.last_write_client_name === undefined ? undefined : (row.last_write_client_name as string | null);
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -142,6 +147,9 @@ export function rowToPage(row: Record<string, unknown>): Page {
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
     ...(contextualRetrievalMode !== undefined && { contextual_retrieval_mode: contextualRetrievalMode }),
+    // Author attribution (migration v9002). Optional in SELECT projection.
+    ...(lastWriteClientId !== undefined && { last_write_client_id: lastWriteClientId }),
+    ...(lastWriteClientName !== undefined && { last_write_client_name: lastWriteClientName }),
     // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
     // can thread it through getChunks / upsertChunks without defaulting to 'default'.
     // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now
