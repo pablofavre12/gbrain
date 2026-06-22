@@ -227,6 +227,78 @@ describe('PGLiteEngine: Pages', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────
+// getPageLayers (v119) — multi-source "union of layers" read.
+// Exercises the real SQL array_position ordering + scope filter that the
+// get_page op relies on. Conceptual ladder: campo < backoffice < directorio.
+// ─────────────────────────────────────────────────────────────────
+describe('PGLiteEngine: getPageLayers (v119)', () => {
+  beforeEach(truncateAll);
+
+  // Register the three salas (FK pages.source_id → sources.id), then seed the
+  // same slug in each (insert order deliberately scrambled to prove ordering
+  // comes from the query, not insertion).
+  async function seedThreeLayers() {
+    for (const id of ['campo', 'backoffice', 'directorio']) {
+      await (engine as any).db.query(
+        `INSERT INTO sources (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`,
+        [id],
+      );
+    }
+    await engine.putPage('personas/x', { ...testPage, title: 'directorio layer' }, { sourceId: 'directorio' });
+    await engine.putPage('personas/x', { ...testPage, title: 'campo layer' }, { sourceId: 'campo' });
+    await engine.putPage('personas/x', { ...testPage, title: 'backoffice layer' }, { sourceId: 'backoffice' });
+  }
+
+  test('returns every readable layer ordered by the sourceIds scope array (public→restricted)', async () => {
+    await seedThreeLayers();
+    const layers = await engine.getPageLayers('personas/x', {
+      sourceIds: ['campo', 'backoffice', 'directorio'],
+    });
+    expect(layers.map((l) => l.source_id)).toEqual(['campo', 'backoffice', 'directorio']);
+    expect(layers.map((l) => l.title)).toEqual(['campo layer', 'backoffice layer', 'directorio layer']);
+  });
+
+  test('scope filter drops layers outside the grant', async () => {
+    await seedThreeLayers();
+    const layers = await engine.getPageLayers('personas/x', {
+      sourceIds: ['campo', 'directorio'], // backoffice NOT granted
+    });
+    expect(layers.map((l) => l.source_id)).toEqual(['campo', 'directorio']);
+  });
+
+  test('a different scope ORDER reorders the layers deterministically', async () => {
+    await seedThreeLayers();
+    const layers = await engine.getPageLayers('personas/x', {
+      sourceIds: ['directorio', 'campo', 'backoffice'],
+    });
+    expect(layers.map((l) => l.source_id)).toEqual(['directorio', 'campo', 'backoffice']);
+  });
+
+  test('no sourceIds → all layers, alphabetical source_id tiebreak', async () => {
+    await seedThreeLayers();
+    const layers = await engine.getPageLayers('personas/x');
+    expect(layers.map((l) => l.source_id)).toEqual(['backoffice', 'campo', 'directorio']);
+  });
+
+  test('soft-deleted layers hidden by default, surfaced with includeDeleted', async () => {
+    await seedThreeLayers();
+    await engine.softDeletePage('personas/x', { sourceId: 'campo' });
+    const live = await engine.getPageLayers('personas/x', { sourceIds: ['campo', 'directorio'] });
+    expect(live.map((l) => l.source_id)).toEqual(['directorio']);
+    const all = await engine.getPageLayers('personas/x', {
+      sourceIds: ['campo', 'directorio'],
+      includeDeleted: true,
+    });
+    expect(all.map((l) => l.source_id)).toEqual(['campo', 'directorio']);
+    expect(all.find((l) => l.source_id === 'campo')?.deleted_at).toBeTruthy();
+  });
+
+  test('unknown slug → empty array', async () => {
+    expect(await engine.getPageLayers('personas/nope', { sourceIds: ['campo'] })).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
 // Search (tsvector triggers + FTS)
 // ─────────────────────────────────────────────────────────────────
 describe('PGLiteEngine: Search', () => {

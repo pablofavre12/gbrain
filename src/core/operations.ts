@@ -1081,9 +1081,10 @@ export interface Operation {
 
 const get_page: Operation = {
   name: 'get_page',
-  description: 'Read a page by slug (supports optional fuzzy matching). Soft-deleted pages are hidden by default; pass include_deleted: true to surface them with deleted_at populated (see v0.26.5 recovery window).',
+  description: 'Read a page by slug (supports optional fuzzy matching). v119 multi-source: the same slug can exist as several "layers" in different salas/sources (e.g. a base layer in `campo` and a confidential layer in `directorio`). Pass `source` to read ONE specific layer (must be within your readable scope, else forbidden). Omit `source` to read the UNION of every layer you can read, ordered most-public → most-restricted: returns the single page when only one layer exists (backward-compatible shape) or {slug, multi_source: true, layers: [...]} when more than one. Soft-deleted pages are hidden by default; pass include_deleted: true to surface them with deleted_at populated (see v0.26.5 recovery window).',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
+    source: { type: 'string', description: 'v119: read only this source/sala layer of the slug. Must be within your readable scope (your source_id or one of your federated read sources), else forbidden_source. Omit to read the union of all readable layers.' },
     fuzzy: { type: 'boolean', description: 'Enable fuzzy slug resolution (default: false)' },
     include_deleted: { type: 'boolean', description: 'v0.26.5: surface soft-deleted pages with deleted_at populated (default: false). Used by restore workflows.' },
   },
@@ -1091,6 +1092,7 @@ const get_page: Operation = {
     const slug = p.slug as string;
     const fuzzy = (p.fuzzy as boolean) || false;
     const includeDeleted = (p.include_deleted as boolean) === true;
+    const requestedSource = typeof p.source === 'string' ? (p.source as string) : undefined;
     // #1393: route BOTH the exact-match read and the fuzzy resolveSlugs through
     // the canonical precedence ladder (federated array > scalar > nothing). The
     // exact path previously used scalar `ctx.sourceId` only, so a remote client
@@ -1102,36 +1104,6 @@ const get_page: Operation = {
     const sourceOpts = federatedSearchScope(ctx);
     const fuzzyScope = sourceOpts;
 
-    let page = await ctx.engine.getPage(slug, { includeDeleted, ...sourceOpts });
-    let resolved_slug: string | undefined;
-
-    if (!page && fuzzy) {
-      const candidates = await ctx.engine.resolveSlugs(slug, fuzzyScope);
-      if (candidates.length === 1) {
-        page = await ctx.engine.getPage(candidates[0], { includeDeleted, ...sourceOpts });
-        resolved_slug = candidates[0];
-      } else if (candidates.length > 1) {
-        return { error: 'ambiguous_slug', candidates };
-      }
-    }
-
-    if (!page) {
-      throw new OperationError('page_not_found', `Page not found: ${slug}`, includeDeleted ? 'Check the slug or use fuzzy: true' : 'Page may be soft-deleted; pass include_deleted: true to verify');
-    }
-
-    // v0.37.0 (D11): op-layer write-back for the `last_retrieved_at` stale
-    // signal. Fire-and-forget — caller does NOT await. Internal callers
-    // (sync, migrations, dream cycle) bypass this op handler so the signal
-    // stays clean. Throttled to ~1 write / 5 min per page via the SQL clause
-    // inside bumpLastRetrievedAt (D2).
-    bumpLastRetrievedAt(ctx.engine, [page.id]);
-
-    // #2200: resolve tags against the concrete page's source. `sourceOpts` may
-    // be { sourceIds:[...] } (federated) with no scalar sourceId, which getTags
-    // would otherwise fall back to 'default' for — the wrong source for a
-    // non-default page. We already hold the resolved page, so its source is
-    // unambiguous.
-    const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
     // Privacy boundary for the per-token allow-list (v0.28.6 for takes,
     // v0.32.2 for facts).
     //
@@ -1141,41 +1113,133 @@ const get_page: Operation = {
     // remote MCP caller could otherwise call `get_page <slug>` and
     // recover every fence row verbatim.
     //
-    // v0.32.2 (Codex R2-#5): the strip trigger is now `ctx.remote === true`
+    // v0.32.2 (Codex R2-#5): the strip trigger is `ctx.remote === true`
     // rather than the takes-holders-allow-list flag (which subagent paths
     // didn't set, leaving a pre-existing privacy hole). Subagent + remote
     // MCP + scope-restricted-token callers all get the strip; local CLI
-    // (`ctx.remote === false`) sees the full fence. Closes the
-    // pre-existing takes hole as a bonus.
+    // (`ctx.remote === false`) sees the full fence.
+    //
+    // v119: extracted into a closure so the single-page path AND every
+    // union layer apply the IDENTICAL strip — a layer must never leak a
+    // fence the single read would have stripped.
     //
     // Both fences are stripped:
-    //  - stripTakesFence: drops the entire takes table for untrusted
-    //    readers (per-token holder allow-list is the row-level surface
-    //    for trusted callers).
+    //  - stripTakesFence: drops the entire takes table for untrusted readers.
     //  - stripFactsFence({keepVisibility: ['world']}): keeps world rows,
-    //    drops private. World facts are public knowledge by definition;
-    //    untrusted readers see them. Private facts never cross the boundary.
+    //    drops private. World facts are public; private never crosses.
     const isUntrustedReader = ctx.remote === true;
-    const visibleBody = isUntrustedReader
-      ? {
-          ...page,
-          compiled_truth: stripFactsFence(
-            stripTakesFence(page.compiled_truth),
-            { keepVisibility: ['world'] },
-          ),
+    const stripBody = (body: string): string =>
+      isUntrustedReader
+        ? stripFactsFence(stripTakesFence(body), { keepVisibility: ['world'] })
+        : body;
+
+    // ── Explicit `source` → read exactly that ONE layer (scope-checked) ──
+    // resolveRequestedScope is the canonical fail-closed gate: a remote caller
+    // whose federated grant does not include `source` gets permission_denied;
+    // otherwise it returns { sourceId: source }. We surface it as
+    // `forbidden_source` for a clearer signal on this read path.
+    if (requestedSource !== undefined) {
+      let scoped: { sourceId?: string; sourceIds?: string[] };
+      try {
+        scoped = resolveRequestedScope(ctx, requestedSource, false);
+      } catch (err) {
+        if (err instanceof OperationError && err.code === 'permission_denied') {
+          throw new OperationError(
+            'forbidden_source',
+            `Source '${requestedSource}' is outside your readable scope`,
+            'Omit `source` to read every layer within your grant, or request access to this source.',
+          );
         }
-      : page;
-    // v0.42 (#1699) agent-warning channel: surface the page's content_flag
-    // marker as a top-level field (parallel to SearchResult.content_flag) so
-    // an agent reading a page directly gets the same "this looks odd, examine
-    // it" signal it would get from search. The marker is also in frontmatter;
-    // this is the clean, documented accessor.
-    const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
+        throw err;
+      }
+      const page = await ctx.engine.getPage(slug, { includeDeleted, ...scoped });
+      if (!page) {
+        throw new OperationError('page_not_found', `Page not found: ${slug} (source=${requestedSource})`, includeDeleted ? 'Check the slug/source or omit source to scan all layers' : 'Page may be soft-deleted; pass include_deleted: true to verify');
+      }
+      bumpLastRetrievedAt(ctx.engine, [page.id]);
+      const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
+      const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
+      return {
+        ...page,
+        compiled_truth: stripBody(page.compiled_truth),
+        tags,
+        ...(content_flag ? { content_flag } : {}),
+      };
+    }
+
+    // ── No `source` → union of every readable layer ──
+    // The readable source list is the caller's grant, already ordered by scope
+    // (federated array > scalar > unscoped). Passing it as sourceIds lets the
+    // engine both filter AND order most-public → most-restricted.
+    const readableSources = sourceOpts.sourceIds
+      ?? (sourceOpts.sourceId ? [sourceOpts.sourceId] : undefined);
+    const layerOpts = { sourceIds: readableSources, includeDeleted };
+
+    let layers = await ctx.engine.getPageLayers(slug, layerOpts);
+    let resolved_slug: string | undefined;
+
+    if (layers.length === 0 && fuzzy) {
+      const candidates = await ctx.engine.resolveSlugs(slug, fuzzyScope);
+      if (candidates.length === 1) {
+        layers = await ctx.engine.getPageLayers(candidates[0], layerOpts);
+        resolved_slug = candidates[0];
+      } else if (candidates.length > 1) {
+        return { error: 'ambiguous_slug', candidates };
+      }
+    }
+
+    if (layers.length === 0) {
+      throw new OperationError('page_not_found', `Page not found: ${slug}`, includeDeleted ? 'Check the slug or use fuzzy: true' : 'Page may be soft-deleted; pass include_deleted: true to verify');
+    }
+
+    // v0.37.0 (D11): op-layer write-back for the `last_retrieved_at` stale
+    // signal. Fire-and-forget — caller does NOT await. v119: bump EVERY layer
+    // surfaced, not just the first. Throttled to ~1 write / 5 min per page
+    // inside bumpLastRetrievedAt (D2).
+    bumpLastRetrievedAt(ctx.engine, layers.map((l) => l.id));
+
+    // Single layer → preserve the pre-v119 shape exactly (backward-compatible:
+    // existing callers that expect a flat page object keep working).
+    if (layers.length === 1) {
+      const page = layers[0];
+      const tags = await ctx.engine.getTags(page.slug, sourceOpts);
+      // v0.42 (#1699) agent-warning channel: surface the page's content_flag
+      // marker as a top-level field (parallel to SearchResult.content_flag).
+      const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
+      return {
+        ...page,
+        compiled_truth: stripBody(page.compiled_truth),
+        tags,
+        ...(resolved_slug ? { resolved_slug } : {}),
+        ...(content_flag ? { content_flag } : {}),
+      };
+    }
+
+    // Multiple layers → multi-source envelope. Tags are fetched PER LAYER with
+    // that layer's own source_id (getTags defaults to 'default' when source is
+    // omitted, so a per-layer source_id is mandatory here). Each layer's body
+    // gets the same untrusted-reader strip as the single-page path.
+    const builtLayers = await Promise.all(
+      layers.map(async (page) => {
+        const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
+        const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
+        return {
+          source_id: page.source_id,
+          title: page.title,
+          type: page.type,
+          compiled_truth: stripBody(page.compiled_truth),
+          tags,
+          frontmatter: page.frontmatter,
+          ...(page.deleted_at ? { deleted_at: page.deleted_at } : {}),
+          ...(content_flag ? { content_flag } : {}),
+        };
+      }),
+    );
     return {
-      ...visibleBody,
-      tags,
+      slug: layers[0].slug,
+      multi_source: true,
+      layers: builtLayers,
       ...(resolved_slug ? { resolved_slug } : {}),
-      ...(content_flag ? { content_flag } : {}),
     };
   },
   scope: 'read',

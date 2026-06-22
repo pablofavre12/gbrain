@@ -1105,6 +1105,44 @@ export class PostgresEngine implements BrainEngine {
   }
 
   /**
+   * v119 — multi-source layer read. See `BrainEngine.getPageLayers`.
+   *
+   * Returns every live row sharing `slug` within the caller's readable
+   * sources, ordered most-public → most-restricted. The order is driven by
+   * the position of each `source_id` inside the caller-supplied `sourceIds`
+   * array (which already arrives sorted by scope); ties / unlisted sources
+   * fall back to alphabetical `source_id`. Conceptual ladder:
+   * campo < backoffice < lideres < directorio.
+   */
+  async getPageLayers(
+    slug: string,
+    opts?: { sourceIds?: string[]; includeDeleted?: boolean },
+  ): Promise<Page[]> {
+    const sql = this.sql;
+    const includeDeleted = opts?.includeDeleted === true;
+    const sourceIds = opts?.sourceIds;
+    const hasScope = sourceIds !== undefined && sourceIds.length > 0;
+    const sourceCondition = hasScope
+      ? sql`AND source_id = ANY(${sourceIds}::text[])`
+      : sql``;
+    const deletedCondition = includeDeleted ? sql`` : sql`AND deleted_at IS NULL`;
+    // Order by the caller's scope array (array_position is 1-based; NULL for
+    // unlisted source_ids, which sort last under NULLS LAST), then
+    // alphabetical source_id as the deterministic tiebreaker.
+    const orderCondition = hasScope
+      ? sql`ORDER BY array_position(${sourceIds}::text[], source_id) NULLS LAST, source_id ASC`
+      : sql`ORDER BY source_id ASC`;
+    const rows = await sql`
+      SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
+             source_kind, source_uri, ingested_via, ingested_at
+      FROM pages
+      WHERE slug = ${slug} ${sourceCondition} ${deletedCondition}
+      ${orderCondition}
+    `;
+    return rows.map((r) => rowToPage(r));
+  }
+
+  /**
    * v0.41.13 (#1309) — identity-based dedup pre-check.
    * See `BrainEngine.findDuplicatePage` for the contract.
    */

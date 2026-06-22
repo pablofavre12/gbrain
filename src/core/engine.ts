@@ -691,6 +691,35 @@ export interface BrainEngine {
    */
   getPage(slug: string, opts?: GetPageOpts): Promise<Page | null>;
   /**
+   * v119 — multi-source layer read. Return ALL live rows that share `slug`
+   * across the caller's readable sources, one per source ("layer"). This is
+   * the union-of-layers companion to `getPage` (which returns at most ONE
+   * row): the same slug can exist as distinct layers in different salas
+   * (e.g. `personas/x` in `campo` AND in `directorio`), and the get_page op
+   * surfaces them all together when no explicit `source` is requested.
+   *
+   * Scope: `opts.sourceIds` is the caller's readable grant — when set and
+   * non-empty, only rows whose `source_id` is in that set are returned. When
+   * omitted, NO source filter applies (local-CLI / unscoped semantics, same
+   * as `getPage`'s missing-opts branch). The op layer is responsible for
+   * passing the caller's grant; the engine does not infer it.
+   *
+   * Ordering: deterministic, most-public → most-restricted. When `sourceIds`
+   * is provided, rows are returned in THAT array's order (the caller hands it
+   * down already sorted by scope), with any unlisted source_id (possible only
+   * in the unscoped branch) and ties broken alphabetically by source_id. The
+   * conceptual confidentiality ladder is `campo < backoffice < lideres <
+   * directorio` — there is no per-row confidentiality column in the schema,
+   * so the array order IS the contract. See operations.ts get_page handler.
+   *
+   * Soft-delete: hidden by default; `opts.includeDeleted: true` surfaces
+   * soft-deleted layers with `deleted_at` populated, matching `getPage`.
+   */
+  getPageLayers(
+    slug: string,
+    opts?: { sourceIds?: string[]; includeDeleted?: boolean },
+  ): Promise<Page[]>;
+  /**
    * Insert or update a page. When `opts.sourceId` is omitted, the row is
    * written under the schema DEFAULT ('default'). When provided, `source_id`
    * is included in the INSERT column list so ON CONFLICT (source_id, slug)

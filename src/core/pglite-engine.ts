@@ -1250,6 +1250,49 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   /**
+   * v119 — multi-source layer read. See `BrainEngine.getPageLayers`.
+   *
+   * Mirrors the Postgres engine: every live row sharing `slug` within the
+   * caller's readable sources, ordered most-public → most-restricted by the
+   * position of each source_id inside the caller-supplied scope array, with
+   * alphabetical source_id as the deterministic tiebreaker. Conceptual
+   * ladder: campo < backoffice < lideres < directorio.
+   */
+  async getPageLayers(
+    slug: string,
+    opts?: { sourceIds?: string[]; includeDeleted?: boolean },
+  ): Promise<Page[]> {
+    const includeDeleted = opts?.includeDeleted === true;
+    const sourceIds = opts?.sourceIds;
+    const hasScope = sourceIds !== undefined && sourceIds.length > 0;
+    const where: string[] = ['slug = $1'];
+    const params: unknown[] = [slug];
+    if (hasScope) {
+      params.push(sourceIds);
+      where.push(`source_id = ANY($${params.length}::text[])`);
+    }
+    if (!includeDeleted) {
+      where.push('deleted_at IS NULL');
+    }
+    // Order by the caller's scope array (array_position is 1-based; NULL for
+    // unlisted source_ids → NULLS LAST), alphabetical source_id as tiebreaker.
+    let orderBy: string;
+    if (hasScope) {
+      params.push(sourceIds);
+      orderBy = `ORDER BY array_position($${params.length}::text[], source_id) NULLS LAST, source_id ASC`;
+    } else {
+      orderBy = 'ORDER BY source_id ASC';
+    }
+    const { rows } = await this.db.query(
+      `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
+              source_kind, source_uri, ingested_via, ingested_at
+       FROM pages WHERE ${where.join(' AND ')} ${orderBy}`,
+      params
+    );
+    return (rows as Record<string, unknown>[]).map((r) => rowToPage(r));
+  }
+
+  /**
    * v0.41.13 (#1309) — identity-based dedup pre-check.
    * See `BrainEngine.findDuplicatePage` for the contract.
    */
