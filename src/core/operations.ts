@@ -1878,16 +1878,23 @@ const delete_page: Operation = {
   description: 'Soft-delete a page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
   params: {
     slug: { type: 'string', required: true },
+    // Symmetric with put_page/add_link (v118): optional target sala/source.
+    // Authorized via resolveWriteSource against {ctx.sourceId} ∪ federated_write —
+    // you may soft-delete anywhere you're allowed to write. Omit → ctx.sourceId.
+    source: { type: 'string', required: false, description: 'Target source/sala the page lives in. Must be the client\'s source_id or one of its federated_write sources. Omit to use the client\'s default source_id.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
     enforceClientSlugFence(ctx, slug, 'delete_page');
-    if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug };
-    // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
-    // intended row instead of always targeting (default, slug).
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    // v118-symmetry: resolve + authorize the target sala BEFORE the dry-run
+    // short-circuit (mirrors put_page). FAIL-CLOSED — a client-supplied `source`
+    // outside {ctx.sourceId} ∪ federated_write throws permission_denied. Delete
+    // rights track write rights: you may delete wherever you may write.
+    const writeSourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug, source: writeSourceId };
+    const sourceOpts = { sourceId: writeSourceId };
     // v0.26.5: rewired from hard-delete to soft-delete. The hard-delete primitive
     // (engine.deletePage) is now reserved for purgeDeletedPages and explicit
     // tests. softDeletePage returns null when the slug is unknown OR already
@@ -1912,15 +1919,19 @@ const restore_page: Operation = {
   description: 'v0.26.5 — restore a soft-deleted page (clear deleted_at). Returns success only if the page was actually soft-deleted. After this op, the page reappears in search and in get_page/list_pages without the include_deleted flag.',
   params: {
     slug: { type: 'string', required: true },
+    // Symmetric with delete_page: optional target sala/source, authorized via
+    // resolveWriteSource. Omit → ctx.sourceId.
+    source: { type: 'string', required: false, description: 'Target source/sala the page lives in. Must be the client\'s source_id or one of its federated_write sources. Omit to use the client\'s default source_id.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
     enforceClientSlugFence(ctx, slug, 'restore_page');
-    if (ctx.dryRun) return { dry_run: true, action: 'restore_page', slug };
-    // v0.31.8 (D7): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    // v118-symmetry: resolve + authorize target sala before dry-run (see delete_page).
+    const writeSourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    if (ctx.dryRun) return { dry_run: true, action: 'restore_page', slug, source: writeSourceId };
+    const sourceOpts = { sourceId: writeSourceId };
     const ok = await ctx.engine.restorePage(slug, sourceOpts);
     if (!ok) {
       // Distinguish "not found" from "already active" (idempotent-as-false).
