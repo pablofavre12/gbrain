@@ -1481,6 +1481,17 @@ export interface BrainEngine {
    */
   addTimelineEntriesBatch(entries: TimelineBatchInput[], opts?: BatchOpts): Promise<number>;
   getTimeline(slug: string, opts?: TimelineOpts): Promise<TimelineEntry[]>;
+  /**
+   * Backfill a creation-date "Page created" baseline timeline entry for every
+   * entity page (type person/company) that has NO timeline yet, dated at the
+   * page's earliest known instant (MIN(page_versions.snapshot_at), falling back
+   * to pages.created_at). Idempotent via the (page_id, date, summary, source)
+   * dedup index; `source = 'baseline'` keeps synthetic entries distinguishable
+   * from substantive ones. `opts.sourceId` scopes the backfill to one source
+   * (omit for brain-wide). Returns the count of baseline rows created. Lifts
+   * timeline_coverage without fabricating content.
+   */
+  applyTimelineBaseline(opts?: { sourceId?: string }): Promise<{ created: number }>;
 
   // v0.42.x — Life Chronicle (#2390) timeline reads. All filter the depth page
   // (and any event page) on deleted_at IS NULL, order by COALESCE(event

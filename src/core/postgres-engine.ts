@@ -3968,6 +3968,29 @@ export class PostgresEngine implements BrainEngine {
     return result.length;
   }
 
+  async applyTimelineBaseline(opts?: { sourceId?: string }): Promise<{ created: number }> {
+    // One creation-date "Page created" row per entity page with no timeline yet.
+    // Date = earliest known instant (first page_version snapshot, else created_at).
+    // Idempotent via the (page_id, date, summary, source) dedup index + NOT EXISTS.
+    // Source-scoped when sourceId is given, brain-wide otherwise. Mirrors the
+    // pglite path (engines stay lockstep on behavior).
+    const sql = this.sql;
+    const sourceId = opts?.sourceId ?? null;
+    const result = await sql`
+      INSERT INTO timeline_entries (page_id, date, source, summary, detail) -- gbrain-allow-direct-insert: entity creation-date baseline, idempotent via (page_id,date,summary,source) + NOT EXISTS
+      SELECT p.id,
+             COALESCE((SELECT MIN(v.snapshot_at) FROM page_versions v WHERE v.page_id = p.id), p.created_at)::date,
+             'baseline', 'Page created', ''
+      FROM pages p
+      WHERE p.type IN ('person', 'company')
+        AND (${sourceId}::text IS NULL OR p.source_id = ${sourceId})
+        AND NOT EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id)
+      ON CONFLICT (page_id, date, summary, source) DO NOTHING
+      RETURNING page_id
+    `;
+    return { created: result.length };
+  }
+
   async getTimeline(slug: string, opts?: TimelineOpts): Promise<TimelineEntry[]> {
     const sql = this.sql;
     const limit = opts?.limit || 100;
@@ -5694,7 +5717,7 @@ export class PostgresEngine implements BrainEngine {
     // who'd just successfully run init. PGLite path has the same fix.
     const embedCoverageScore = pageCount === 0 ? 35 : Math.round(embedCoverage * 35);
     const linkDensityScore = pageCount === 0 ? 25 : Math.round(linkDensity * 25);
-    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverageWhole * 15);
+    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverage * 15);
     const noOrphansScore = pageCount === 0 ? 15 : Math.round(noOrphans * 15);
     const noDeadLinksScore = pageCount === 0 ? 10 : Math.round(noDeadLinks * 10);
     const brainScore = embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore;
@@ -5709,7 +5732,7 @@ export class PostgresEngine implements BrainEngine {
       brain_score: brainScore,
       dead_links: deadLinks,
       link_coverage: Number(h.link_coverage),
-      timeline_coverage: Number(h.timeline_coverage),
+      timeline_coverage: timelineCoverage,
       most_connected: (connected as unknown as { slug: string; link_count: number }[]).map(c => ({
         slug: c.slug,
         link_count: Number(c.link_count),

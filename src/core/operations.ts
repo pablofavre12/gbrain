@@ -2860,6 +2860,25 @@ const add_timeline_entry: Operation = {
   cliHints: { name: 'timeline-add', positional: ['slug', 'date', 'summary'] },
 };
 
+const apply_timeline_baseline: Operation = {
+  name: 'apply_timeline_baseline',
+  description:
+    'Backfill a creation-date "Page created" baseline timeline entry for every entity page (person/company) that has no timeline yet. Idempotent; lifts timeline_coverage without fabricating content. Synthetic entries carry source="baseline" so they stay distinguishable from substantive ones. Run after a sync/import or on a schedule.',
+  params: {},
+  mutating: true,
+  scope: 'write',
+  localOnly: true,
+  handler: async (ctx, _p) => {
+    if (ctx.dryRun) return { dry_run: true, action: 'apply_timeline_baseline' };
+    // Thread ctx.sourceId so a source-scoped trusted caller only backfills its
+    // own source; omit for a brain-wide backfill.
+    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    const res = await ctx.engine.applyTimelineBaseline(sourceOpts);
+    return { status: 'ok', ...res };
+  },
+  cliHints: { name: 'timeline-baseline' },
+};
+
 const get_timeline: Operation = {
   name: 'get_timeline',
   description: 'Get timeline entries for a page, optionally filtered by date window',
@@ -6902,7 +6921,7 @@ export const operations: Operation[] = [
   // Links
   add_link, remove_link, get_links, get_backlinks, list_link_sources, traverse_graph,
   // Timeline
-  add_timeline_entry, get_timeline,
+  add_timeline_entry, get_timeline, apply_timeline_baseline,
   // Admin
   get_stats, get_health, run_doctor, get_versions, revert_version,
   // v0.31.1 (Issue #734): thin-client banner identity packet (read-scope, banner-only)

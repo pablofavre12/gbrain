@@ -4006,6 +4006,29 @@ export class PGLiteEngine implements BrainEngine {
     return result.length;
   }
 
+  async applyTimelineBaseline(opts?: { sourceId?: string }): Promise<{ created: number }> {
+    // One creation-date "Page created" row per entity page that has no timeline
+    // yet. Date = earliest known instant (first page_version snapshot, else the
+    // page's created_at). Idempotent: the (page_id, date, summary, source) dedup
+    // index plus the NOT EXISTS guard make re-runs no-ops. Source-scoped when a
+    // sourceId is given, brain-wide otherwise.
+    const sourceId = opts?.sourceId ?? null;
+    const { rows } = await this.db.query(
+      `INSERT INTO timeline_entries (page_id, date, source, summary, detail) -- gbrain-allow-direct-insert: entity creation-date baseline, idempotent via (page_id,date,summary,source) + NOT EXISTS
+       SELECT p.id,
+              COALESCE((SELECT MIN(v.snapshot_at) FROM page_versions v WHERE v.page_id = p.id), p.created_at)::date,
+              'baseline', 'Page created', ''
+       FROM pages p
+       WHERE p.type IN ('person', 'company')
+         AND ($1::text IS NULL OR p.source_id = $1)
+         AND NOT EXISTS (SELECT 1 FROM timeline_entries te WHERE te.page_id = p.id)
+       ON CONFLICT (page_id, date, summary, source) DO NOTHING
+       RETURNING page_id`,
+      [sourceId]
+    );
+    return { created: rows.length };
+  }
+
   async getTimeline(slug: string, opts?: TimelineOpts): Promise<TimelineEntry[]> {
     // v0.31.8 (D16) + #2200: build WHERE clause dynamically so the source scope
     // composes cleanly with the after/before filters. Precedence: federated
@@ -5792,7 +5815,7 @@ export class PGLiteEngine implements BrainEngine {
     // who'd just successfully run init.
     const embedCoverageScore = pageCount === 0 ? 35 : Math.round(embedCoverage * 35);
     const linkDensityScore = pageCount === 0 ? 25 : Math.round(linkDensity * 25);
-    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverageDensity * 15);
+    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverage * 15);
     const noOrphansScore = pageCount === 0 ? 15 : Math.round(noOrphans * 15);
     const noDeadLinksScore = pageCount === 0 ? 10 : Math.round(noDeadLinks * 10);
     const brainScore = embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore;
@@ -5807,7 +5830,7 @@ export class PGLiteEngine implements BrainEngine {
       brain_score: brainScore,
       dead_links: deadLinks,
       link_coverage: Number(r.link_coverage),
-      timeline_coverage: Number(r.timeline_coverage),
+      timeline_coverage: timelineCoverage,
       most_connected: (connected as { slug: string; link_count: number }[]).map(c => ({
         slug: c.slug,
         link_count: Number(c.link_count),

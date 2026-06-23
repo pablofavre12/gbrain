@@ -68,6 +68,26 @@ describe('Bug 11 — brain_score breakdown sums to total', () => {
     expect(h.brain_score).toBeGreaterThanOrEqual(0);
     expect(h.brain_score).toBeLessThanOrEqual(100);
   });
+
+  test('timeline score tracks ENTITY coverage, not whole-brain density', async () => {
+    // Regression guard: the timeline_coverage_score used to divide
+    // (pages with any timeline) by (ALL pages), so a brain whose entity pages
+    // were fully covered still scored ~1/15 once it accumulated leaf docs that
+    // never get a timeline by design. The score must follow the entity-scoped
+    // timeline_coverage it displays.
+    for (const slug of ['alice-example', 'bob-example']) {
+      await engine.putPage(slug, { type: 'person', title: slug, compiled_truth: `# ${slug}`, frontmatter: {} });
+      await engine.addTimelineEntry(slug, { date: '2026-01-01', source: 'test', summary: 'joined', detail: '' });
+    }
+    // 20 leaf docs with no timeline — by-design timeline-less, used to deflate
+    // the old density to 2/22 → score 1.
+    for (let i = 0; i < 20; i++) {
+      await engine.putPage(`notes/doc-${i}`, { type: 'note', title: `doc ${i}`, compiled_truth: 'x', frontmatter: {} });
+    }
+    const h = await engine.getHealth();
+    expect(h.timeline_coverage).toBeCloseTo(1.0, 5);   // 2/2 entity pages covered
+    expect(h.timeline_coverage_score).toBe(15);        // round(1.0 * 15); was ~1 under the old density
+  });
 });
 
 describe('Bug 11 — orphan_pages is "no inbound links"', () => {
