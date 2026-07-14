@@ -30,6 +30,7 @@ const FORK_LOCAL_NAMES = new Set([
   'oauth_clients_federated_write_gin_index',
   'write_attribution_columns',
   'reconcile_forked_118_119',
+  'reconcile_forked_120_121_122',
 ]);
 
 describe('fork-band migration convention', () => {
