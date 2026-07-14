@@ -190,6 +190,89 @@ const OP_CHECKPOINTS_ARRAY_CHECK_SQL = `
       END $$;
     `;
 
+// [fork] Upstream v120/v121/v122 DDL extracted to constants so the
+// reconcile_forked_120_121_122 catch-up (fork band + 4) re-applies the EXACT
+// same DDL — idempotently — on brains already stamped past the fork band
+// (their scalar high-water-mark > 122 makes 120/121/122 non-pending, so they'd
+// otherwise never receive these). Same shape as the 118/119 reconcile. All
+// three are additive + guarded (IF EXISTS / IF NOT EXISTS), so re-running is a
+// no-op on fresh installs that already applied 120/121/122 in order.
+const V120_SEARCH_PATH_HARDENING_POSTGRES_SQL = `
+        ALTER VIEW IF EXISTS page_links SET (security_invoker = on);
+
+        DO $$
+        DECLARE fn text;
+        BEGIN
+          FOREACH fn IN ARRAY ARRAY[
+            'bump_page_generation_fn','bump_page_generation_clock_fn',
+            'update_chunk_search_vector','update_page_search_vector',
+            'notify_minion_job_change','auto_enable_rls'
+          ] LOOP
+            IF EXISTS (
+              SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname = fn
+            ) THEN
+              EXECUTE format('ALTER FUNCTION public.%I() SET search_path = pg_catalog, public', fn);
+            END IF;
+          END LOOP;
+        END $$;
+      `;
+
+const V120_SEARCH_PATH_HARDENING_PGLITE_SQL = `
+        DO $$
+        DECLARE fn text;
+        BEGIN
+          FOREACH fn IN ARRAY ARRAY[
+            'bump_page_generation_fn','bump_page_generation_clock_fn',
+            'update_chunk_search_vector','update_page_search_vector',
+            'notify_minion_job_change'
+          ] LOOP
+            IF EXISTS (
+              SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname = fn
+            ) THEN
+              EXECUTE format('ALTER FUNCTION public.%I() SET search_path = pg_catalog, public', fn);
+            END IF;
+          END LOOP;
+        END $$;
+      `;
+
+const V121_TIMELINE_EVENT_PAGE_ID_SQL = `
+      ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
+
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'timeline_entries_event_page_id_fkey'
+             AND conrelid = 'timeline_entries'::regclass
+        ) THEN
+          ALTER TABLE timeline_entries
+            ADD CONSTRAINT timeline_entries_event_page_id_fkey
+            FOREIGN KEY (event_page_id) REFERENCES pages(id) ON DELETE CASCADE;
+        END IF;
+      END $$;
+
+      CREATE INDEX IF NOT EXISTS idx_timeline_event_page
+        ON timeline_entries(event_page_id) WHERE event_page_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_event_dedup
+        ON timeline_entries(event_page_id, date) WHERE event_page_id IS NOT NULL;
+    `;
+
+const V122_FACTS_ONTOLOGY_DIMENSION_SQL = `
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS dimension  TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS value      TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS value_hash TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS dim_status TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_facts_dimension
+        ON facts(source_id, entity_slug, dimension, valid_from DESC)
+        WHERE expired_at IS NULL AND dimension IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_ontology_dedup
+        ON facts(source_id, entity_slug, dimension, value_hash, source_markdown_slug)
+        WHERE dimension IS NOT NULL;
+    `;
+
 export const MIGRATIONS: Migration[] = [
   // Version 1 is the baseline (schema.sql creates everything with IF NOT EXISTS).
   {
@@ -5414,45 +5497,11 @@ export const MIGRATIONS: Migration[] = [
     // function defs in schema.sql / pglite-schema.ts carry SET search_path too.
     idempotent: true,
     sql: '', // engine-specific via sqlFor
+    // [fork] DDL extracted to constants (top of file) so reconcile_forked_120_121_122
+    // (fork band + 4) re-applies the exact same statements on already-stamped brains.
     sqlFor: {
-      postgres: `
-        ALTER VIEW IF EXISTS page_links SET (security_invoker = on);
-
-        DO $$
-        DECLARE fn text;
-        BEGIN
-          FOREACH fn IN ARRAY ARRAY[
-            'bump_page_generation_fn','bump_page_generation_clock_fn',
-            'update_chunk_search_vector','update_page_search_vector',
-            'notify_minion_job_change','auto_enable_rls'
-          ] LOOP
-            IF EXISTS (
-              SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-              WHERE n.nspname = 'public' AND p.proname = fn
-            ) THEN
-              EXECUTE format('ALTER FUNCTION public.%I() SET search_path = pg_catalog, public', fn);
-            END IF;
-          END LOOP;
-        END $$;
-      `,
-      pglite: `
-        DO $$
-        DECLARE fn text;
-        BEGIN
-          FOREACH fn IN ARRAY ARRAY[
-            'bump_page_generation_fn','bump_page_generation_clock_fn',
-            'update_chunk_search_vector','update_page_search_vector',
-            'notify_minion_job_change'
-          ] LOOP
-            IF EXISTS (
-              SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-              WHERE n.nspname = 'public' AND p.proname = fn
-            ) THEN
-              EXECUTE format('ALTER FUNCTION public.%I() SET search_path = pg_catalog, public', fn);
-            END IF;
-          END LOOP;
-        END $$;
-      `,
+      postgres: V120_SEARCH_PATH_HARDENING_POSTGRES_SQL,
+      pglite: V120_SEARCH_PATH_HARDENING_PGLITE_SQL,
     },
   },
   {
@@ -5469,27 +5518,9 @@ export const MIGRATIONS: Migration[] = [
     // no-op on re-runs. Mirrored in src/schema.sql, src/core/pglite-schema.ts,
     // and the generated src/core/schema-embedded.ts for fresh installs.
     idempotent: true,
-    sql: `
-      ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
-
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-           WHERE conname = 'timeline_entries_event_page_id_fkey'
-             AND conrelid = 'timeline_entries'::regclass
-        ) THEN
-          ALTER TABLE timeline_entries
-            ADD CONSTRAINT timeline_entries_event_page_id_fkey
-            FOREIGN KEY (event_page_id) REFERENCES pages(id) ON DELETE CASCADE;
-        END IF;
-      END $$;
-
-      CREATE INDEX IF NOT EXISTS idx_timeline_event_page
-        ON timeline_entries(event_page_id) WHERE event_page_id IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_event_dedup
-        ON timeline_entries(event_page_id, date) WHERE event_page_id IS NOT NULL;
-    `,
+    // [fork] DDL in V121_TIMELINE_EVENT_PAGE_ID_SQL (top of file); shared with the
+    // reconcile_forked_120_121_122 catch-up (fork band + 4).
+    sql: V121_TIMELINE_EVENT_PAGE_ID_SQL,
   },
   {
     version: 122,
@@ -5507,19 +5538,9 @@ export const MIGRATIONS: Migration[] = [
     // facts is migration-created (absent from static schema), so this migration
     // is the single source for fresh + migrated brains.
     idempotent: true,
-    sql: `
-      ALTER TABLE facts ADD COLUMN IF NOT EXISTS dimension  TEXT;
-      ALTER TABLE facts ADD COLUMN IF NOT EXISTS value      TEXT;
-      ALTER TABLE facts ADD COLUMN IF NOT EXISTS value_hash TEXT;
-      ALTER TABLE facts ADD COLUMN IF NOT EXISTS dim_status TEXT;
-
-      CREATE INDEX IF NOT EXISTS idx_facts_dimension
-        ON facts(source_id, entity_slug, dimension, valid_from DESC)
-        WHERE expired_at IS NULL AND dimension IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_ontology_dedup
-        ON facts(source_id, entity_slug, dimension, value_hash, source_markdown_slug)
-        WHERE dimension IS NOT NULL;
-    `,
+    // [fork] DDL in V122_FACTS_ONTOLOGY_DIMENSION_SQL (top of file); shared with the
+    // reconcile_forked_120_121_122 catch-up (fork band + 4).
+    sql: V122_FACTS_ONTOLOGY_DIMENSION_SQL,
   },
   {
     version: FORK_MIGRATION_BASE + 0, // 9000
@@ -5603,6 +5624,34 @@ export const MIGRATIONS: Migration[] = [
     // (where 118/119 ran normally) this is a harmless no-op.
     idempotent: true,
     sql: PAGE_GENERATION_CLOCK_SEQUENCE_SWAP_SQL + '\n' + OP_CHECKPOINTS_ARRAY_CHECK_SQL,
+  },
+  {
+    version: FORK_MIGRATION_BASE + 4, // 9004
+    name: 'reconcile_forked_120_121_122',
+    // [fork] Heal brains already stamped inside the fork band (schema_version at
+    // 9000-9003) so they receive upstream's v120/v121/v122 — added at their
+    // upstream numbers above during the v0.42.59.0 sync. The runner's scalar
+    // high-water-mark (`pending = version > current`) makes 120/121/122 NON-pending
+    // for any brain whose bookmark is already ≥ 9000 (e.g. every deployed pere
+    // brain, at 9003), so without this they would silently never run — the same
+    // shadowing class the 118/119 reconcile fixed. This catch-up sits above the
+    // band ceiling so it IS pending, and re-applies the EXACT same DDL (shared
+    // constants). Engine-specific because v120 (search_path hardening) is:
+    // Postgres also fixes the page_links security_invoker view + auto_enable_rls;
+    // PGLite has neither. All three bodies are additive + guarded, so on a fresh
+    // install (where 120/121/122 ran in order) this is a harmless no-op.
+    idempotent: true,
+    sql: '', // engine-specific via sqlFor
+    sqlFor: {
+      postgres:
+        V120_SEARCH_PATH_HARDENING_POSTGRES_SQL + '\n' +
+        V121_TIMELINE_EVENT_PAGE_ID_SQL + '\n' +
+        V122_FACTS_ONTOLOGY_DIMENSION_SQL,
+      pglite:
+        V120_SEARCH_PATH_HARDENING_PGLITE_SQL + '\n' +
+        V121_TIMELINE_EVENT_PAGE_ID_SQL + '\n' +
+        V122_FACTS_ONTOLOGY_DIMENSION_SQL,
+    },
   },
 ];
 
