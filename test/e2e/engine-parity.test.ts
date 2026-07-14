@@ -588,7 +588,12 @@ describeBoth('Engine parity — relationalFanout', () => {
   }, 30_000);
 
   const shape = (rows: Awaited<ReturnType<BrainEngine['relationalFanout']>>) =>
-    rows.map(r => `${r.source_id}:${r.slug}:${r.hop}:${r.edge_count}:${r.via_link_types.join(',')}:${r.path.join('>')}:${r.canonical_chunk_id ?? 'null'}`);
+    // canonical_chunk_id is a serial id — its absolute value diverges between a
+    // fresh PGLite engine and a shared Postgres DB whose content_chunks sequence
+    // advanced earlier (setupDB TRUNCATEs without RESTART IDENTITY). Compare its
+    // PRESENCE, not the exact id, so the parity check verifies graph structure +
+    // canonical-chunk resolution without depending on cross-engine sequence state.
+    rows.map(r => `${r.source_id}:${r.slug}:${r.hop}:${r.edge_count}:${r.via_link_types.join(',')}:${r.path.join('>')}:${r.canonical_chunk_id != null ? 'set' : 'null'}`);
 
   test('typed-edge fan-out is identical across engines', async () => {
     const opts = { direction: 'in' as const, linkTypes: ['invested_in'] };
@@ -610,5 +615,91 @@ describeBoth('Engine parity — relationalFanout', () => {
     const pg = await pgEngine.relationalFanout(seeds, { direction: 'both' });
     const pglite = await pgliteEngine.relationalFanout(seeds, { direction: 'both' });
     expect(shape(pg)).toEqual(shape(pglite));
+  });
+});
+
+// #2200 — federated sourceIds[] on the secondary-fetch reads must behave
+// identically on both engines (a drift would mean a federated MCP client sees
+// different tags/links/timeline after `gbrain migrate --to supabase`).
+async function seedFederated(eng: BrainEngine) {
+  await eng.executeRaw(`INSERT INTO sources (id, name, local_path) VALUES ('beta', 'beta', '/tmp/beta') ON CONFLICT (id) DO NOTHING`);
+  await eng.putPage('fed/doc', { type: 'note', title: 'Fed doc', compiled_truth: 'b', timeline: '' }, { sourceId: 'beta' });
+  await eng.putPage('fed/target', { type: 'note', title: 'Fed target', compiled_truth: 'b', timeline: '' }, { sourceId: 'beta' });
+  await eng.putPage('fed/doc', { type: 'note', title: 'Default decoy', compiled_truth: 'd', timeline: '' }, { sourceId: 'default' });
+  await eng.putPage('fed/outside', { type: 'note', title: 'Outside', compiled_truth: 'd', timeline: '' }, { sourceId: 'default' });
+  await eng.addTag('fed/doc', 'beta-tag', { sourceId: 'beta' });
+  await eng.addTag('fed/doc', 'default-decoy-tag', { sourceId: 'default' });
+  await eng.addLink('fed/doc', 'fed/target', 'in', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'beta', toSourceId: 'beta' });
+  await eng.addLink('fed/doc', 'fed/outside', 'leak', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'beta', toSourceId: 'default' });
+  await eng.addLink('fed/target', 'fed/doc', 'inback', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'beta', toSourceId: 'beta' });
+  await eng.addLink('fed/outside', 'fed/doc', 'leakback', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'default', toSourceId: 'beta' });
+  // F1: in-grant edge authored by an out-of-grant origin — origin_slug must null out.
+  await eng.addLink('fed/doc', 'fed/target', 'originleak', 'mentions', 'frontmatter', 'fed/outside', 'related', { fromSourceId: 'beta', toSourceId: 'beta', originSourceId: 'default' });
+  await eng.addTimelineEntry('fed/doc', { date: '2026-02-02', source: 't', summary: 'fed event', detail: 'd' }, { sourceId: 'beta' });
+  // Second-dated entry so the after/before fragment paths (D5A Postgres refactor) are exercised.
+  await eng.addTimelineEntry('fed/doc', { date: '2026-08-08', source: 't', summary: 'late event', detail: 'd' }, { sourceId: 'beta' });
+}
+
+describeBoth('Engine parity — federated sourceIds[] secondary reads (#2200)', () => {
+  let pgEngine: BrainEngine;
+  let pgliteEngine: PGLiteEngine;
+  const grant = { sourceIds: ['beta'] };
+
+  beforeAll(async () => {
+    pgEngine = await setupDB();
+    await seedFederated(pgEngine);
+    pgliteEngine = new PGLiteEngine();
+    await pgliteEngine.connect({});
+    await pgliteEngine.initSchema();
+    await seedFederated(pgliteEngine);
+  }, 90_000);
+
+  afterAll(async () => {
+    await pgliteEngine.disconnect();
+    await teardownDB();
+  }, 30_000);
+
+  test('getTags identical under sourceIds[]', async () => {
+    const pg = (await pgEngine.getTags('fed/doc', grant)).sort();
+    const pglite = (await pgliteEngine.getTags('fed/doc', grant)).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg).toEqual(['beta-tag']); // default decoy excluded
+  });
+
+  test('getLinks identical under sourceIds[] (all three endpoints scoped)', async () => {
+    const pg = (await pgEngine.getLinks('fed/doc', grant)).map(l => l.to_slug).sort();
+    const pglite = (await pgliteEngine.getLinks('fed/doc', grant)).map(l => l.to_slug).sort();
+    expect(pg).toEqual(pglite);
+    expect([...new Set(pg)]).toEqual(['fed/target']); // far-endpoint 'fed/outside' excluded
+    // F1: origin_slug nulled identically on both engines when origin is out-of-grant.
+    const pgOrigins = (await pgEngine.getLinks('fed/doc', grant)).map(l => l.origin_slug ?? null);
+    const pgliteOrigins = (await pgliteEngine.getLinks('fed/doc', grant)).map(l => l.origin_slug ?? null);
+    expect(pgOrigins.sort()).toEqual(pgliteOrigins.sort());
+    expect(pgOrigins).not.toContain('fed/outside');
+  });
+
+  test('getBacklinks identical under sourceIds[] (both endpoints scoped)', async () => {
+    const pg = (await pgEngine.getBacklinks('fed/doc', grant)).map(l => l.from_slug).sort();
+    const pglite = (await pgliteEngine.getBacklinks('fed/doc', grant)).map(l => l.from_slug).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg).toEqual(['fed/target']);
+  });
+
+  test('getTimeline identical under sourceIds[]', async () => {
+    const pg = (await pgEngine.getTimeline('fed/doc', grant)).map(e => e.summary).sort();
+    const pglite = (await pgliteEngine.getTimeline('fed/doc', grant)).map(e => e.summary).sort();
+    expect(pg).toEqual(pglite);
+    expect(pg).toEqual(['fed event', 'late event']);
+  });
+
+  // Pins the D5A Postgres fragment refactor: after/before/both window paths must
+  // match PGLite under a federated grant (the 8-branch→composed-WHERE rewrite).
+  test('getTimeline date-window fragments identical across engines (D5A regression guard)', async () => {
+    for (const win of [{ after: '2026-05-01' }, { before: '2026-05-01' }, { after: '2026-01-01', before: '2026-12-31' }]) {
+      const opts = { ...grant, ...win };
+      const pg = (await pgEngine.getTimeline('fed/doc', opts)).map(e => e.summary).sort();
+      const pglite = (await pgliteEngine.getTimeline('fed/doc', opts)).map(e => e.summary).sort();
+      expect(pg).toEqual(pglite);
+    }
   });
 });

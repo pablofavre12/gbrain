@@ -44,7 +44,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'enrich', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'quarantine', 'self-upgrade', 'watch']);
+const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'enrich', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'quarantine', 'self-upgrade', 'advisor', 'watch']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -282,6 +282,17 @@ async function main() {
       printCliOnlyHelp(command);
       return;
     }
+  }
+
+  // DB-free durability pull (v0.42.44 D2): the harden cron calls
+  // `gbrain sources pull --path <dir>` every ~30 min. It must NOT open PGLite
+  // (a live long-lived session holds the single-writer lock), so handle it
+  // BEFORE connectEngine. The `sources pull <id>` form (no --path) still routes
+  // through handleCliOnly → runSources with an engine.
+  if (command === 'sources' && subArgs[0] === 'pull' && subArgs.includes('--path')) {
+    const { runPull } = await import('./commands/sources-harden.ts');
+    await runPull(null, subArgs.slice(1));
+    return;
   }
 
   // CLI-only commands
@@ -1405,6 +1416,14 @@ async function handleCliOnly(command: string, args: string[]) {
     return;
   }
 
+  // v0.42.x (#2390): `gbrain eval chronicle` is deterministic — brings its own
+  // in-memory PGLite, no DB/gateway. CI fixture gate runs anywhere.
+  if (command === 'eval' && args[0] === 'chronicle') {
+    const { runEvalChronicle } = await import('./commands/eval-chronicle.ts');
+    setCliExitVerdict(await runEvalChronicle(args.slice(1)));
+    return;
+  }
+
   // v0.41.13.0: `gbrain eval conversation-parser` is pure-function
   // (parses fixture JSONL, runs parseConversation, scores results).
   // No DB access; bypass connectEngine entirely so the CI fixture
@@ -1771,6 +1790,15 @@ async function handleCliOnly(command: string, args: string[]) {
         const result = await runStatus(engine, args);
         // #2084 inner-exit sweep: a mid-switch exit skips the finally teardown.
         setCliExitVerdict(result.exitCode);
+        break;
+      }
+      // v0.43 (#2180) — `gbrain advisor`: ranked, read-only "what to do next".
+      // CLI surface; the same signals are exposed over MCP via the `advisor` op.
+      case 'advisor': {
+        const { runAdvisorCli } = await import('./commands/advisor.ts');
+        const result = await runAdvisorCli(engine, args);
+        process.exit(result.exitCode);
+        // eslint-disable-next-line no-unreachable
         break;
       }
       // v0.38 — Capture: single human-facing entrypoint for ingestion.
@@ -2325,7 +2353,8 @@ ADMIN
   serve                              MCP server (stdio)
   serve --http [--port N]            HTTP MCP server with OAuth 2.1
     --token-ttl N                    Access token TTL in seconds (default: 3600)
-    --enable-dcr                     Enable Dynamic Client Registration
+    --enable-dcr                     Enable Dynamic Client Registration (DCR clients default to authorization_code)
+    --enable-dcr-insecure            Also allow the consent-bypassing client_credentials grant on DCR (implies --enable-dcr)
     --public-url URL                 Public issuer URL (required behind proxy/tunnel)
   connect <mcp-url> --token <t>      Wire Claude Code to a remote gbrain (bearer token)
         [--install] [--json]         Print the paste-ready command, or --install to run it

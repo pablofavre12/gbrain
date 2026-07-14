@@ -135,6 +135,14 @@ const FORK_MIGRATION_BASE = 9000;
 // the fork-band catch-up migration (FORK_MIGRATION_BASE + 3) can re-apply the
 // exact same DDL to heal brains that recorded version 119 while running the
 // fork's old federated_write migrations instead of these.
+// [fork] The bump_page_generation_clock_fn body carries `SET search_path` inline
+// (upstream's v118 migration body did NOT — it relied on the LATER v120 search_path
+// hardening to pin it). The fork's reconcile_forked_118_119 catch-up (fork band + 3)
+// re-runs this CREATE OR REPLACE AFTER v120, which would otherwise STRIP the pin
+// v120 just added (a healed brain that never ran v118 gets the function only from
+// this catch-up, with no v120 pass to re-harden it). Making it born-hardened here —
+// matching upstream's fresh schema.sql / pglite-schema.ts definition verbatim —
+// keeps the pin under every ordering. Guarded by test/migration-v120.test.ts.
 const PAGE_GENERATION_CLOCK_SEQUENCE_SWAP_SQL = `
       CREATE SEQUENCE IF NOT EXISTS page_generation_clock_seq;
 
@@ -145,7 +153,7 @@ const PAGE_GENERATION_CLOCK_SEQUENCE_SWAP_SQL = `
         COALESCE((SELECT MAX(generation) FROM pages), 0)
       ));
 
-      CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn() RETURNS trigger AS $func$
+      CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn() RETURNS trigger SET search_path = pg_catalog, public AS $func$
       BEGIN
         PERFORM nextval('page_generation_clock_seq');
         RETURN NULL;
@@ -932,7 +940,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF NOT has_bypass THEN
           -- Fail the migration loudly instead of WARNING + version-bump.
           -- The runner unconditionally records schema_version on success,
@@ -1221,7 +1229,7 @@ export const MIGRATIONS: Migration[] = [
         DECLARE
           has_bypass BOOLEAN;
         BEGIN
-          SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+          SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
           IF NOT has_bypass THEN
             RAISE EXCEPTION 'v29 cathedral_ii_code_edges_rls: role % does not have BYPASSRLS privilege — cannot enable RLS safely. Re-run as postgres (or another BYPASSRLS role). The migration will retry automatically on the next initSchema call.', current_user;
           END IF;
@@ -1309,7 +1317,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE takes              ENABLE ROW LEVEL SECURITY;
           ALTER TABLE synthesis_evidence ENABLE ROW LEVEL SECURITY;
@@ -1411,7 +1419,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE dream_verdicts ENABLE ROW LEVEL SECURITY;
         END IF;
@@ -1450,7 +1458,7 @@ export const MIGRATIONS: Migration[] = [
         DECLARE
           has_bypass BOOLEAN;
         BEGIN
-          SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+          SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
           IF NOT has_bypass THEN
             RAISE EXCEPTION 'v31 eval_capture_tables: role % does not have BYPASSRLS privilege — cannot enable RLS safely. Re-run as postgres (or another BYPASSRLS role). The migration will retry automatically on the next initSchema call.', current_user;
           END IF;
@@ -1569,7 +1577,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
           ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
@@ -1790,7 +1798,7 @@ export const MIGRATIONS: Migration[] = [
           has_bypass BOOLEAN;
           r record;
         BEGIN
-          SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+          SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
           IF NOT has_bypass THEN
             -- Same posture as v24: raise to abort the migration so the runner
             -- leaves config.version unbumped and retries on the next call.
@@ -2182,7 +2190,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE drift_decisions ENABLE ROW LEVEL SECURITY;
         END IF;
@@ -2435,7 +2443,7 @@ export const MIGRATIONS: Migration[] = [
           DECLARE
             has_bypass BOOLEAN;
           BEGIN
-            SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+            SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
             IF has_bypass THEN
               ALTER TABLE facts ENABLE ROW LEVEL SECURITY;
             END IF;
@@ -4459,7 +4467,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE take_domain_assignments ENABLE ROW LEVEL SECURITY;
         END IF;
@@ -5357,6 +5365,9 @@ export const MIGRATIONS: Migration[] = [
     // nextval() takes a microsecond LWLock, never a row lock. The Layer-1 cache
     // bookmark reads `last_value` instead of the row. Idempotent: CREATE
     // SEQUENCE IF NOT EXISTS + CREATE OR REPLACE + DROP TRIGGER IF EXISTS.
+    // [fork] SQL extracted to PAGE_GENERATION_CLOCK_SEQUENCE_SWAP_SQL (top of
+    // file), byte-identical to upstream's inline body, so the reconcile_forked_
+    // 118_119 catch-up (fork band + 3) can re-apply the exact same DDL.
     idempotent: true,
     sql: PAGE_GENERATION_CLOCK_SEQUENCE_SWAP_SQL,
   },
@@ -5371,6 +5382,144 @@ export const MIGRATIONS: Migration[] = [
     // CONSTRAINT (pg_constraint existence check).
     idempotent: true,
     sql: OP_CHECKPOINTS_ARRAY_CHECK_SQL,
+  },
+  {
+    version: 120,
+    name: 'schema_lint_hardening_search_path_security_invoker',
+    // v0.42 schema-lint hardening wave (#1647 / #171).
+    //
+    //   (b) security_invoker on the page_links view: pre-fix the view ran with
+    //       the definer/owner's privileges, so the anon / PostgREST role could
+    //       read `links` (which has RLS) THROUGH the view, bypassing RLS. This
+    //       is the single ERROR-severity Supabase lint. Postgres-only — PGLite
+    //       is embedded/single-user with no anon role and no PostgREST, so the
+    //       view has no RLS-bypass surface there (and security_invoker carries
+    //       no benefit). Guarded with IF EXISTS for very old brains.
+    //
+    //   (a)/(#171) search_path on every gbrain-owned trigger/event function:
+    //       an unqualified reference (e.g. `FROM timeline_entries`) resolves
+    //       through the caller's search_path, so a same-named object in a
+    //       user-controlled schema could shadow it. Pinning search_path closes
+    //       that. ALTER FUNCTION (NOT CREATE OR REPLACE) leaves each body
+    //       untouched — lowest drift risk, and critically safe for the
+    //       load-bearing `auto_enable_rls` event-trigger function (codex #3).
+    //       The IF EXISTS loop is engine-agnostic and skips functions a given
+    //       brain never created (e.g. auto_enable_rls + the NOTIFY/chunk
+    //       trigger functions are Postgres-only — codex #4).
+    //
+    // Regression guard is a doctor probe (pg_proc.proconfig) + scripts/
+    // check-search-path.sh, NOT a migration verify-hook — hooks don't run on
+    // brains already stamped past this version (learning: migration-verify-hook-
+    // never-runs-on-stamped-brains). Fresh installs are born correct: the
+    // function defs in schema.sql / pglite-schema.ts carry SET search_path too.
+    idempotent: true,
+    sql: '', // engine-specific via sqlFor
+    sqlFor: {
+      postgres: `
+        ALTER VIEW IF EXISTS page_links SET (security_invoker = on);
+
+        DO $$
+        DECLARE fn text;
+        BEGIN
+          FOREACH fn IN ARRAY ARRAY[
+            'bump_page_generation_fn','bump_page_generation_clock_fn',
+            'update_chunk_search_vector','update_page_search_vector',
+            'notify_minion_job_change','auto_enable_rls'
+          ] LOOP
+            IF EXISTS (
+              SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname = fn
+            ) THEN
+              EXECUTE format('ALTER FUNCTION public.%I() SET search_path = pg_catalog, public', fn);
+            END IF;
+          END LOOP;
+        END $$;
+      `,
+      pglite: `
+        DO $$
+        DECLARE fn text;
+        BEGIN
+          FOREACH fn IN ARRAY ARRAY[
+            'bump_page_generation_fn','bump_page_generation_clock_fn',
+            'update_chunk_search_vector','update_page_search_vector',
+            'notify_minion_job_change'
+          ] LOOP
+            IF EXISTS (
+              SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname = fn
+            ) THEN
+              EXECUTE format('ALTER FUNCTION public.%I() SET search_path = pg_catalog, public', fn);
+            END IF;
+          END LOOP;
+        END $$;
+      `,
+    },
+  },
+  {
+    version: 121,
+    name: 'timeline_entries_event_page_id',
+    // v0.42.x — Life Chronicle (#2390): the event→timeline projection pointer.
+    // A `type:event` page projects ONE date-index row into timeline_entries
+    // keyed to the depth/meeting page (page_id), with event_page_id pointing at
+    // the event page itself. Additive + idempotent: nullable FK + partial
+    // indexes; legacy rows keep event_page_id NULL so existing behavior is
+    // unchanged. The partial UNIQUE(event_page_id, date) makes re-extraction
+    // with a changed summary an UPDATE (not a duplicate). FK added via a guarded
+    // DO block (mirrors the facts_source_id_fkey pattern) so the ALTER is a
+    // no-op on re-runs. Mirrored in src/schema.sql, src/core/pglite-schema.ts,
+    // and the generated src/core/schema-embedded.ts for fresh installs.
+    idempotent: true,
+    sql: `
+      ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
+
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conname = 'timeline_entries_event_page_id_fkey'
+             AND conrelid = 'timeline_entries'::regclass
+        ) THEN
+          ALTER TABLE timeline_entries
+            ADD CONSTRAINT timeline_entries_event_page_id_fkey
+            FOREIGN KEY (event_page_id) REFERENCES pages(id) ON DELETE CASCADE;
+        END IF;
+      END $$;
+
+      CREATE INDEX IF NOT EXISTS idx_timeline_event_page
+        ON timeline_entries(event_page_id) WHERE event_page_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_event_dedup
+        ON timeline_entries(event_page_id, date) WHERE event_page_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 122,
+    name: 'facts_ontology_dimension',
+    // v0.42.x — Life Chronicle (#2390): the per-entity ontology rides the
+    // existing `facts` table. facts already gives bi-temporal validity
+    // (valid_from/valid_until/expired_at), supersession (superseded_by),
+    // remote redaction (visibility), confidence, provenance (source_markdown_slug),
+    // embedding, and corroboration (consolidated_into). The ONLY genuinely-new
+    // concept is a typed `dimension` (e.g. role, risk_tolerance) carrying a
+    // resolved `value` + a deterministic `value_hash` dedup key, plus a
+    // `dim_status` for quarantining novel/LLM-proposed dimensions. Plain facts
+    // keep dimension NULL → unchanged behavior. The partial UNIQUE is
+    // deterministic (no timestamp) so a crash-retry is idempotent. Additive;
+    // facts is migration-created (absent from static schema), so this migration
+    // is the single source for fresh + migrated brains.
+    idempotent: true,
+    sql: `
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS dimension  TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS value      TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS value_hash TEXT;
+      ALTER TABLE facts ADD COLUMN IF NOT EXISTS dim_status TEXT;
+
+      CREATE INDEX IF NOT EXISTS idx_facts_dimension
+        ON facts(source_id, entity_slug, dimension, valid_from DESC)
+        WHERE expired_at IS NULL AND dimension IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_ontology_dedup
+        ON facts(source_id, entity_slug, dimension, value_hash, source_markdown_slug)
+        WHERE dimension IS NOT NULL;
+    `,
   },
   {
     version: FORK_MIGRATION_BASE + 0, // 9000
