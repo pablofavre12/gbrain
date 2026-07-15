@@ -65,15 +65,39 @@ conflict marker, no error, no CI failure. This already bit us once: the fork's
   (`ADD COLUMN IF NOT EXISTS`, `CREATE ... IF NOT EXISTS`, guarded `ADD
   CONSTRAINT`) and order-independent, so appending is safe.
 
-**Healing brains hit by a past collision.** A brain that recorded version 119 under
-the old (fork) numbering will never re-run the upstream 118/119 placed there now
-(they're ≤ its bookmark). The fix is a **catch-up migration in the band** (e.g.
-`reconcile_forked_118_119` at `FORK_MIGRATION_BASE + 3`) that re-applies the exact
-same DDL idempotently. On a fresh install it's a harmless no-op.
+**Every upstream sync needs a band catch-up — not just number collisions.** This is
+the trap. The bookmark is a **single scalar high-water-mark**: once a deployed brain
+is stamped inside the band (`schema_version ≥ 9000`), `pending = version > current`
+makes **every** upstream migration non-pending — because they all live in the low
+range (< 9000). So a NEW upstream migration added at, say, 121 is `121 > 9003 = false`
+→ **skipped silently** on every already-deployed brain, leaving new code on a stale
+schema. This is a *superset* of the collision case: it is not limited to versions the
+fork previously shadowed. Two examples, same fix:
+
+- *Collision (118/119):* the fork's `federated_write` had grabbed 118/119; upstream's
+  real 118/119 were restored at their numbers + a catch-up `reconcile_forked_118_119`
+  at `FORK_MIGRATION_BASE + 3`.
+- *Plain new upstream migrations (120/121/122, the v0.42.59.0 sync):* never shadowed,
+  just numerically below the band ceiling → still skipped on brains at 9003. Fixed the
+  same way: added at their upstream numbers + a catch-up `reconcile_forked_120_121_122`
+  at `FORK_MIGRATION_BASE + 4`.
+
+**The catch-up recipe.** For each new upstream migration in a sync, add ONE band
+catch-up (version above the current band ceiling) that re-applies the exact same DDL,
+idempotently. Extract the DDL into a shared constant referenced by BOTH the upstream
+migration and the catch-up so they can never drift. If the upstream migration is
+engine-specific (`sqlFor`), the catch-up is too. On a fresh install (where 120/121/122
+ran in order) the catch-up is a harmless no-op; on a stamped brain it is the ONLY thing
+that delivers them. **Before shipping a sync, check prod's real bookmark**
+(`fly ssh console -a pere-brain -C "gbrain config get version"`) — if it is ≥ 9000, you
+MUST have a catch-up covering every new upstream migration or they never land.
 
 **Guardrail.** `test/migration-fork-band.test.ts` pins: unique versions, fork
-migrations live only in the band, upstream 118/119 restored by name, and the
-schema is healed after a full init. Run it after touching `migrate.ts`.
+migrations live only in the band (add new `reconcile_forked_*` names to its
+`FORK_LOCAL_NAMES`), upstream migrations restored by name, and the schema is healed
+after a full init. `test/migration-reconcile-120-122.test.ts` reproduces the stuck-brain
+case (bookmark forced to 9003, objects dropped → catch-up restores them). Run both after
+touching `migrate.ts`.
 
 ## Merge-conflict hotspots
 
@@ -103,10 +127,12 @@ git push fork sync/upstream-$(date +%Y%m%d)
 gh pr create --repo perennia-regen/gbrain --base perennia
 ```
 
-On merge, after resolving `migrate.ts`: if upstream added migrations that the fork
-had shadowed (collision), restore them at their upstream numbers and add a
-band catch-up so already-migrated brains heal. Re-run
-`test/migration-fork-band.test.ts`.
+On merge, after resolving `migrate.ts`: restore EVERY new upstream migration at its
+upstream number AND add a band catch-up (`reconcile_forked_*`) that re-applies its DDL
+idempotently — see "Every upstream sync needs a band catch-up" above. This is required
+for every sync that brings new upstream migrations, not only for number collisions,
+because deployed brains are stamped inside the band and skip anything below it. Re-run
+`test/migration-fork-band.test.ts` + `test/migration-reconcile-*.test.ts`.
 
 The `.github/workflows/upstream-sync.yml` workflow automates the fetch + merge
 attempt + test run and opens a PR (or an issue on conflict) on a schedule.
