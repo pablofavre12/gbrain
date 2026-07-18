@@ -1409,6 +1409,75 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
       // Informational, like 4.5: do NOT bump consecutiveErrors.
     }
 
+    // 4.7 — Nightly contradiction probe (perennia fork).
+    // Once per cadence (default 7d), run the suspected-contradictions probe
+    // over CAPTURED queries so find_contradictions has a fresh row instead of
+    // going stale forever (the routine cycle never invokes the probe; it needs
+    // an explicit query set). Requires eval.capture; skips silently WITHOUT
+    // spending when eval_candidates is empty. Postgres-only (needs the capture
+    // table + persisted runs). Wrapped in try/catch — a probe failure NEVER
+    // crashes the autopilot loop and does NOT bump consecutiveErrors.
+    try {
+      const cxEnabled = cfg?.autopilot?.nightly_contradiction_probe?.enabled === true;
+      if (cxEnabled && engine.kind === 'postgres') {
+        const { runNightlyContradictionProbe } = await import('../core/cycle/nightly-contradiction-probe.ts');
+        const { runContradictionProbe } = await import('../core/eval-contradictions/runner.ts');
+        const { writeRunRow } = await import('../core/eval-contradictions/trends.ts');
+        const { resolveModel } = await import('../core/model-config.ts');
+        const cxCfg = cfg?.autopilot?.nightly_contradiction_probe ?? {};
+        const cadenceDays = Number(cxCfg.cadence_days ?? 7);
+        const maxUsd = Number(cxCfg.max_usd ?? 0.6);
+        const maxQueries = Number(cxCfg.max_queries ?? 25);
+        const topK = Number(cxCfg.top_k ?? 5);
+        await runNightlyContradictionProbe({
+          isEnabled: () => true, // already gated above; phase re-checks for defense-in-depth
+          now: () => new Date(),
+          resolveCadenceMs: () => Math.max(0, cadenceDays) * 24 * 60 * 60 * 1000,
+          resolveMaxUsd: () => maxUsd,
+          resolveMaxQueries: () => maxQueries,
+          lastRunAt: async () => {
+            const rows = await engine.loadContradictionsTrend(Math.max(1, Math.ceil(cadenceDays) + 1));
+            const latest = rows[0]?.ran_at;
+            return latest ? new Date(latest) : null;
+          },
+          loadCaptureQueries: async (limit: number) => {
+            const rows = await engine.executeRaw<{ query: string }>(
+              `SELECT query FROM eval_candidates WHERE query IS NOT NULL ORDER BY id DESC LIMIT $1`,
+              [limit],
+            );
+            return (rows ?? [])
+              .map((r) => r.query)
+              .filter((q): q is string => typeof q === 'string' && q.length > 0);
+          },
+          runAndPersist: async ({ queries, budgetUsd }) => {
+            const judgeModel = await resolveModel(engine, {
+              configKey: 'models.eval.contradictions_judge',
+              tier: 'utility',
+              envVar: 'GBRAIN_CONTRADICTIONS_JUDGE_MODEL',
+              fallback: 'anthropic:claude-haiku-4-5',
+            });
+            const out = await runContradictionProbe({
+              engine,
+              queries,
+              judgeModel,
+              topK,
+              budgetUsd,
+              yesOverride: true, // non-interactive: auto-proceed past the pre-flight prompt
+            });
+            if (out.preFlightRefused) return null;
+            await writeRunRow(engine, out.report, out.report.duration_ms);
+            return {
+              run_id: out.report.run_id,
+              queries_evaluated: out.report.queries_evaluated,
+              total_contradictions_flagged: out.report.total_contradictions_flagged,
+            };
+          },
+        });
+      }
+    } catch (e) {
+      logError('autopilot.contradiction_probe', e);
+      // Intentional: probe failure is informational; loop continues.
+    }
     // Wait for next cycle
     await new Promise(r => setTimeout(r, interval * 1000));
   }

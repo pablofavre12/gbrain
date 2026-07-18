@@ -196,6 +196,25 @@ export interface GBrainConfig {
      * `gbrain config set autopilot.incremental_extract_include_frontmatter <bool>`.
      */
     incremental_extract_include_frontmatter?: boolean;
+    /**
+     * Nightly contradiction probe (perennia fork). Once per cadence, runs
+     * `suspected-contradictions` over CAPTURED queries so find_contradictions
+     * has a fresh row instead of going stale forever. Default OFF; requires
+     * `eval.capture: true` (skips WITHOUT spend when eval_candidates is empty).
+     * Enable with `gbrain config set autopilot.nightly_contradiction_probe.enabled true`.
+     */
+    nightly_contradiction_probe?: {
+      /** Master switch. Default false. */
+      enabled?: boolean;
+      /** Min days between runs. Default 7. */
+      cadence_days?: number;
+      /** Soft USD cap per run. Default 0.6. */
+      max_usd?: number;
+      /** Max captured queries evaluated per run. Default 25. */
+      max_queries?: number;
+      /** Retrieval pairs sampled per query. Default 5. */
+      top_k?: number;
+    };
   };
   eval?: {
     /** false disables capture entirely. Defaults to true. */
@@ -1149,7 +1168,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'provider_chat_options.', // per-provider / per-model chat providerOptions
   'content_sanity.',    // v0.41 content-sanity tunables
   'mcp.',               // mcp.publish_skills, mcp.skills_dir (PR1 skill catalog)
-  'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
+  'autopilot.',         // autopilot probes, auto_drain, and related scheduler knobs (#1685)
   'chronicle.',         // chronicle.tz + future Life Chronicle knobs (#2390)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
 ];
