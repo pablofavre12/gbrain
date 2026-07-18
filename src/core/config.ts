@@ -112,6 +112,25 @@ export interface GBrainConfig {
       /** Daily spend cap (USD); bounds drains/day = floor(cap / ~$0.30). Default 2.0. */
       max_usd_per_day?: number;
     };
+    /**
+     * Nightly contradiction probe (perennia fork). Once per cadence, runs
+     * `suspected-contradictions` over CAPTURED queries so find_contradictions
+     * has a fresh row instead of going stale forever. Default OFF; requires
+     * `eval.capture: true` (skips WITHOUT spend when eval_candidates is empty).
+     * Enable with `gbrain config set autopilot.nightly_contradiction_probe.enabled true`.
+     */
+    nightly_contradiction_probe?: {
+      /** Master switch. Default false. */
+      enabled?: boolean;
+      /** Min days between runs. Default 7. */
+      cadence_days?: number;
+      /** Soft USD cap per run. Default 0.6. */
+      max_usd?: number;
+      /** Max captured queries evaluated per run. Default 25. */
+      max_queries?: number;
+      /** Retrieval pairs sampled per query. Default 5. */
+      top_k?: number;
+    };
   };
   eval?: {
     /** false disables capture entirely. Defaults to true. */
@@ -942,7 +961,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'provider_base_urls.', // per-provider base URL overrides
   'content_sanity.',    // v0.41 content-sanity tunables
   'mcp.',               // mcp.publish_skills, mcp.skills_dir (PR1 skill catalog)
-  'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
+  'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.*, autopilot.nightly_contradiction_probe.* (#1685)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
 ];
 
