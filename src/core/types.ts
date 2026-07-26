@@ -142,6 +142,18 @@ export interface Page {
    * Test fixtures building synthetic Page rows must include this field.
    */
   source_id: string;
+  /**
+   * Page-level read ACL. NULL means legacy/public-within-source behavior.
+   * A non-empty array is visible only when it overlaps a server-resolved
+   * caller subject. Never derive caller subjects from tool parameters.
+   */
+  acl_subject_ids?: string[] | null;
+  /** Stable Platform document identity for monotonic version ingestion. */
+  document_id?: string | null;
+  /** Monotonic Platform version sequence. Present together with document_id/hash. */
+  document_version_sequence?: number | null;
+  /** SHA-256 of the canonical Platform version source. */
+  document_version_hash?: string | null;
 
   // v0.39.3.0 provenance read-path (WARN-8 + CV5). Migration v81 columns
   // surfaced through getPage / list_pages so `gbrain call get_page | jq
@@ -305,6 +317,15 @@ export interface PageInput {
   last_write_client_id?: string | null;
   /** Human-readable agent name of the writer; NULL for identity-less callers. */
   last_write_client_name?: string | null;
+  /**
+   * Page-level read ACL. Undefined preserves an existing ACL on update;
+   * a non-empty array restricts the page to matching server-resolved subjects.
+   */
+  acl_subject_ids?: string[] | null;
+  /** All three document fence fields are supplied together for versioned documents. */
+  document_id?: string | null;
+  document_version_sequence?: number | null;
+  document_version_hash?: string | null;
 }
 
 export interface PageFilters {
@@ -360,6 +381,11 @@ export interface PageFilters {
    * pre-v0.34 unscoped behavior is preserved for local CLI callers.
    */
   sourceIds?: string[];
+  /**
+   * Server-resolved page ACL subjects. Undefined is a trusted/local bypass;
+   * an empty array means public pages only (fail-closed remote caller).
+   */
+  aclSubjectIds?: string[];
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */
@@ -374,6 +400,8 @@ export interface GetPageOpts {
   sourceIds?: string[];
   /** Include soft-deleted pages. Default false. See PageFilters.includeDeleted. */
   includeDeleted?: boolean;
+  /** See PageFilters.aclSubjectIds. */
+  aclSubjectIds?: string[];
 }
 
 /** v0.29: literal ORDER BY fragments for the PageFilters.sort enum. Whitelisted. */
@@ -1047,6 +1075,11 @@ export interface SearchOpts {
    */
   orFallback?: boolean;
   /**
+   * Server-resolved page ACL subjects. Undefined is reserved for trusted
+   * local/internal callers; [] means public pages only.
+   */
+  aclSubjectIds?: string[];
+  /**
    * v0.27.1 / v0.36 (D11): target column for vector search. Two shapes:
    *
    * 1. String name (legacy + user-facing). Engine and hybridSearch convert
@@ -1236,13 +1269,29 @@ export interface CodeEdgeResult {
 }
 
 // Links
+/**
+ * Stable public identity for a page. Slugs are human-readable aliases only:
+ * they are unique within a source, never across the whole brain.
+ */
+export interface BrainPageRef {
+  source_id: string;
+  page_id: number;
+  slug: string;
+}
+
 export interface Link {
+  /** Full endpoint references prevent same-slug pages from being merged by clients. */
+  from: BrainPageRef;
+  to: BrainPageRef;
+  /** Legacy, human-readable endpoint aliases. Prefer `from` / `to` for identity. */
   from_slug: string;
   /** Exact source identity of the from-page joined by from_page_id. */
   from_source_id: string;
   to_slug: string;
   /** Exact source identity of the to-page joined by to_page_id. */
   to_source_id: string;
+  from_page_id: number;
+  to_page_id: number;
   link_type: string;
   context: string;
   /**
@@ -1269,12 +1318,18 @@ export interface Link {
   origin_field?: string | null;
 }
 
-export interface GraphNode {
-  slug: string;
+export interface GraphNode extends BrainPageRef {
   title: string;
   type: PageType;
   depth: number;
-  links: { to_slug: string; link_type: string }[];
+  links: Array<{
+    to: BrainPageRef;
+    /** Legacy, human-readable alias. Prefer `to` for identity. */
+    to_slug: string;
+    to_source_id: string;
+    to_page_id: number;
+    link_type: string;
+  }>;
 }
 
 /**
@@ -1283,8 +1338,15 @@ export interface GraphNode {
  * actual edge with direction, type, and depth from the root.
  */
 export interface GraphPath {
+  from: BrainPageRef;
+  to: BrainPageRef;
+  /** Legacy, human-readable endpoint aliases. Prefer `from` / `to` for identity. */
   from_slug: string;
   to_slug: string;
+  from_source_id: string;
+  to_source_id: string;
+  from_page_id: number;
+  to_page_id: number;
   link_type: string;
   context: string;
   /** Depth of `to_slug` from the root (1 for direct neighbors). */
@@ -1324,6 +1386,8 @@ export interface RelationalFanoutOpts {
   sourceId?: string;
   /** Federated scope; traversal stays WITHIN each seed's own source. */
   sourceIds?: string[];
+  /** See SearchOpts.aclSubjectIds. */
+  aclSubjectIds?: string[];
   /** Hard cap on returned candidate nodes. Default 50. */
   limit?: number;
 }

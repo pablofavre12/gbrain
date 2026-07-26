@@ -19,7 +19,7 @@ import type {
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
 } from './engine.ts';
-import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
+import { MAX_SEARCH_LIMIT, clampSearchLimit, DocumentVersionConflictError } from './engine.ts';
 // Engine-path imports stay static unless a call site carries an explicit
 // engine-dynamic-import-ok justification. The gateway is the only current
 // exception because its local try/catch preserves a soft fallback.
@@ -684,6 +684,8 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema='public' AND table_name='pages') AS pages_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='pages' AND column_name='acl_subject_ids') AS pages_acl_subject_ids_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='pages' AND column_name='source_id') AS source_id_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='pages' AND column_name='deleted_at') AS deleted_at_exists,
@@ -776,6 +778,7 @@ export class PGLiteEngine implements BrainEngine {
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
+      pages_acl_subject_ids_exists: boolean;
       source_id_exists: boolean;
       deleted_at_exists: boolean;
       links_exists: boolean;
@@ -824,6 +827,7 @@ export class PGLiteEngine implements BrainEngine {
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
+    const needsPagesAclBootstrap = probe.pages_exists && !probe.pages_acl_subject_ids_exists;
     const needsLinksBootstrap = probe.links_exists
       && (!probe.link_source_exists || !probe.origin_page_id_exists);
     const needsChunksBootstrap = probe.chunks_exists
@@ -918,7 +922,8 @@ export class PGLiteEngine implements BrainEngine {
         && !needsPagesEmbeddingSignature
         && !needsPagesLinksExtractedAt
         && !needsTimelineEventPageId
-        && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey) return;
+        && !needsMinionJobsTimeoutAt && !needsMinionJobsIdempotencyKey
+        && !needsPagesAclBootstrap) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -1189,6 +1194,16 @@ export class PGLiteEngine implements BrainEngine {
         ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
       `);
     }
+
+    if (needsPagesAclBootstrap) {
+      // Fork v9004 forward-reference bootstrap for the ACL GIN index.
+      await this.db.exec(`
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS acl_subject_ids TEXT[];
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS document_id TEXT;
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS document_version_sequence BIGINT;
+        ALTER TABLE pages ADD COLUMN IF NOT EXISTS document_version_hash TEXT;
+      `);
+    }
   }
 
   async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
@@ -1218,7 +1233,7 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   // Pages CRUD
-  async getPage(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeDeleted?: boolean }): Promise<Page | null> {
+  async getPage(slug: string, opts?: import('./types.ts').GetPageOpts): Promise<Page | null> {
     // v0.26.5: hide soft-deleted by default; opt-in via opts.includeDeleted.
     const includeDeleted = opts?.includeDeleted === true;
     const sourceId = opts?.sourceId;
@@ -1237,13 +1252,51 @@ export class PGLiteEngine implements BrainEngine {
     if (!includeDeleted) {
       where.push('deleted_at IS NULL');
     }
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        where.push(`(acl_subject_ids IS NULL OR acl_subject_ids && $${params.length}::text[])`);
+      } else {
+        where.push('acl_subject_ids IS NULL');
+      }
+    }
     const { rows } = await this.db.query(
       `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
               effective_date, effective_date_source,
               source_kind, source_uri, ingested_via, ingested_at,
-              contextual_retrieval_mode
+              contextual_retrieval_mode, acl_subject_ids, document_id, document_version_sequence, document_version_hash
        FROM pages WHERE ${where.join(' AND ')} LIMIT 1`,
       params
+    );
+    if (rows.length === 0) return null;
+    return rowToPage(rows[0] as Record<string, unknown>);
+  }
+
+  async getPageById(pageId: number, opts?: import('./types.ts').GetPageOpts): Promise<Page | null> {
+    const includeDeleted = opts?.includeDeleted === true;
+    const where: string[] = ['id = $1'];
+    const params: unknown[] = [pageId];
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      where.push(`source_id = ANY($${params.length}::text[])`);
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      where.push(`source_id = $${params.length}`);
+    }
+    if (!includeDeleted) where.push('deleted_at IS NULL');
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        where.push(`(acl_subject_ids IS NULL OR acl_subject_ids && $${params.length}::text[])`);
+      } else {
+        where.push('acl_subject_ids IS NULL');
+      }
+    }
+    const { rows } = await this.db.query(
+      `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
+              source_kind, source_uri, ingested_via, ingested_at, acl_subject_ids, document_id, document_version_sequence, document_version_hash
+       FROM pages WHERE ${where.join(' AND ')} LIMIT 1`,
+      params,
     );
     if (rows.length === 0) return null;
     return rowToPage(rows[0] as Record<string, unknown>);
@@ -1260,7 +1313,7 @@ export class PGLiteEngine implements BrainEngine {
    */
   async getPageLayers(
     slug: string,
-    opts?: { sourceIds?: string[]; includeDeleted?: boolean },
+    opts?: { sourceIds?: string[]; includeDeleted?: boolean; aclSubjectIds?: string[] },
   ): Promise<Page[]> {
     const includeDeleted = opts?.includeDeleted === true;
     const sourceIds = opts?.sourceIds;
@@ -1274,6 +1327,14 @@ export class PGLiteEngine implements BrainEngine {
     if (!includeDeleted) {
       where.push('deleted_at IS NULL');
     }
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        where.push(`(acl_subject_ids IS NULL OR acl_subject_ids && $${params.length}::text[])`);
+      } else {
+        where.push('acl_subject_ids IS NULL');
+      }
+    }
     // Order by the caller's scope array (array_position is 1-based; NULL for
     // unlisted source_ids → NULLS LAST), alphabetical source_id as tiebreaker.
     let orderBy: string;
@@ -1285,7 +1346,7 @@ export class PGLiteEngine implements BrainEngine {
     }
     const { rows } = await this.db.query(
       `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
-              source_kind, source_uri, ingested_via, ingested_at
+              source_kind, source_uri, ingested_via, ingested_at, acl_subject_ids, document_id, document_version_sequence, document_version_hash
        FROM pages WHERE ${where.join(' AND ')} ${orderBy}`,
       params
     );
@@ -1349,9 +1410,13 @@ export class PGLiteEngine implements BrainEngine {
     // prior author. Mirrors postgres-engine.ts.
     const lastWriteClientId = page.last_write_client_id ?? null;
     const lastWriteClientName = page.last_write_client_name ?? null;
+    const aclSubjectIds = page.acl_subject_ids ?? null;
+    const documentId = page.document_id ?? null;
+    const documentVersionSequence = page.document_version_sequence ?? null;
+    const documentVersionHash = page.document_version_hash ?? null;
     const { rows } = await this.db.query(
-      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at, last_write_client_id, last_write_client_name)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, ${MARKDOWN_CHUNKER_VERSION}), $14, $15, $16, $17, $18::timestamptz, $19, $20)
+      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at, last_write_client_id, last_write_client_name, acl_subject_ids, document_id, document_version_sequence, document_version_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, ${MARKDOWN_CHUNKER_VERSION}), $14, $15, $16, $17, $18::timestamptz, $19, $20, $21::text[], $22, $23, $24)
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          page_kind = EXCLUDED.page_kind,
@@ -1372,19 +1437,45 @@ export class PGLiteEngine implements BrainEngine {
          ingested_via           = COALESCE(EXCLUDED.ingested_via,           pages.ingested_via),
          ingested_at            = COALESCE(EXCLUDED.ingested_at,            pages.ingested_at),
          last_write_client_id   = COALESCE(EXCLUDED.last_write_client_id,   pages.last_write_client_id),
-         last_write_client_name = COALESCE(EXCLUDED.last_write_client_name, pages.last_write_client_name)
-       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at, last_write_client_id, last_write_client_name`,
-       [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, lastWriteClientId, lastWriteClientName]
+         last_write_client_name = COALESCE(EXCLUDED.last_write_client_name, pages.last_write_client_name),
+         acl_subject_ids        = COALESCE(EXCLUDED.acl_subject_ids,        pages.acl_subject_ids),
+         document_id                 = COALESCE(EXCLUDED.document_id, pages.document_id),
+         document_version_sequence   = COALESCE(EXCLUDED.document_version_sequence, pages.document_version_sequence),
+         document_version_hash       = COALESCE(EXCLUDED.document_version_hash, pages.document_version_hash)
+       WHERE
+         pages.document_id IS NULL
+         OR (
+           EXCLUDED.document_id = pages.document_id
+           AND (
+             EXCLUDED.document_version_sequence > pages.document_version_sequence
+             OR (
+               EXCLUDED.document_version_sequence = pages.document_version_sequence
+               AND EXCLUDED.document_version_hash = pages.document_version_hash
+               AND EXCLUDED.content_hash = pages.content_hash
+             )
+           )
+         )
+       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at, last_write_client_id, last_write_client_name, acl_subject_ids, document_id, document_version_sequence, document_version_hash`,
+      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, lastWriteClientId, lastWriteClientName, aclSubjectIds, documentId, documentVersionSequence, documentVersionHash]
     );
-    // PGLite can return zero rows from INSERT ... ON CONFLICT DO UPDATE ...
-    // RETURNING in no-op/trigger edge cases, which made rowToPage(undefined)
-    // throw "undefined is not an object (evaluating 'row.deleted_at')" and
-    // skip the file during sync. The row WAS written, so re-read instead of
-    // crashing.
     if (rows.length === 0) {
-      const reread = await this.getPage(slug, { sourceId });
-      if (reread) return reread;
-      throw new Error(`putPage: RETURNING produced no row for ${sourceId}/${slug}`);
+      const current = await this.db.query<{
+        document_id: string | null;
+        document_version_sequence: number | string | null;
+        document_version_hash: string | null;
+      }>(
+        `SELECT document_id, document_version_sequence, document_version_hash
+         FROM pages WHERE source_id = $1 AND slug = $2 LIMIT 1`,
+        [sourceId, slug],
+      );
+      const row = current.rows[0];
+      throw new DocumentVersionConflictError({
+        document_id: row?.document_id ?? null,
+        document_version_sequence: row?.document_version_sequence == null
+          ? null
+          : Number(row.document_version_sequence),
+        document_version_hash: row?.document_version_hash ?? null,
+      });
     }
     return rowToPage(rows[0] as Record<string, unknown>);
   }
@@ -1601,6 +1692,14 @@ export class PGLiteEngine implements BrainEngine {
     // v0.26.5: hide soft-deleted by default; opt in via filters.includeDeleted.
     if (filters?.includeDeleted !== true) {
       where.push('p.deleted_at IS NULL');
+    }
+    if (filters?.aclSubjectIds !== undefined) {
+      if (filters.aclSubjectIds.length > 0) {
+        params.push(filters.aclSubjectIds);
+        where.push(`(p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`);
+      } else {
+        where.push('p.acl_subject_ids IS NULL');
+      }
     }
 
     const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
@@ -1843,39 +1942,42 @@ export class PGLiteEngine implements BrainEngine {
     }));
   }
 
-  async resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]> {
-    // v0.41.13 #1436: source scope. When opts.sourceIds is set
-    // (federated_read OAuth tier), filter via `source_id = ANY($N::text[])`.
-    // When opts.sourceId is set (scalar single-source tier), filter via
-    // `source_id = $N`. When neither is set, preserve the pre-fix unscoped
-    // behavior so internal CLI callers (`gbrain query --resolve` etc.)
-    // continue to walk every source.
-    const sources = opts?.sourceIds ?? null;
-    const scalar = opts?.sourceId ?? null;
-    const scopeSql = sources
-      ? ` AND source_id = ANY($${'__N__'}::text[])`
-      : scalar
-        ? ` AND source_id = $${'__N__'}`
-        : '';
+  async resolveSlugs(partial: string, opts?: import('./engine.ts').PageReferenceOpts): Promise<string[]> {
+    const buildWhere = (fuzzy: boolean): { sql: string; params: unknown[] } => {
+      const params: unknown[] = fuzzy ? [partial, '%' + partial + '%'] : [partial];
+      const where = fuzzy
+        ? ['deleted_at IS NULL', '(title % $1 OR slug ILIKE $2)']
+        : ['slug = $1', 'deleted_at IS NULL'];
+      if (opts?.sourceIds && opts.sourceIds.length > 0) {
+        params.push(opts.sourceIds);
+        where.push(`source_id = ANY($${params.length}::text[])`);
+      } else if (opts?.sourceId) {
+        params.push(opts.sourceId);
+        where.push(`source_id = $${params.length}`);
+      }
+      if (opts?.aclSubjectIds !== undefined) {
+        if (opts.aclSubjectIds.length > 0) {
+          params.push(opts.aclSubjectIds);
+          where.push(`(acl_subject_ids IS NULL OR acl_subject_ids && $${params.length}::text[])`);
+        } else {
+          where.push('acl_subject_ids IS NULL');
+        }
+      }
+      return { sql: where.join(' AND '), params };
+    };
 
-    // Try exact match first
-    const exactSql = `SELECT slug FROM pages WHERE slug = $1 AND deleted_at IS NULL${scopeSql.replace('__N__', '2')}`;
-    const exactParams: unknown[] = sources ? [partial, sources] : scalar ? [partial, scalar] : [partial];
-    const exact = await this.db.query(exactSql, exactParams);
+    const exactBuilt = buildWhere(false);
+    const exact = await this.db.query(`SELECT slug FROM pages WHERE ${exactBuilt.sql}`, exactBuilt.params);
     if (exact.rows.length > 0) return [(exact.rows[0] as { slug: string }).slug];
 
     // Fuzzy match via pg_trgm
+    const fuzzyBuilt = buildWhere(true);
     const fuzzySql = `SELECT slug, similarity(title, $1) AS sim
        FROM pages
-       WHERE deleted_at IS NULL AND (title % $1 OR slug ILIKE $2)${scopeSql.replace('__N__', '3')}
+       WHERE ${fuzzyBuilt.sql}
        ORDER BY sim DESC
        LIMIT 5`;
-    const fuzzyParams: unknown[] = sources
-      ? [partial, '%' + partial + '%', sources]
-      : scalar
-        ? [partial, '%' + partial + '%', scalar]
-        : [partial, '%' + partial + '%'];
-    const { rows } = await this.db.query(fuzzySql, fuzzyParams);
+    const { rows } = await this.db.query(fuzzySql, fuzzyBuilt.params);
     return (rows as { slug: string }[]).map(r => r.slug);
   }
 
@@ -1961,6 +2063,14 @@ export class PGLiteEngine implements BrainEngine {
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
       extraFilter += ` AND p.source_id = $${params.length}`;
+    }
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        extraFilter += ` AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+      } else {
+        extraFilter += ' AND p.acl_subject_ids IS NULL';
+      }
     }
 
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
@@ -2203,6 +2313,14 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.sourceId);
       extraFilter += ` AND p.source_id = $${params.length}`;
     }
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        extraFilter += ` AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+      } else {
+        extraFilter += ' AND p.acl_subject_ids IS NULL';
+      }
+    }
 
     // Bigram-frequency count: count occurrences of $qRaw in chunk_text via
     // (length(chunk) - length(replace(chunk, q, ''))) / length(q). Acts as
@@ -2339,6 +2457,14 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.sourceId);
       extraFilter += ` AND p.source_id = $${params.length}`;
     }
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        extraFilter += ` AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+      } else {
+        extraFilter += ' AND p.acl_subject_ids IS NULL';
+      }
+    }
 
     // visibilityClause already declared above (v0.32.7: hoisted so CJK branch can reuse).
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
@@ -2439,6 +2565,14 @@ export class PGLiteEngine implements BrainEngine {
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
       extraFilter += ` AND p.source_id = $${params.length}`;
+    }
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        extraFilter += ` AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+      } else {
+        extraFilter += ' AND p.acl_subject_ids IS NULL';
+      }
     }
 
     // v0.26.5: visibility filter applied in the inner CTE so HNSW sees the
@@ -3205,135 +3339,123 @@ export class PGLiteEngine implements BrainEngine {
     }
   }
 
-  async getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]> {
-    // #2200: federated grant scopes ALL THREE page endpoints — from, to, AND the
-    // origin (the authoring page, surfaced as origin_slug). The origin LEFT JOIN
-    // carries the same ANY($) filter so an out-of-grant origin's slug nulls out.
-    // Remote MCP clients always land here.
+  async getLinks(slug: string, opts?: import('./engine.ts').PageReferenceOpts): Promise<Link[]> {
+    const params: unknown[] = [];
+    const where: string[] = [];
+    const originJoin: string[] = [];
+    params.push(opts?.pageId ?? slug);
+    where.push(opts?.pageId ? `f.id = $${params.length}` : `f.slug = $${params.length}`);
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
-      const { rows } = await this.db.query(
-        `SELECT f.slug as from_slug, f.source_id as from_source_id,
-                t.slug as to_slug, t.source_id as to_source_id,
-                l.link_type, l.context, l.link_source,
-                o.slug as origin_slug, o.source_id as origin_source_id,
-                l.origin_field
-         FROM links l
-         JOIN pages f ON f.id = l.from_page_id
-         JOIN pages t ON t.id = l.to_page_id
-         LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY($2::text[])
-         WHERE f.slug = $1 AND f.source_id = ANY($2::text[]) AND t.source_id = ANY($2::text[])`,
-        [slug, opts.sourceIds]
-      );
-      return rows as unknown as Link[];
+      params.push(opts.sourceIds);
+      const idx = params.length;
+      where.push(`f.source_id = ANY($${idx}::text[])`, `t.source_id = ANY($${idx}::text[])`);
+      originJoin.push(`o.source_id = ANY($${idx}::text[])`);
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      const idx = params.length;
+      where.push(`f.source_id = $${idx}`, `t.source_id = $${idx}`);
     }
-    // v0.31.8 (D16) + #2200: the federated arm above is the first branch; the two
-    // below preserve pre-v0.31.8 semantics. Without opts.sourceId, no source filter
-    // (cross-source view for back-link validators and reconcileLinks). With
-    // opts.sourceId, scope to that source (D20).
-    if (opts?.sourceId) {
-      const { rows } = await this.db.query(
-        `SELECT f.slug as from_slug, f.source_id as from_source_id,
-                t.slug as to_slug, t.source_id as to_source_id,
-                l.link_type, l.context, l.link_source,
-                o.slug as origin_slug, o.source_id as origin_source_id,
-                l.origin_field
-         FROM links l
-         JOIN pages f ON f.id = l.from_page_id
-         JOIN pages t ON t.id = l.to_page_id
-         LEFT JOIN pages o ON o.id = l.origin_page_id
-         WHERE f.slug = $1 AND f.source_id = $2`,
-        [slug, opts.sourceId]
-      );
-      return rows as unknown as Link[];
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        const idx = params.length;
+        where.push(
+          `(f.acl_subject_ids IS NULL OR f.acl_subject_ids && $${idx}::text[])`,
+          `(t.acl_subject_ids IS NULL OR t.acl_subject_ids && $${idx}::text[])`,
+        );
+        originJoin.push(`(o.acl_subject_ids IS NULL OR o.acl_subject_ids && $${idx}::text[])`);
+      } else {
+        where.push('f.acl_subject_ids IS NULL', 't.acl_subject_ids IS NULL');
+        originJoin.push('o.acl_subject_ids IS NULL');
+      }
     }
     const { rows } = await this.db.query(
-      `SELECT f.slug as from_slug, f.source_id as from_source_id,
-              t.slug as to_slug, t.source_id as to_source_id,
-              l.link_type, l.context, l.link_source,
-              o.slug as origin_slug, o.source_id as origin_source_id,
-              l.origin_field
-       FROM links l
-       JOIN pages f ON f.id = l.from_page_id
-       JOIN pages t ON t.id = l.to_page_id
-       LEFT JOIN pages o ON o.id = l.origin_page_id
-       WHERE f.slug = $1`,
-      [slug]
+      `SELECT f.id as from_page_id, f.source_id as from_source_id, f.slug as from_slug,
+              t.id as to_page_id, t.source_id as to_source_id, t.slug as to_slug,
+              l.link_type, l.context, l.link_source, o.slug as origin_slug, l.origin_field
+       FROM links l JOIN pages f ON f.id = l.from_page_id JOIN pages t ON t.id = l.to_page_id
+       LEFT JOIN pages o ON o.id = l.origin_page_id${originJoin.length > 0 ? ` AND ${originJoin.join(' AND ')}` : ''}
+       WHERE ${where.join(' AND ')}`,
+      params,
     );
-    return rows as unknown as Link[];
+    return (rows as Record<string, unknown>[]).map(linkRowToLink);
   }
 
-  async getBacklinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]> {
-    // #2200: federated grant scopes all three endpoints (mirrors getLinks) — the
-    // referrer (from), the queried page (to), AND the origin — so neither a
-    // foreign referrer nor a foreign origin slug is disclosed to the caller.
+  async getBacklinks(slug: string, opts?: import('./engine.ts').PageReferenceOpts): Promise<Link[]> {
+    const params: unknown[] = [];
+    const where: string[] = [];
+    const originJoin: string[] = [];
+    params.push(opts?.pageId ?? slug);
+    where.push(opts?.pageId ? `t.id = $${params.length}` : `t.slug = $${params.length}`);
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
-      const { rows } = await this.db.query(
-        `SELECT f.slug as from_slug, f.source_id as from_source_id,
-                t.slug as to_slug, t.source_id as to_source_id,
-                l.link_type, l.context, l.link_source,
-                o.slug as origin_slug, o.source_id as origin_source_id,
-                l.origin_field
-         FROM links l
-         JOIN pages f ON f.id = l.from_page_id
-         JOIN pages t ON t.id = l.to_page_id
-         LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY($2::text[])
-         WHERE t.slug = $1 AND t.source_id = ANY($2::text[]) AND f.source_id = ANY($2::text[])`,
-        [slug, opts.sourceIds]
-      );
-      return rows as unknown as Link[];
+      params.push(opts.sourceIds);
+      const idx = params.length;
+      where.push(`f.source_id = ANY($${idx}::text[])`, `t.source_id = ANY($${idx}::text[])`);
+      originJoin.push(`o.source_id = ANY($${idx}::text[])`);
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      const idx = params.length;
+      where.push(`f.source_id = $${idx}`, `t.source_id = $${idx}`);
     }
-    // v0.31.8 (D16) + #2200: federated arm above is first; two below mirror getLinks.
-    if (opts?.sourceId) {
-      const { rows } = await this.db.query(
-        `SELECT f.slug as from_slug, f.source_id as from_source_id,
-                t.slug as to_slug, t.source_id as to_source_id,
-                l.link_type, l.context, l.link_source,
-                o.slug as origin_slug, o.source_id as origin_source_id,
-                l.origin_field
-         FROM links l
-         JOIN pages f ON f.id = l.from_page_id
-         JOIN pages t ON t.id = l.to_page_id
-         LEFT JOIN pages o ON o.id = l.origin_page_id
-         WHERE t.slug = $1 AND t.source_id = $2`,
-        [slug, opts.sourceId]
-      );
-      return rows as unknown as Link[];
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        const idx = params.length;
+        where.push(
+          `(f.acl_subject_ids IS NULL OR f.acl_subject_ids && $${idx}::text[])`,
+          `(t.acl_subject_ids IS NULL OR t.acl_subject_ids && $${idx}::text[])`,
+        );
+        originJoin.push(`(o.acl_subject_ids IS NULL OR o.acl_subject_ids && $${idx}::text[])`);
+      } else {
+        where.push('f.acl_subject_ids IS NULL', 't.acl_subject_ids IS NULL');
+        originJoin.push('o.acl_subject_ids IS NULL');
+      }
     }
     const { rows } = await this.db.query(
-      `SELECT f.slug as from_slug, f.source_id as from_source_id,
-              t.slug as to_slug, t.source_id as to_source_id,
-              l.link_type, l.context, l.link_source,
-              o.slug as origin_slug, o.source_id as origin_source_id,
-              l.origin_field
-       FROM links l
-       JOIN pages f ON f.id = l.from_page_id
-       JOIN pages t ON t.id = l.to_page_id
-       LEFT JOIN pages o ON o.id = l.origin_page_id
-       WHERE t.slug = $1`,
-      [slug]
+      `SELECT f.id as from_page_id, f.source_id as from_source_id, f.slug as from_slug,
+              t.id as to_page_id, t.source_id as to_source_id, t.slug as to_slug,
+              l.link_type, l.context, l.link_source, o.slug as origin_slug, l.origin_field
+       FROM links l JOIN pages f ON f.id = l.from_page_id JOIN pages t ON t.id = l.to_page_id
+       LEFT JOIN pages o ON o.id = l.origin_page_id${originJoin.length > 0 ? ` AND ${originJoin.join(' AND ')}` : ''}
+       WHERE ${where.join(' AND ')}`,
+      params,
     );
-    return rows as unknown as Link[];
+    return (rows as Record<string, unknown>[]).map(linkRowToLink);
   }
 
   async listLinkSources(
-    opts?: { sourceId?: string; sourceIds?: string[] },
+    opts?: import('./engine.ts').PageReferenceOpts,
   ): Promise<{ link_source: string | null; count: number }[]> {
     // v114 (#1941): distinct provenances + counts for `gbrain link-sources`.
     // Scope by the FROM page's source (consistent with getLinks). Federated
     // {sourceIds} takes precedence over scalar {sourceId}; neither = unscoped.
     const params: unknown[] = [];
-    let where = '';
+    const conditions: string[] = [];
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
       params.push(opts.sourceIds);
-      where = `JOIN pages f ON f.id = l.from_page_id WHERE f.source_id = ANY($${params.length}::text[])`;
+      conditions.push(`f.source_id = ANY($${params.length}::text[])`, `t.source_id = ANY($${params.length}::text[])`);
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
-      where = `JOIN pages f ON f.id = l.from_page_id WHERE f.source_id = $${params.length}`;
+      conditions.push(`f.source_id = $${params.length}`, `t.source_id = $${params.length}`);
+    }
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        const idx = params.length;
+        conditions.push(
+          `(f.acl_subject_ids IS NULL OR f.acl_subject_ids && $${idx}::text[])`,
+          `(t.acl_subject_ids IS NULL OR t.acl_subject_ids && $${idx}::text[])`,
+        );
+      } else {
+        conditions.push('f.acl_subject_ids IS NULL', 't.acl_subject_ids IS NULL');
+      }
     }
     const { rows } = await this.db.query(
       `SELECT l.link_source, COUNT(*)::int AS count
        FROM links l
-       ${where}
+       JOIN pages f ON f.id = l.from_page_id
+       JOIN pages t ON t.id = l.to_page_id
+       WHERE ${conditions.length > 0 ? conditions.join(' AND ') : '1=1'}
        GROUP BY l.link_source
        ORDER BY count DESC, l.link_source ASC NULLS LAST`,
       params,
@@ -3392,7 +3514,7 @@ export class PGLiteEngine implements BrainEngine {
   ): Promise<GraphNode[]> {
     // v0.34.1 (#861 — P0 leak seal): source-scope filters at seed, step, and
     // aggregation subquery. Mirrors postgres-engine.traverseGraph placement.
-    const params: unknown[] = [slug, depth];
+    const params: unknown[] = [opts?.pageId ?? slug, depth];
     const useSourceIds = opts?.sourceIds && opts.sourceIds.length > 0;
     let seedScope = '';
     let stepScope = '';
@@ -3410,6 +3532,22 @@ export class PGLiteEngine implements BrainEngine {
       stepScope = `AND p2.source_id = $${idx}`;
       aggScope = `AND p3.source_id = $${idx}`;
     }
+    let seedAcl = '';
+    let stepAcl = '';
+    let aggAcl = '';
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        const idx = params.length;
+        seedAcl = `AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${idx}::text[])`;
+        stepAcl = `AND (p2.acl_subject_ids IS NULL OR p2.acl_subject_ids && $${idx}::text[])`;
+        aggAcl = `AND (p3.acl_subject_ids IS NULL OR p3.acl_subject_ids && $${idx}::text[])`;
+      } else {
+        seedAcl = 'AND p.acl_subject_ids IS NULL';
+        stepAcl = 'AND p2.acl_subject_ids IS NULL';
+        aggAcl = 'AND p3.acl_subject_ids IS NULL';
+      }
+    }
 
     // T8 (v0.36+): frontier cap. When set, the recursive term applies a
     // parenthesized LIMIT N ORDER BY (slug, id) for stable selection. Per-
@@ -3421,51 +3559,55 @@ export class PGLiteEngine implements BrainEngine {
     if (cap !== undefined && cap > 0) {
       params.push(cap);
       const capIdx = params.length;
-      recursiveTerm = `(SELECT p2.id, p2.slug, p2.title, p2.type, g.depth + 1, g.visited || p2.id
+      recursiveTerm = `(SELECT p2.id, p2.source_id, p2.slug, p2.title, p2.type, g.depth + 1, g.visited || p2.id
         FROM graph g
         JOIN links l ON l.from_page_id = g.id
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE g.depth < $2
           AND NOT (p2.id = ANY(g.visited))
           ${stepScope}
+          ${stepAcl}
         ORDER BY p2.slug ASC, p2.id ASC
         LIMIT $${capIdx})`;
     } else {
-      recursiveTerm = `SELECT p2.id, p2.slug, p2.title, p2.type, g.depth + 1, g.visited || p2.id
+      recursiveTerm = `SELECT p2.id, p2.source_id, p2.slug, p2.title, p2.type, g.depth + 1, g.visited || p2.id
         FROM graph g
         JOIN links l ON l.from_page_id = g.id
         JOIN pages p2 ON p2.id = l.to_page_id
         WHERE g.depth < $2
           AND NOT (p2.id = ANY(g.visited))
-          ${stepScope}`;
+          ${stepScope}
+          ${stepAcl}`;
     }
 
     // Cycle prevention: visited array tracks page IDs already in the path.
     // Prevents exponential blowup on cyclic subgraphs (e.g., A->B->A).
     const { rows } = await this.db.query(
       `WITH RECURSIVE graph AS (
-        SELECT p.id, p.slug, p.title, p.type, 0 as depth, ARRAY[p.id] as visited
-        FROM pages p WHERE p.slug = $1 ${seedScope}
+        SELECT p.id, p.source_id, p.slug, p.title, p.type, 0 as depth, ARRAY[p.id] as visited
+        FROM pages p WHERE ${opts?.pageId ? 'p.id = $1' : 'p.slug = $1'} ${seedScope} ${seedAcl}
 
         UNION ALL
 
         ${recursiveTerm}
       )
-      SELECT DISTINCT g.slug, g.title, g.type, g.depth,
+      SELECT DISTINCT g.id as page_id, g.source_id, g.slug, g.title, g.type, g.depth,
         coalesce(
           -- jsonb_agg(DISTINCT ...) collapses duplicate (to_slug, link_type)
           -- edges that originate from different provenance (markdown body
           -- vs frontmatter vs auto-extracted). Presentation-only dedup;
           -- the links table still preserves every provenance row. See
           -- plan Bug 6/10.
-          (SELECT jsonb_agg(DISTINCT jsonb_build_object('to_slug', p3.slug, 'link_type', l2.link_type))
+          (SELECT jsonb_agg(DISTINCT jsonb_build_object(
+             'to', jsonb_build_object('source_id', p3.source_id, 'page_id', p3.id, 'slug', p3.slug),
+             'to_slug', p3.slug, 'to_source_id', p3.source_id, 'to_page_id', p3.id, 'link_type', l2.link_type))
            FROM links l2
            JOIN pages p3 ON p3.id = l2.to_page_id
-           WHERE l2.from_page_id = g.id ${aggScope}),
+           WHERE l2.from_page_id = g.id ${aggScope} ${aggAcl}),
           '[]'::jsonb
         ) as links
       FROM graph g
-      ORDER BY g.depth, g.slug`,
+      ORDER BY g.depth, g.source_id, g.slug, g.id`,
       params
     );
 
@@ -3473,23 +3615,25 @@ export class PGLiteEngine implements BrainEngine {
     // postgres-engine.traverseGraph for the parallel comment + TODOS.md.
 
     return (rows as Record<string, unknown>[]).map(r => ({
+      source_id: r.source_id as string,
+      page_id: Number(r.page_id),
       slug: r.slug as string,
       title: r.title as string,
       type: r.type as string,
       depth: r.depth as number,
-      links: (typeof r.links === 'string' ? JSON.parse(r.links) : r.links) as { to_slug: string; link_type: string }[],
+      links: (typeof r.links === 'string' ? JSON.parse(r.links) : r.links) as GraphNode['links'],
     }));
   }
 
   async traversePaths(
     slug: string,
-    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' } & import('./engine.ts').PageReferenceOpts,
   ): Promise<GraphPath[]> {
     const depth = opts?.depth ?? 5;
     const direction = opts?.direction ?? 'out';
     const linkType = opts?.linkType ?? null;
     const linkTypeWhere = linkType !== null ? 'AND l.link_type = $3' : '';
-    const params: unknown[] = [slug, depth];
+    const params: unknown[] = [opts?.pageId ?? slug, depth];
     if (linkType !== null) params.push(linkType);
 
     // v0.34.1 (#861 — P0 leak seal): source-scope filters at seed + step +
@@ -3515,15 +3659,34 @@ export class PGLiteEngine implements BrainEngine {
       pfScope = `AND pf.source_id = $${idx}`;
       ptScope = `AND pt.source_id = $${idx}`;
     }
+    let seedAcl = '';
+    let stepAcl = '';
+    let pfAcl = '';
+    let ptAcl = '';
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        const idx = params.length;
+        seedAcl = `AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${idx}::text[])`;
+        stepAcl = `AND (p2.acl_subject_ids IS NULL OR p2.acl_subject_ids && $${idx}::text[])`;
+        pfAcl = `AND (pf.acl_subject_ids IS NULL OR pf.acl_subject_ids && $${idx}::text[])`;
+        ptAcl = `AND (pt.acl_subject_ids IS NULL OR pt.acl_subject_ids && $${idx}::text[])`;
+      } else {
+        seedAcl = 'AND p.acl_subject_ids IS NULL';
+        stepAcl = 'AND p2.acl_subject_ids IS NULL';
+        pfAcl = 'AND pf.acl_subject_ids IS NULL';
+        ptAcl = 'AND pt.acl_subject_ids IS NULL';
+      }
+    }
 
     let sql: string;
     if (direction === 'out') {
       sql = `
         WITH RECURSIVE walk AS (
-          SELECT p.id, p.slug, 0::int AS depth, ARRAY[p.id] AS visited
-          FROM pages p WHERE p.slug = $1 ${seedScope}
+          SELECT p.id, p.slug, p.source_id, 0::int AS depth, ARRAY[p.id] AS visited
+          FROM pages p WHERE ${opts?.pageId ? 'p.id = $1' : 'p.slug = $1'} ${seedScope} ${seedAcl}
           UNION ALL
-          SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
+          SELECT p2.id, p2.slug, p2.source_id, w.depth + 1, w.visited || p2.id
           FROM walk w
           JOIN links l ON l.from_page_id = w.id
           JOIN pages p2 ON p2.id = l.to_page_id
@@ -3531,8 +3694,10 @@ export class PGLiteEngine implements BrainEngine {
             AND NOT (p2.id = ANY(w.visited))
             ${linkTypeWhere}
             ${stepScope}
+            ${stepAcl}
         )
-        SELECT w.slug AS from_slug, p2.slug AS to_slug,
+        SELECT w.id AS from_page_id, w.source_id AS from_source_id, w.slug AS from_slug,
+               p2.id AS to_page_id, p2.source_id AS to_source_id, p2.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
         FROM walk w
         JOIN links l ON l.from_page_id = w.id
@@ -3540,15 +3705,16 @@ export class PGLiteEngine implements BrainEngine {
         WHERE w.depth < $2
           ${linkTypeWhere}
           ${stepScope}
+          ${stepAcl}
         ORDER BY depth, from_slug, to_slug
       `;
     } else if (direction === 'in') {
       sql = `
         WITH RECURSIVE walk AS (
-          SELECT p.id, p.slug, 0::int AS depth, ARRAY[p.id] AS visited
-          FROM pages p WHERE p.slug = $1 ${seedScope}
+          SELECT p.id, p.slug, p.source_id, 0::int AS depth, ARRAY[p.id] AS visited
+          FROM pages p WHERE ${opts?.pageId ? 'p.id = $1' : 'p.slug = $1'} ${seedScope} ${seedAcl}
           UNION ALL
-          SELECT p2.id, p2.slug, w.depth + 1, w.visited || p2.id
+          SELECT p2.id, p2.slug, p2.source_id, w.depth + 1, w.visited || p2.id
           FROM walk w
           JOIN links l ON l.to_page_id = w.id
           JOIN pages p2 ON p2.id = l.from_page_id
@@ -3556,8 +3722,10 @@ export class PGLiteEngine implements BrainEngine {
             AND NOT (p2.id = ANY(w.visited))
             ${linkTypeWhere}
             ${stepScope}
+            ${stepAcl}
         )
-        SELECT p2.slug AS from_slug, w.slug AS to_slug,
+        SELECT p2.id AS from_page_id, p2.source_id AS from_source_id, p2.slug AS from_slug,
+               w.id AS to_page_id, w.source_id AS to_source_id, w.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
         FROM walk w
         JOIN links l ON l.to_page_id = w.id
@@ -3565,6 +3733,7 @@ export class PGLiteEngine implements BrainEngine {
         WHERE w.depth < $2
           ${linkTypeWhere}
           ${stepScope}
+          ${stepAcl}
         ORDER BY depth, from_slug, to_slug
       `;
     } else {
@@ -3572,10 +3741,10 @@ export class PGLiteEngine implements BrainEngine {
       // natural from->to direction from the links table).
       sql = `
         WITH RECURSIVE walk AS (
-          SELECT p.id, 0::int AS depth, ARRAY[p.id] AS visited
-          FROM pages p WHERE p.slug = $1 ${seedScope}
+          SELECT p.id, p.source_id, 0::int AS depth, ARRAY[p.id] AS visited
+          FROM pages p WHERE ${opts?.pageId ? 'p.id = $1' : 'p.slug = $1'} ${seedScope} ${seedAcl}
           UNION ALL
-          SELECT p2.id, w.depth + 1, w.visited || p2.id
+          SELECT p2.id, p2.source_id, w.depth + 1, w.visited || p2.id
           FROM walk w
           JOIN links l ON (l.from_page_id = w.id OR l.to_page_id = w.id)
           JOIN pages p2 ON p2.id = CASE WHEN l.from_page_id = w.id THEN l.to_page_id ELSE l.from_page_id END
@@ -3583,8 +3752,10 @@ export class PGLiteEngine implements BrainEngine {
             AND NOT (p2.id = ANY(w.visited))
             ${linkTypeWhere}
             ${stepScope}
+            ${stepAcl}
         )
-        SELECT pf.slug AS from_slug, pt.slug AS to_slug,
+        SELECT pf.id AS from_page_id, pf.source_id AS from_source_id, pf.slug AS from_slug,
+               pt.id AS to_page_id, pt.source_id AS to_source_id, pt.slug AS to_slug,
                l.link_type, l.context, w.depth + 1 AS depth
         FROM walk w
         JOIN links l ON (l.from_page_id = w.id OR l.to_page_id = w.id)
@@ -3594,6 +3765,8 @@ export class PGLiteEngine implements BrainEngine {
           ${linkTypeWhere}
           ${pfScope}
           ${ptScope}
+          ${pfAcl}
+          ${ptAcl}
         ORDER BY depth, from_slug, to_slug
       `;
     }
@@ -3603,12 +3776,18 @@ export class PGLiteEngine implements BrainEngine {
     const seen = new Set<string>();
     const result: GraphPath[] = [];
     for (const r of rows as Record<string, unknown>[]) {
-      const key = `${r.from_slug}|${r.to_slug}|${r.link_type}|${r.depth}`;
+      const key = `${r.from_page_id}|${r.to_page_id}|${r.link_type}|${r.depth}`;
       if (seen.has(key)) continue;
       seen.add(key);
       result.push({
+        from: { source_id: String(r.from_source_id), page_id: Number(r.from_page_id), slug: r.from_slug as string },
+        to: { source_id: String(r.to_source_id), page_id: Number(r.to_page_id), slug: r.to_slug as string },
         from_slug: r.from_slug as string,
         to_slug: r.to_slug as string,
+        from_source_id: String(r.from_source_id),
+        to_source_id: String(r.to_source_id),
+        from_page_id: Number(r.from_page_id),
+        to_page_id: Number(r.to_page_id),
         link_type: r.link_type as string,
         context: (r.context as string) || '',
         depth: r.depth as number,
@@ -3638,6 +3817,19 @@ export class PGLiteEngine implements BrainEngine {
       params.push(opts.sourceId);
       seedScope = `AND p.source_id = $${params.length}`;
     }
+    let seedAcl = '';
+    let stepAcl = '';
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        const idx = params.length;
+        seedAcl = `AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${idx}::text[])`;
+        stepAcl = `AND (p2.acl_subject_ids IS NULL OR p2.acl_subject_ids && $${idx}::text[])`;
+      } else {
+        seedAcl = 'AND p.acl_subject_ids IS NULL';
+        stepAcl = 'AND p2.acl_subject_ids IS NULL';
+      }
+    }
     let typeFilter = '';
     if (types) {
       params.push(types);
@@ -3659,7 +3851,7 @@ export class PGLiteEngine implements BrainEngine {
                ARRAY[p.id] AS visited, ARRAY[p.slug] AS path,
                p.source_id AS seed_source, NULL::text AS last_link_type
         FROM pages p
-        WHERE p.slug = ANY($1::text[]) ${seedScope} AND p.deleted_at IS NULL
+        WHERE p.slug = ANY($1::text[]) ${seedScope} ${seedAcl} AND p.deleted_at IS NULL
         UNION ALL
         SELECT p2.id, p2.slug, p2.source_id, w.depth + 1,
                w.visited || p2.id, w.path || p2.slug,
@@ -3670,6 +3862,7 @@ export class PGLiteEngine implements BrainEngine {
           AND NOT (p2.id = ANY(w.visited))
           AND p2.source_id = w.seed_source
           AND p2.deleted_at IS NULL
+          ${stepAcl}
           ${mentionsFilter}
           ${typeFilter}
       )
@@ -3701,7 +3894,10 @@ export class PGLiteEngine implements BrainEngine {
     }));
   }
 
-  async getBacklinkCounts(slugs: string[]): Promise<Map<string, number>> {
+  async getBacklinkCounts(
+    slugs: string[],
+    opts?: import('./engine.ts').PageReferenceOpts,
+  ): Promise<Map<string, number>> {
     const result = new Map<string, number>();
     if (slugs.length === 0) return result;
     // Initialize all slugs to 0 so callers get a consistent map.
@@ -3712,14 +3908,47 @@ export class PGLiteEngine implements BrainEngine {
     // for the full rationale. `IS DISTINCT FROM` is NULL-safe so legacy
     // rows with NULL link_source still count toward backlinks.
     // PGLite needs explicit cast for array binding (does not auto-serialize JS arrays).
+    const params: unknown[] = [slugs];
+    const sources =
+      opts?.sourceIds && opts.sourceIds.length > 0
+        ? opts.sourceIds
+        : opts?.sourceId
+          ? [opts.sourceId]
+          : null;
+    let targetSource = '';
+    let fromSource = '';
+    if (sources) {
+      params.push(sources);
+      targetSource = `AND p.source_id = ANY($${params.length}::text[])`;
+      fromSource = `AND pf.source_id = ANY($${params.length}::text[])`;
+    }
+    let targetAcl = '';
+    let fromAcl = '';
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        targetAcl = `AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+        fromAcl = `AND (pf.acl_subject_ids IS NULL OR pf.acl_subject_ids && $${params.length}::text[])`;
+      } else {
+        targetAcl = 'AND p.acl_subject_ids IS NULL';
+        fromAcl = 'AND pf.acl_subject_ids IS NULL';
+      }
+    }
     const { rows } = await this.db.query(
-      `SELECT p.slug AS slug, COUNT(l.id)::int AS cnt
+      `SELECT p.slug AS slug, (
+         SELECT COUNT(l.id)::int
+         FROM links l
+         JOIN pages pf ON pf.id = l.from_page_id
+         WHERE l.to_page_id = p.id
+           AND l.link_source IS DISTINCT FROM 'mentions'
+           ${fromSource}
+           ${fromAcl}
+       ) AS cnt
        FROM pages p
-       LEFT JOIN links l ON l.to_page_id = p.id
-         AND l.link_source IS DISTINCT FROM 'mentions'
        WHERE p.slug = ANY($1::text[])
-       GROUP BY p.slug`,
-      [slugs]
+         ${targetSource}
+         ${targetAcl}`,
+      params,
     );
     for (const r of rows as { slug: string; cnt: number }[]) {
       result.set(r.slug, Number(r.cnt));
@@ -5940,7 +6169,7 @@ export class PGLiteEngine implements BrainEngine {
 
   async resolveAliases(
     aliasNorms: string[],
-    opts?: { sourceId?: string; sourceIds?: string[] },
+    opts?: import('./engine.ts').PageReferenceOpts,
   ): Promise<Map<string, Array<{ slug: string; source_id: string }>>> {
     const out = new Map<string, Array<{ slug: string; source_id: string }>>();
     if (!aliasNorms || aliasNorms.length === 0) return out;
@@ -5950,13 +6179,25 @@ export class PGLiteEngine implements BrainEngine {
         : opts?.sourceId
           ? [opts.sourceId]
           : null;
-    let q = `SELECT alias_norm, slug, source_id FROM page_aliases WHERE alias_norm = ANY($1::text[])`;
+    const aclScoped = opts?.aclSubjectIds !== undefined;
+    let q = `SELECT a.alias_norm, a.slug, a.source_id
+      FROM page_aliases a
+      ${aclScoped ? 'JOIN pages p ON p.source_id = a.source_id AND p.slug = a.slug' : ''}
+      WHERE a.alias_norm = ANY($1::text[])`;
     const params: unknown[] = [aliasNorms];
     if (sources) {
       params.push(sources);
-      q += ` AND source_id = ANY($2::text[])`;
+      q += ` AND a.source_id = ANY($${params.length}::text[])`;
     }
-    q += ` ORDER BY alias_norm, source_id, slug`;
+    if (opts?.aclSubjectIds !== undefined) {
+      if (opts.aclSubjectIds.length > 0) {
+        params.push(opts.aclSubjectIds);
+        q += ` AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+      } else {
+        q += ` AND p.acl_subject_ids IS NULL`;
+      }
+    }
+    q += ` ORDER BY a.alias_norm, a.source_id, a.slug`;
     const { rows } = await this.db.query(q, params);
     for (const r of rows as Array<{ alias_norm: string; slug: string; source_id: string }>) {
       const list = out.get(r.alias_norm) ?? [];
@@ -6731,5 +6972,31 @@ function rowToCodeEdge(row: Record<string, unknown>): import('./types.ts').CodeE
     edge_metadata: (row.edge_metadata as Record<string, unknown>) ?? {},
     source_id: row.source_id == null ? null : (row.source_id as string),
     resolved: Boolean(row.resolved),
+  };
+}
+
+function linkRowToLink(row: Record<string, unknown>): Link {
+  const from = {
+    source_id: String(row.from_source_id),
+    page_id: Number(row.from_page_id),
+    slug: String(row.from_slug),
+  };
+  const to = {
+    source_id: String(row.to_source_id),
+    page_id: Number(row.to_page_id),
+    slug: String(row.to_slug),
+  };
+  return {
+    ...row as Omit<Link, 'from' | 'to'>,
+    from,
+    to,
+    from_slug: from.slug,
+    to_slug: to.slug,
+    from_source_id: from.source_id,
+    to_source_id: to.source_id,
+    from_page_id: from.page_id,
+    to_page_id: to.page_id,
+    link_type: String(row.link_type ?? ''),
+    context: String(row.context ?? ''),
   };
 }

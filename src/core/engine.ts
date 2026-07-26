@@ -22,6 +22,29 @@ import type {
   EnrichCandidatesOpts, EnrichCandidate,
 } from './types.ts';
 
+export interface PageReferenceOpts {
+  sourceId?: string;
+  sourceIds?: string[];
+  /** Undefined = trusted bypass; [] = public pages only. */
+  aclSubjectIds?: string[];
+  /** Exact numeric page identity. When supplied it takes precedence over slug. */
+  pageId?: number;
+}
+
+export class DocumentVersionConflictError extends Error {
+  readonly code = 'DOCUMENT_VERSION_CONFLICT';
+  constructor(
+    readonly current: {
+      document_id: string | null;
+      document_version_sequence: number | null;
+      document_version_hash: string | null;
+    },
+  ) {
+    super('Incoming document version is not allowed to replace the current page version');
+    this.name = 'DocumentVersionConflictError';
+  }
+}
+
 /**
  * v0.27.1: file row for binary-asset metadata. Mirrors the `files` table
  * shape on both engines (Postgres has had it since v0.18; PGLite gets it
@@ -61,9 +84,9 @@ export interface SourceRow {
   config: Record<string, unknown>;
 }
 
-export interface TraverseGraphOpts {
-  sourceId?: string;
-  sourceIds?: string[];
+export interface TraverseGraphOpts extends PageReferenceOpts {
+  /** Exact numeric seed identity. `slug` remains the backward-compatible selector. */
+  pageId?: number;
   frontierCap?: number;
 }
 
@@ -691,6 +714,11 @@ export interface BrainEngine {
    */
   getPage(slug: string, opts?: GetPageOpts): Promise<Page | null>;
   /**
+   * Fetch an exact page identity. The caller MUST still pass its readable
+   * source scope so an id cannot be used to bypass source isolation.
+   */
+  getPageById(pageId: number, opts?: GetPageOpts): Promise<Page | null>;
+  /**
    * v119 — multi-source layer read. Return ALL live rows that share `slug`
    * across the caller's readable sources, one per source ("layer"). This is
    * the union-of-layers companion to `getPage` (which returns at most ONE
@@ -717,7 +745,7 @@ export interface BrainEngine {
    */
   getPageLayers(
     slug: string,
-    opts?: { sourceIds?: string[]; includeDeleted?: boolean },
+    opts?: { sourceIds?: string[]; includeDeleted?: boolean; aclSubjectIds?: string[] },
   ): Promise<Page[]>;
   /**
    * Insert or update a page. When `opts.sourceId` is omitted, the row is
@@ -868,7 +896,7 @@ export interface BrainEngine {
    * `gbrain query --resolve` CLI path, etc.). Field names match the
    * `sourceScopeOpts(ctx)` helper output so callers can spread directly.
    */
-  resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]>;
+  resolveSlugs(partial: string, opts?: PageReferenceOpts): Promise<string[]>;
   /**
    * Returns the slug of every page in the brain. Used by batch commands as a
    * mutation-immune iteration source (alternative to listPages OFFSET pagination,
@@ -1235,13 +1263,13 @@ export interface BrainEngine {
    * grant); the scalar branch is internal/CLI and keeps cross-source visibility
    * (reconcileLinks + back-link validators depend on it).
    */
-  getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]>;
+  getLinks(slug: string, opts?: PageReferenceOpts): Promise<Link[]>;
   /**
    * v0.31.8 (D12 + D16): same `opts.sourceId` semantics as `getLinks`,
    * applied to the to-page side of the join. #2200: `opts.sourceIds` federated
    * grant constrains both endpoints (see `getLinks`).
    */
-  getBacklinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]>;
+  getBacklinks(slug: string, opts?: PageReferenceOpts): Promise<Link[]>;
   /**
    * v114 (#1941): distinct link_source provenances with edge counts, for
    * `gbrain link-sources`. Source-scoped via `{sourceId?, sourceIds?}` (both
@@ -1250,7 +1278,7 @@ export interface BrainEngine {
    * parity. `link_source` may be NULL (legacy/unknown rows).
    */
   listLinkSources(
-    opts?: { sourceId?: string; sourceIds?: string[] },
+    opts?: PageReferenceOpts,
   ): Promise<{ link_source: string | null; count: number }[]>;
   /**
    * Fuzzy-match a display name to a page slug using pg_trgm similarity.
@@ -1304,7 +1332,7 @@ export interface BrainEngine {
    */
   traversePaths(
     slug: string,
-    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
+    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' } & PageReferenceOpts,
   ): Promise<GraphPath[]>;
   /**
    * Typed-edge relational fan-out for the relational recall arm (v0.43).
@@ -1335,7 +1363,7 @@ export interface BrainEngine {
    * Used by hybrid search backlink boost. Single SQL query, not N+1.
    * Slugs with zero inbound links are present in the map with value 0.
    */
-  getBacklinkCounts(slugs: string[]): Promise<Map<string, number>>;
+  getBacklinkCounts(slugs: string[], opts?: PageReferenceOpts): Promise<Map<string, number>>;
   /**
    * v0.40.4 — for a list of page_ids, return adjacency aggregates
    * restricted to the subgraph induced by them. Returns ALL pages with
@@ -2044,7 +2072,7 @@ export interface BrainEngine {
    */
   resolveAliases(
     aliasNorms: string[],
-    opts?: { sourceId?: string; sourceIds?: string[] },
+    opts?: PageReferenceOpts,
   ): Promise<Map<string, Array<{ slug: string; source_id: string }>>>;
 
   /**

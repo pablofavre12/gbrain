@@ -39,4 +39,24 @@ describe('cacheScopeKey', () => {
     const scalar = cacheScopeKey({ sourceId: 'host' });
     expect(set).not.toBe(scalar); // a 1-element set still cannot serve a scalar read
   });
+
+  test('remote page ACL identities partition cache rows without exposing subject IDs', () => {
+    const alice = cacheScopeKey({ sourceId: 'host', aclSubjectIds: ['user:alice'] });
+    const aliceReordered = cacheScopeKey({
+      sourceId: 'host',
+      aclSubjectIds: ['group:editors', 'user:alice'],
+    });
+    const aliceReordered2 = cacheScopeKey({
+      sourceId: 'host',
+      aclSubjectIds: ['user:alice', 'group:editors'],
+    });
+    const bob = cacheScopeKey({ sourceId: 'host', aclSubjectIds: ['user:bob'] });
+    const publicOnly = cacheScopeKey({ sourceId: 'host', aclSubjectIds: [] });
+
+    expect(alice).not.toBe(bob);
+    expect(alice).not.toBe(publicOnly);
+    expect(aliceReordered).toBe(aliceReordered2);
+    expect(alice).not.toContain('alice');
+    expect(bob).not.toContain('bob');
+  });
 });

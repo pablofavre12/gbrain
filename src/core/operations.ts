@@ -4,9 +4,10 @@
  */
 
 import { lstatSync, realpathSync } from 'fs';
+import { createHash, randomUUID } from 'crypto';
 import { resolve, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
-import { clampSearchLimit } from './engine.ts';
+import { clampSearchLimit, DocumentVersionConflictError } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
@@ -582,6 +583,22 @@ export interface AuthInfo {
    * ever ADDS to the always-allowed `sourceId`.
    */
   federatedWrite?: string[];
+  /**
+   * Additional page-ACL subjects established by the authentication layer
+   * (for example `user:<platform-user-uuid>` or `group:<uuid>`). Tool params
+   * never populate this field. `client:<clientId>` is added automatically.
+   */
+  subjectIds?: string[];
+  /**
+   * Server-established capabilities that may unlock narrower privileged
+   * contracts. Wire params never populate this field.
+   *
+   * `versioned_document_write` is required for remote callers that set the
+   * Platform document fence (`document_id` + version sequence/hash). This
+   * prevents a generic write-scoped client from claiming a public page as a
+   * versioned document and locking subsequent writers out.
+   */
+  capabilities?: string[];
 }
 
 export interface OperationContext {
@@ -763,23 +780,37 @@ export interface OperationContext {
  * Helper rather than inline so every read-side handler routes through the
  * same precedence ladder — drift between sites is the bug class.
  */
-export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sourceIds?: string[] } {
+export function pageAccessOpts(ctx: OperationContext): { aclSubjectIds?: string[] } {
+  if (ctx.remote === false) return {};
+  const values = [
+    ...(ctx.auth?.clientId ? [`client:${ctx.auth.clientId}`] : []),
+    ...(ctx.auth?.subjectIds ?? []),
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  return { aclSubjectIds: [...new Set(values)].sort() };
+}
+
+export function sourceScopeOpts(ctx: OperationContext): {
+  sourceId?: string;
+  sourceIds?: string[];
+  aclSubjectIds?: string[];
+} {
+  const acl = pageAccessOpts(ctx);
   const allowed = ctx.auth?.allowedSources;
   // Treat an empty `allowedSources: []` as "no federated read scope" — the
   // op-handler defers to scalar `ctx.sourceId` below. An attacker-controlled
   // value of `[]` MUST NOT widen scope to "all sources" by being interpreted
   // as "no filter."
-  if (allowed && allowed.length > 0) return { sourceIds: allowed };
+  if (allowed && allowed.length > 0) return { sourceIds: allowed, ...acl };
   // #1712: the __all__ sentinel spans the brain — but ONLY for trusted local
   // callers (strictly `remote === false`). For remote/untrusted callers the
   // literal stays as-is: it can never match a real source id (underscores are
   // rejected at creation), so the read fail-closes to empty rather than
   // widening past the caller's grant. Do NOT "simplify" this to `{}`.
   if (ctx.sourceId === ALL_SOURCES) {
-    return ctx.remote === false ? {} : { sourceId: ctx.sourceId };
+    return ctx.remote === false ? acl : { sourceId: ctx.sourceId, ...acl };
   }
-  if (ctx.sourceId) return { sourceId: ctx.sourceId };
-  return {};
+  if (ctx.sourceId) return { sourceId: ctx.sourceId, ...acl };
+  return acl;
 }
 
 /** Map the operation-layer scope names onto runThink's public options. */
@@ -844,7 +875,7 @@ export function resolveRequestedScope(
   ctx: OperationContext,
   sourceIdParam: string | undefined,
   allSourcesParam = false,
-): { sourceId?: string; sourceIds?: string[] } {
+): { sourceId?: string; sourceIds?: string[]; aclSubjectIds?: string[] } {
   const wantsAll = allSourcesParam || sourceIdParam === ALL_SOURCES;
   if (wantsAll) {
     return ctx.remote === false ? {} : sourceScopeOpts(ctx);
@@ -858,7 +889,7 @@ export function resolveRequestedScope(
         'Request access to this source, or omit source_id to search within your grant.',
       );
     }
-    return { sourceId: sourceIdParam };
+    return { sourceId: sourceIdParam, ...pageAccessOpts(ctx) };
   }
   return sourceScopeOpts(ctx);
 }
@@ -1083,18 +1114,37 @@ export interface Operation {
 
 const get_page: Operation = {
   name: 'get_page',
-  description: 'Read a page by slug (supports optional fuzzy matching). v119 multi-source: the same slug can exist as several "layers" in different salas/sources (e.g. a base layer in `campo` and a confidential layer in `directorio`). Pass `source` to read ONE specific layer (must be within your readable scope, else forbidden). Omit `source` to read the UNION of every layer you can read, ordered most-public → most-restricted: returns the single page when only one layer exists (backward-compatible shape) or {slug, multi_source: true, layers: [...]} when more than one. Soft-deleted pages are hidden by default; pass include_deleted: true to surface them with deleted_at populated (see v0.26.5 recovery window).',
+  description: 'Read a page by its stable page_id (preferred) or slug. A slug that exists in more than one authorized source is rejected with AMBIGUOUS_PAGE_REF unless include_layers=true explicitly requests the readable union. Pass source or source_id to select one layer. Every result carries source_id, page_id and slug. Soft-deleted pages are hidden by default; pass include_deleted=true to inspect one.',
   params: {
-    slug: { type: 'string', required: true, description: 'Page slug' },
-    source: { type: 'string', description: 'v119: read only this source/sala layer of the slug. Must be within your readable scope (your source_id or one of your federated read sources), else forbidden_source. Omit to read the union of all readable layers.' },
+    slug: { type: 'string', description: 'Human-readable page alias. Must resolve to one authorized source unless include_layers=true.' },
+    page_id: { type: 'number', description: 'Stable numeric page identity. Preferred when a graph/search result already supplied it.' },
+    source: { type: 'string', description: 'Read only this source/sala layer. Alias for source_id.' },
+    source_id: { type: 'string', description: 'Read only this source/sala layer. Must be within your readable scope.' },
+    include_layers: { type: 'boolean', description: 'Explicitly return every authorized layer for an ambiguous slug (default false).' },
     fuzzy: { type: 'boolean', description: 'Enable fuzzy slug resolution (default: false)' },
     include_deleted: { type: 'boolean', description: 'v0.26.5: surface soft-deleted pages with deleted_at populated (default: false). Used by restore workflows.' },
   },
   handler: async (ctx, p) => {
-    const slug = p.slug as string;
+    const slug = typeof p.slug === 'string' && p.slug.length > 0 ? p.slug : undefined;
+    const rawPageId = p.page_id;
+    const pageId = typeof rawPageId === 'number' && Number.isInteger(rawPageId) && rawPageId > 0
+      ? rawPageId
+      : undefined;
+    if (rawPageId !== undefined && pageId === undefined) {
+      throw new OperationError('invalid_params', 'page_id must be a positive integer');
+    }
+    if (!slug && pageId === undefined) {
+      throw new OperationError('invalid_params', 'Provide slug or page_id');
+    }
     const fuzzy = (p.fuzzy as boolean) || false;
     const includeDeleted = (p.include_deleted as boolean) === true;
-    const requestedSource = typeof p.source === 'string' ? (p.source as string) : undefined;
+    const requestedSourceAlias = typeof p.source === 'string' ? p.source : undefined;
+    const requestedSourceId = typeof p.source_id === 'string' ? p.source_id : undefined;
+    if (requestedSourceAlias && requestedSourceId && requestedSourceAlias !== requestedSourceId) {
+      throw new OperationError('invalid_params', 'source and source_id must match when both are provided');
+    }
+    const requestedSource = requestedSourceId ?? requestedSourceAlias;
+    const includeLayers = p.include_layers === true;
     // #1393: route BOTH the exact-match read and the fuzzy resolveSlugs through
     // the canonical precedence ladder (federated array > scalar > nothing). The
     // exact path previously used scalar `ctx.sourceId` only, so a remote client
@@ -1135,38 +1185,60 @@ const get_page: Operation = {
         ? stripFactsFence(stripTakesFence(body), { keepVisibility: ['world'] })
         : body;
 
+    const decoratePage = async (page: import('./types.ts').Page) => {
+      const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
+      const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
+      return {
+        ...page,
+        page_id: page.id,
+        compiled_truth: stripBody(page.compiled_truth),
+        tags,
+        ...(content_flag ? { content_flag } : {}),
+      };
+    };
+
+    const resolveRequestedReadScope = (): { sourceId?: string; sourceIds?: string[] } => {
+      if (requestedSource === undefined) return sourceOpts;
+      try {
+        return resolveRequestedScope(ctx, requestedSource, false);
+      } catch (err) {
+        if (err instanceof OperationError && err.code === 'permission_denied') {
+          throw new OperationError(
+            'forbidden_source',
+            `Source '${requestedSource}' is outside your readable scope`,
+            'Choose a source within your grant or request access.',
+          );
+        }
+        throw err;
+      }
+    };
+
+    // ── Exact page identity ──
+    if (pageId !== undefined) {
+      const page = await ctx.engine.getPageById(pageId, {
+        includeDeleted,
+        ...resolveRequestedReadScope(),
+      });
+      if (!page) throw new OperationError('page_not_found', `Page not found: page_id=${pageId}`);
+      if (slug && page.slug !== slug) {
+        throw new OperationError('invalid_params', `page_id=${pageId} does not match slug='${slug}'`);
+      }
+      bumpLastRetrievedAt(ctx.engine, [page.id]);
+      return decoratePage(page);
+    }
+
     // ── Explicit `source` → read exactly that ONE layer (scope-checked) ──
     // resolveRequestedScope is the canonical fail-closed gate: a remote caller
     // whose federated grant does not include `source` gets permission_denied;
     // otherwise it returns { sourceId: source }. We surface it as
     // `forbidden_source` for a clearer signal on this read path.
     if (requestedSource !== undefined) {
-      let scoped: { sourceId?: string; sourceIds?: string[] };
-      try {
-        scoped = resolveRequestedScope(ctx, requestedSource, false);
-      } catch (err) {
-        if (err instanceof OperationError && err.code === 'permission_denied') {
-          throw new OperationError(
-            'forbidden_source',
-            `Source '${requestedSource}' is outside your readable scope`,
-            'Omit `source` to read every layer within your grant, or request access to this source.',
-          );
-        }
-        throw err;
-      }
-      const page = await ctx.engine.getPage(slug, { includeDeleted, ...scoped });
+      const page = await ctx.engine.getPage(slug!, { includeDeleted, ...resolveRequestedReadScope() });
       if (!page) {
         throw new OperationError('page_not_found', `Page not found: ${slug} (source=${requestedSource})`, includeDeleted ? 'Check the slug/source or omit source to scan all layers' : 'Page may be soft-deleted; pass include_deleted: true to verify');
       }
       bumpLastRetrievedAt(ctx.engine, [page.id]);
-      const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
-      const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
-      return {
-        ...page,
-        compiled_truth: stripBody(page.compiled_truth),
-        tags,
-        ...(content_flag ? { content_flag } : {}),
-      };
+      return decoratePage(page);
     }
 
     // ── No `source` → union of every readable layer ──
@@ -1175,13 +1247,17 @@ const get_page: Operation = {
     // engine both filter AND order most-public → most-restricted.
     const readableSources = sourceOpts.sourceIds
       ?? (sourceOpts.sourceId ? [sourceOpts.sourceId] : undefined);
-    const layerOpts = { sourceIds: readableSources, includeDeleted };
+    const layerOpts = {
+      sourceIds: readableSources,
+      includeDeleted,
+      ...(sourceOpts.aclSubjectIds !== undefined ? { aclSubjectIds: sourceOpts.aclSubjectIds } : {}),
+    };
 
-    let layers = await ctx.engine.getPageLayers(slug, layerOpts);
+    let layers = await ctx.engine.getPageLayers(slug!, layerOpts);
     let resolved_slug: string | undefined;
 
     if (layers.length === 0 && fuzzy) {
-      const candidates = await ctx.engine.resolveSlugs(slug, fuzzyScope);
+      const candidates = await ctx.engine.resolveSlugs(slug!, fuzzyScope);
       if (candidates.length === 1) {
         layers = await ctx.engine.getPageLayers(candidates[0], layerOpts);
         resolved_slug = candidates[0];
@@ -1194,6 +1270,14 @@ const get_page: Operation = {
       throw new OperationError('page_not_found', `Page not found: ${slug}`, includeDeleted ? 'Check the slug or use fuzzy: true' : 'Page may be soft-deleted; pass include_deleted: true to verify');
     }
 
+    if (layers.length > 1 && !includeLayers) {
+      throw new OperationError(
+        'AMBIGUOUS_PAGE_REF',
+        `Slug '${slug}' exists in more than one authorized source; pass page_id/source_id or include_layers=true`,
+        JSON.stringify(layers.map((page) => ({ source_id: page.source_id, page_id: page.id, slug: page.slug }))),
+      );
+    }
+
     // v0.37.0 (D11): op-layer write-back for the `last_retrieved_at` stale
     // signal. Fire-and-forget — caller does NOT await. v119: bump EVERY layer
     // surfaced, not just the first. Throttled to ~1 write / 5 min per page
@@ -1203,17 +1287,9 @@ const get_page: Operation = {
     // Single layer → preserve the pre-v119 shape exactly (backward-compatible:
     // existing callers that expect a flat page object keep working).
     if (layers.length === 1) {
-      const page = layers[0];
-      const tags = await ctx.engine.getTags(page.slug, sourceOpts);
-      // v0.42 (#1699) agent-warning channel: surface the page's content_flag
-      // marker as a top-level field (parallel to SearchResult.content_flag).
-      const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
       return {
-        ...page,
-        compiled_truth: stripBody(page.compiled_truth),
-        tags,
+        ...await decoratePage(layers[0]),
         ...(resolved_slug ? { resolved_slug } : {}),
-        ...(content_flag ? { content_flag } : {}),
       };
     }
 
@@ -1222,20 +1298,7 @@ const get_page: Operation = {
     // omitted, so a per-layer source_id is mandatory here). Each layer's body
     // gets the same untrusted-reader strip as the single-page path.
     const builtLayers = await Promise.all(
-      layers.map(async (page) => {
-        const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
-        const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
-        return {
-          source_id: page.source_id,
-          title: page.title,
-          type: page.type,
-          compiled_truth: stripBody(page.compiled_truth),
-          tags,
-          frontmatter: page.frontmatter,
-          ...(page.deleted_at ? { deleted_at: page.deleted_at } : {}),
-          ...(content_flag ? { content_flag } : {}),
-        };
-      }),
+      layers.map(decoratePage),
     );
     return {
       slug: layers[0].slug,
@@ -1246,6 +1309,184 @@ const get_page: Operation = {
   },
   scope: 'read',
   cliHints: { name: 'get', positional: ['slug'] },
+};
+
+// Native knowledge writes made by an agent use a durable two-step protocol.
+// A proposal records the exact payload, but it does not call importFromContent
+// (or otherwise touch pages) until the same authenticated actor confirms it.
+// Keep this beside put_page: confirmation deliberately reuses that canonical
+// path so source, document-fence, provenance, and write-through behavior do
+// not drift into a second page writer.
+const PAGE_WRITE_PROPOSAL_TTL_MINUTES = 15;
+const PAGE_WRITE_PROPOSAL_MAX_BYTES = 5_000_000;
+const PAGE_WRITE_CONFIRMING_STALE_SECONDS = 120;
+const VERSIONED_DOCUMENT_WRITE_CAPABILITY = 'versioned_document_write';
+
+type PageWriteProposalRow = {
+  proposal_id: string;
+  actor_id: string;
+  source_id: string;
+  slug: string;
+  content: string;
+  content_hash: string;
+  allowed_subject_ids: string[] | null;
+  document_id: string | null;
+  document_version_sequence: number | null;
+  document_version_hash: string | null;
+  status: 'pending' | 'confirming' | 'confirmed' | 'cancelled' | 'expired';
+  expires_at: Date | string;
+  confirmed_at: Date | string | null;
+  confirming_at: Date | string | null;
+};
+
+function governedWriteActor(ctx: OperationContext): string {
+  // A remote confirmation must be bound to a server-verified principal. Stdio
+  // MCP intentionally has no OAuth identity, so it cannot silently collapse
+  // all callers into one shared "anonymous" actor and bypass confirmation.
+  if (ctx.remote !== false) {
+    const verifiedUserSubject = ctx.auth?.subjectIds
+      ?.filter((subject) => subject.startsWith('user:'))
+      .sort()[0];
+    if (verifiedUserSubject) return verifiedUserSubject;
+    if (!ctx.auth?.clientId) {
+      throw new OperationError(
+        'permission_denied',
+        'Governed page writes require an authenticated server actor.',
+        'Use an OAuth-authenticated MCP client, or run the trusted local CLI.',
+      );
+    }
+    return `client:${ctx.auth.clientId}`;
+  }
+  return 'local-cli';
+}
+
+function proposalExpiryIso(expiresAt: Date | string): string {
+  const value = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
+  return value.toISOString();
+}
+
+function proposalPreview(row: Pick<PageWriteProposalRow, 'proposal_id' | 'source_id' | 'slug' | 'content' | 'content_hash' | 'expires_at'>) {
+  return {
+    proposal_id: row.proposal_id,
+    status: 'pending' as const,
+    preview: {
+      slug: row.slug,
+      source_id: row.source_id,
+      content: row.content,
+      content_hash: row.content_hash,
+      expires_at: proposalExpiryIso(row.expires_at),
+    },
+  };
+}
+
+function proposalConfirmation(row: Pick<PageWriteProposalRow, 'proposal_id' | 'source_id' | 'slug' | 'content_hash' | 'confirmed_at'>, idempotent: boolean) {
+  return {
+    proposal_id: row.proposal_id,
+    status: 'confirmed' as const,
+    idempotent,
+    slug: row.slug,
+    source_id: row.source_id,
+    content_hash: row.content_hash,
+    ...(row.confirmed_at ? { confirmed_at: proposalExpiryIso(row.confirmed_at) } : {}),
+  };
+}
+
+function isProposalExpired(row: Pick<PageWriteProposalRow, 'expires_at'>): boolean {
+  return new Date(row.expires_at).getTime() <= Date.now();
+}
+
+function hasPageAclAccess(ctx: OperationContext, allowedSubjects: unknown): boolean {
+  if (ctx.remote === false || allowedSubjects == null) return true;
+  if (!Array.isArray(allowedSubjects) || allowedSubjects.length === 0) return false;
+  const callerSubjects = pageAccessOpts(ctx).aclSubjectIds ?? [];
+  return callerSubjects.some((subject) => allowedSubjects.includes(subject));
+}
+
+function requireVersionedDocumentWriteCapability(ctx: OperationContext): void {
+  if (
+    ctx.remote !== false
+    && !ctx.auth?.capabilities?.includes(VERSIONED_DOCUMENT_WRITE_CAPABILITY)
+  ) {
+    throw new OperationError(
+      'permission_denied',
+      'Versioned document writes require a server-verified document capability.',
+    );
+  }
+}
+
+type CurrentPageWriteTarget = {
+  id: number;
+  acl_subject_ids: string[] | null;
+  deleted_at: Date | string | null;
+};
+
+async function loadAuthorizedPageWriteTarget(
+  ctx: OperationContext,
+  slug: string,
+  sourceId: string,
+): Promise<CurrentPageWriteTarget | null> {
+  const rows = await ctx.engine.executeRaw<CurrentPageWriteTarget>(
+    `SELECT id, acl_subject_ids, deleted_at
+       FROM pages
+      WHERE slug = $1 AND source_id = $2
+      LIMIT 1`,
+    [slug, sourceId],
+  );
+  const page = rows[0] ?? null;
+  if (page && !hasPageAclAccess(ctx, page.acl_subject_ids)) {
+    throw new OperationError('permission_denied', 'You are not authorized to modify this page.');
+  }
+  return page;
+}
+
+const propose_page_write: Operation = {
+  name: 'propose_page_write',
+  description: 'Create a durable, expiring preview for a native knowledge page write. This never writes the page; call confirm_page_write with the returned proposal_id to apply the exact slug/source/content/hash payload.',
+  params: {
+    slug: { type: 'string', required: true, description: 'Page slug to write after confirmation.' },
+    content: { type: 'string', required: true, description: 'Exact markdown content to preview and later write.' },
+    source: { type: 'string', required: false, description: 'Target source/sala. Must be the authenticated actor\'s source_id or federated_write grant.' },
+    allowed_subject_ids: { type: 'array', required: false, items: { type: 'string' }, description: 'Optional page ACL to pass unchanged to the confirmed write.' },
+    document_id: { type: 'string', required: false, description: 'Optional Platform document fence; must be supplied with version sequence and hash.' },
+    document_version_sequence: { type: 'number', required: false, description: 'Optional Platform document version sequence.' },
+    document_version_hash: { type: 'string', required: false, description: 'Optional Platform document version hash.' },
+  },
+  mutating: true,
+  scope: 'write',
+  handler: async (ctx, p) => {
+    const actorId = governedWriteActor(ctx);
+    const slug = p.slug as string;
+    const content = p.content as string;
+    validatePageSlug(slug);
+    if (Buffer.byteLength(content, 'utf8') > PAGE_WRITE_PROPOSAL_MAX_BYTES) {
+      throw new OperationError('invalid_params', `content exceeds ${PAGE_WRITE_PROPOSAL_MAX_BYTES} bytes`);
+    }
+    const sourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    const contentHash = createHash('sha256').update(content).digest('hex');
+    const proposalId = randomUUID();
+    const expiresAt = new Date(Date.now() + PAGE_WRITE_PROPOSAL_TTL_MINUTES * 60_000);
+    const allowedSubjectIds = p.allowed_subject_ids === undefined ? null : p.allowed_subject_ids;
+    if (p.document_id !== undefined) {
+      requireVersionedDocumentWriteCapability(ctx);
+    }
+
+    if (ctx.dryRun) {
+      return proposalPreview({ proposal_id: proposalId, slug, source_id: sourceId, content, content_hash: contentHash, expires_at: expiresAt });
+    }
+
+    await ctx.engine.executeRaw(
+      `INSERT INTO page_write_proposals
+        (proposal_id, actor_id, source_id, slug, content, content_hash, allowed_subject_ids,
+         document_id, document_version_sequence, document_version_hash, status, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8, $9, $10, 'pending', $11)`,
+      [
+        proposalId, actorId, sourceId, slug, content, contentHash, allowedSubjectIds,
+        p.document_id ?? null, p.document_version_sequence ?? null, p.document_version_hash ?? null, expiresAt,
+      ],
+    );
+    return proposalPreview({ proposal_id: proposalId, slug, source_id: sourceId, content, content_hash: contentHash, expires_at: expiresAt });
+  },
+  cliHints: { name: 'propose-page-write', positional: ['slug'], stdin: 'content' },
 };
 
 const put_page: Operation = {
@@ -1270,6 +1511,15 @@ const put_page: Operation = {
     source_kind: { type: 'string', required: false, description: 'Ingestion channel taxonomy (capture-cli | put_page | webhook | …). Remote callers: SERVER-STAMPED, client value ignored.' },
     source_uri: { type: 'string', required: false, description: 'Original URI/path/message-id the event carried. Remote callers: SERVER-STAMPED null.' },
     ingested_via: { type: 'string', required: false, description: 'Richer label paired with source_kind. Remote callers: SERVER-STAMPED.' },
+    allowed_subject_ids: {
+      type: 'array',
+      required: false,
+      items: { type: 'string' },
+      description: 'Page-level read ACL. For versioned Platform documents this must be a non-empty array of server-recognized subjects (for example user:<uuid> or group:<uuid>).',
+    },
+    document_id: { type: 'string', required: false, description: 'Stable Platform document UUID/string. Must be sent with document_version_sequence and document_version_hash.' },
+    document_version_sequence: { type: 'number', required: false, description: 'Monotonic positive Platform version sequence. Lower or conflicting equal sequences are rejected atomically.' },
+    document_version_hash: { type: 'string', required: false, description: 'Lowercase SHA-256 hex of the canonical Platform version source.' },
   },
   mutating: true,
   scope: 'write',
@@ -1283,6 +1533,74 @@ const put_page: Operation = {
     // subagent-namespace check below). Omitted `source` → ctx.sourceId
     // (unchanged pre-v118 behavior).
     const writeSourceId = resolveWriteSource(ctx, p.source as string | undefined);
+
+    const documentId = typeof p.document_id === 'string' ? p.document_id.trim() : undefined;
+    const documentVersionSequence = p.document_version_sequence as number | undefined;
+    const documentVersionHash = typeof p.document_version_hash === 'string'
+      ? p.document_version_hash.toLowerCase()
+      : undefined;
+    const documentFenceCount = [
+      documentId !== undefined,
+      documentVersionSequence !== undefined,
+      documentVersionHash !== undefined,
+    ].filter(Boolean).length;
+    if (documentFenceCount !== 0 && documentFenceCount !== 3) {
+      throw new OperationError(
+        'invalid_params',
+        'document_id, document_version_sequence and document_version_hash must be supplied together',
+      );
+    }
+    if (documentId !== undefined) {
+      requireVersionedDocumentWriteCapability(ctx);
+    }
+    if (documentId !== undefined && (!documentId || documentId.length > 200 || /[\u0000-\u001f\u007f]/.test(documentId))) {
+      throw new OperationError('invalid_params', 'document_id must be 1-200 characters without control characters');
+    }
+    if (
+      documentVersionSequence !== undefined
+      && (!Number.isSafeInteger(documentVersionSequence) || documentVersionSequence < 1)
+    ) {
+      throw new OperationError('invalid_params', 'document_version_sequence must be a positive safe integer');
+    }
+    if (documentVersionHash !== undefined && !/^[a-f0-9]{64}$/.test(documentVersionHash)) {
+      throw new OperationError('invalid_params', 'document_version_hash must be a 64-character SHA-256 hex digest');
+    }
+
+    const rawAllowedSubjects = p.allowed_subject_ids;
+    let allowedSubjectIds: string[] | undefined;
+    if (rawAllowedSubjects !== undefined) {
+      if (!Array.isArray(rawAllowedSubjects) || rawAllowedSubjects.length === 0 || rawAllowedSubjects.length > 256) {
+        throw new OperationError('invalid_params', 'allowed_subject_ids must contain 1-256 identifiers');
+      }
+      const normalized: string[] = [];
+      for (const raw of rawAllowedSubjects) {
+        if (typeof raw !== 'string') {
+          throw new OperationError('invalid_params', 'allowed_subject_ids entries must be strings');
+        }
+        const value = raw.trim();
+        if (!value || value.length > 200 || /[\u0000-\u001f\u007f]/.test(value)) {
+          throw new OperationError('invalid_params', 'allowed_subject_ids entries must be 1-200 characters without control characters');
+        }
+        normalized.push(value);
+      }
+      allowedSubjectIds = [...new Set(normalized)].sort();
+    }
+    if (documentId !== undefined && allowedSubjectIds === undefined) {
+      throw new OperationError(
+        'invalid_params',
+        'Versioned documents require a non-empty allowed_subject_ids ACL',
+      );
+    }
+    if (
+      allowedSubjectIds !== undefined
+      && ctx.remote !== false
+      && !hasPageAclAccess(ctx, allowedSubjectIds)
+    ) {
+      throw new OperationError(
+        'permission_denied',
+        'Remote callers must retain one of their server-verified subjects in the page ACL.',
+      );
+    }
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
     // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
@@ -1317,6 +1635,7 @@ const put_page: Operation = {
     // enforceSubagentSlugFence for the fail-closed policy.
     enforceSubagentSlugFence(ctx, slug, 'put_page');
     enforceClientSlugFence(ctx, slug, 'put_page');
+    await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
 
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug, source: writeSourceId };
 
@@ -1371,34 +1690,50 @@ const put_page: Operation = {
       // Pack load failed; fall through to legacy inferType behavior.
       activePack = undefined;
     }
-    const result = await importFromContent(ctx.engine, slug, p.content as string, {
-      noEmbed,
-      // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
-      // markers (quarantine/content_flag/embed_skip). Fail-closed — anything
-      // not strictly local is remote (matches CV6 / v0.26.9 F7b posture).
-      remote: ctx.remote !== false,
-      // v118: write to the authorized target source (resolveWriteSource).
-      ...(writeSourceId ? { sourceId: writeSourceId } : {}),
-      // v0.39.0.0 T1.5: pack-aware type inference (loaded above; legacy
-      // inferType behavior when undefined).
-      ...(activePack ? { activePack } : {}),
-      // v0.39.3.0 provenance write-through (WARN-8). Trust-filtered values
-      // computed above; ingested_at is server-stamped at the engine layer.
-      // Null-valued fields signal "no provenance write this call" and the
-      // engine's COALESCE-preserve UPDATE keeps the prior first-write
-      // record intact (CV12 audit-trail survival).
-      source_kind: provenanceKind,
-      source_uri: provenanceUri,
-      ingested_via: provenanceVia,
-      // Author attribution (migration v9002). The writer's identity comes from
-      // the SERVER-RESOLVED OAuth context (ctx.auth, set at token-verification
-      // time), NOT from any wire param — so it can't be spoofed and is safe to
-      // stamp for remote callers (unlike provenance). NULL when the caller
-      // carries no identity (local CLI, sync). The engine COALESCE-preserves
-      // so an identity-less re-write keeps the prior author.
-      last_write_client_id: ctx.auth?.clientId ?? null,
-      last_write_client_name: ctx.auth?.clientName ?? null,
-    });
+    let result: Awaited<ReturnType<typeof importFromContent>>;
+    try {
+      result = await importFromContent(ctx.engine, slug, p.content as string, {
+        noEmbed,
+        // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
+        // markers (quarantine/content_flag/embed_skip). Fail-closed — anything
+        // not strictly local is remote (matches CV6 / v0.26.9 F7b posture).
+        remote: ctx.remote !== false,
+        // v118: write to the authorized target source (resolveWriteSource).
+        ...(writeSourceId ? { sourceId: writeSourceId } : {}),
+        // v0.39.0.0 T1.5: pack-aware type inference (loaded above; legacy
+        // inferType behavior when undefined).
+        ...(activePack ? { activePack } : {}),
+        // v0.39.3.0 provenance write-through (WARN-8). Trust-filtered values
+        // computed above; ingested_at is server-stamped at the engine layer.
+        // Null-valued fields signal "no provenance write this call" and the
+        // engine's COALESCE-preserve UPDATE keeps the prior first-write
+        // record intact (CV12 audit-trail survival).
+        source_kind: provenanceKind,
+        source_uri: provenanceUri,
+        ingested_via: provenanceVia,
+        // Author attribution (migration v9002). The writer's identity comes from
+        // the SERVER-RESOLVED OAuth context (ctx.auth, set at token-verification
+        // time), NOT from any wire param — so it can't be spoofed and is safe to
+        // stamp for remote callers (unlike provenance). NULL when the caller
+        // carries no identity (local CLI, sync). The engine COALESCE-preserves
+        // so an identity-less re-write keeps the prior author.
+        last_write_client_id: ctx.auth?.clientId ?? null,
+        last_write_client_name: ctx.auth?.clientName ?? null,
+        acl_subject_ids: allowedSubjectIds,
+        document_id: documentId,
+        document_version_sequence: documentVersionSequence,
+        document_version_hash: documentVersionHash,
+      });
+    } catch (error) {
+      if (error instanceof DocumentVersionConflictError) {
+        throw new OperationError(
+          'DOCUMENT_VERSION_CONFLICT',
+          'Incoming document version cannot replace the current Brain page',
+          JSON.stringify(error.current),
+        );
+      }
+      throw error;
+    }
 
     // The dedup pre-check in importFromContent can resolve the write to a
     // DIFFERENT page than the one requested (same content_hash, or the same
@@ -1470,7 +1805,12 @@ const put_page: Operation = {
     let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
-    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
+    if (documentId !== undefined) {
+      // Platform-owned documents are DB-first. Writing their private body to
+      // the Brain repo would create a second, filesystem-readable copy that
+      // is outside page ACL enforcement.
+      writeThrough = { written: false, skipped: 'platform_document' };
+    } else if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
       // v118: write-through to disk under the authorized write-target source.
       const sourceId = writeSourceId ?? 'default';
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
@@ -1589,33 +1929,37 @@ const put_page: Operation = {
       factsQueued = { skipped: 'slug_bound_client' };
     } else {
     try {
-      const { runFactsBackstop } = await import('./facts/backstop.ts');
-      const r = await runFactsBackstop(
-        {
-          slug,
-          type: result.parsedPage!.type,
-          compiled_truth: result.parsedPage!.compiled_truth,
-          frontmatter: result.parsedPage!.frontmatter,
-        },
-        {
-          engine: ctx.engine,
-          sourceId: writeSourceId ?? 'default',
-          sessionId: (ctx as { source_session?: string }).source_session ?? null,
-          source: 'mcp:put_page',
-          mode: 'queue',
-        },
-      );
-      if (r.mode === 'queue' && r.enqueued) {
-        factsQueued = { queued: true };
-      } else if (r.mode === 'queue' && r.skipped) {
-        // Preserve the pre-v0.31.2 response shape for MCP clients:
-        // 'kind:guide' / 'too_short' / 'subagent_namespace' / 'dream_generated'
-        // (bare reasons), not the helper's namespaced 'eligibility_failed:...'
-        // discriminator. Map back here.
-        const bare = r.skipped.startsWith('eligibility_failed:')
-          ? r.skipped.slice('eligibility_failed:'.length)
-          : r.skipped;
-        factsQueued = { skipped: bare };
+      if (documentId !== undefined) {
+        factsQueued = { skipped: 'platform_document' };
+      } else {
+        const { runFactsBackstop } = await import('./facts/backstop.ts');
+        const r = await runFactsBackstop(
+          {
+            slug,
+            type: result.parsedPage!.type,
+            compiled_truth: result.parsedPage!.compiled_truth,
+            frontmatter: result.parsedPage!.frontmatter,
+          },
+          {
+            engine: ctx.engine,
+            sourceId: writeSourceId ?? 'default',
+            sessionId: (ctx as { source_session?: string }).source_session ?? null,
+            source: 'mcp:put_page',
+            mode: 'queue',
+          },
+        );
+        if (r.mode === 'queue' && r.enqueued) {
+          factsQueued = { queued: true };
+        } else if (r.mode === 'queue' && r.skipped) {
+          // Preserve the pre-v0.31.2 response shape for MCP clients:
+          // 'kind:guide' / 'too_short' / 'subagent_namespace' / 'dream_generated'
+          // (bare reasons), not the helper's namespaced 'eligibility_failed:...'
+          // discriminator. Map back here.
+          const bare = r.skipped.startsWith('eligibility_failed:')
+            ? r.skipped.slice('eligibility_failed:'.length)
+            : r.skipped;
+          factsQueued = { skipped: bare };
+        }
       }
     } catch {
       factsQueued = { skipped: 'backstop_error' };
@@ -1657,24 +2001,34 @@ const put_page: Operation = {
     // write — that's the deferred strict-mode flip after the 7-day soak.
     let writerLint: { error_count: number; warning_count: number } | { skipped: string } | undefined;
     try {
-      const { runPostWriteLint } = await import('./output/post-write.ts');
-      const lint = await runPostWriteLint(ctx.engine, result.slug, {
-        sourceId: ctx.sourceId ?? 'default',
-      });
-      if (lint.ran) {
-        writerLint = {
-          error_count: lint.findings.filter(f => f.severity === 'error').length,
-          warning_count: lint.findings.filter(f => f.severity === 'warning').length,
-        };
-      } else if (lint.skippedReason) {
-        writerLint = { skipped: lint.skippedReason };
+      if (documentId !== undefined) {
+        writerLint = { skipped: 'platform_document' };
+      } else {
+        const { runPostWriteLint } = await import('./output/post-write.ts');
+        const lint = await runPostWriteLint(ctx.engine, result.slug, {
+          sourceId: writeSourceId ?? 'default',
+        });
+        if (lint.ran) {
+          writerLint = {
+            error_count: lint.findings.filter(f => f.severity === 'error').length,
+            warning_count: lint.findings.filter(f => f.severity === 'warning').length,
+          };
+        } else if (lint.skippedReason) {
+          writerLint = { skipped: lint.skippedReason };
+        }
       }
     } catch {
       // Non-fatal; never blocks put_page.
     }
 
+    const storedPage = await ctx.engine.getPage(result.slug, {
+      sourceId: writeSourceId ?? 'default',
+    });
+
     return {
       slug: result.slug,
+      source_id: storedPage?.source_id ?? writeSourceId ?? 'default',
+      page_id: storedPage?.id ?? null,
       status: result.status === 'imported' ? 'created_or_updated' : result.status,
       chunks: result.chunks,
       ...(autoLinks ? { auto_links: autoLinks } : {}),
@@ -1683,9 +2037,222 @@ const put_page: Operation = {
       ...(factsQueued ? { facts_backstop: factsQueued } : {}),
       ...(chronicleQueued ? { chronicle_backstop: chronicleQueued } : {}),
       ...(writeThrough ? { write_through: writeThrough } : {}),
+      ...(documentId !== undefined
+        ? {
+            receipt: {
+              document_id: documentId,
+              version_sequence: documentVersionSequence,
+              version_hash: documentVersionHash,
+            },
+          }
+        : {}),
     };
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
+};
+
+async function loadOwnedPageWriteProposal(
+  ctx: OperationContext,
+  proposalId: string,
+  actorId: string,
+): Promise<PageWriteProposalRow> {
+  // actor_id is part of the query rather than checked after a broad fetch: a
+  // caller who does not own the proposal gets no content, no target, and no
+  // existence oracle for another actor's pending write.
+  const rows = await ctx.engine.executeRaw<PageWriteProposalRow>(
+    `SELECT proposal_id, actor_id, source_id, slug, content, content_hash,
+            allowed_subject_ids, document_id, document_version_sequence,
+            document_version_hash, status, expires_at, confirmed_at, confirming_at
+       FROM page_write_proposals
+      WHERE proposal_id = $1 AND actor_id = $2`,
+    [proposalId, actorId],
+  );
+  const row = rows[0];
+  if (!row) {
+    throw new OperationError('permission_denied', 'Page-write proposal was not found for this actor.');
+  }
+  return row;
+}
+
+async function expirePageWriteProposal(
+  ctx: OperationContext,
+  proposalId: string,
+  actorId: string,
+): Promise<void> {
+  await ctx.engine.executeRaw(
+    `UPDATE page_write_proposals
+        SET status = 'expired'
+      WHERE proposal_id = $1 AND actor_id = $2
+        AND status IN ('pending', 'confirming') AND expires_at <= now()`,
+    [proposalId, actorId],
+  );
+}
+
+const confirm_page_write: Operation = {
+  name: 'confirm_page_write',
+  description: 'Confirm one durable native-knowledge write proposal. The same authenticated actor may repeat this call safely: a confirmed proposal returns its prior confirmation without rewriting the page.',
+  params: {
+    proposal_id: { type: 'string', required: true, description: 'Proposal id returned by propose_page_write.' },
+  },
+  mutating: true,
+  scope: 'write',
+  handler: async (ctx, p) => {
+    const actorId = governedWriteActor(ctx);
+    const proposalId = p.proposal_id as string;
+    if (!proposalId) throw new OperationError('invalid_params', 'proposal_id must be a non-empty string');
+    let proposal = await loadOwnedPageWriteProposal(ctx, proposalId, actorId);
+
+    if (proposal.status === 'confirmed') return proposalConfirmation(proposal, true);
+    if (proposal.status === 'cancelled') {
+      throw new OperationError('proposal_cancelled', 'This page-write proposal was cancelled.');
+    }
+    if (proposal.status === 'expired' || isProposalExpired(proposal)) {
+      await expirePageWriteProposal(ctx, proposalId, actorId);
+      throw new OperationError('proposal_expired', 'This page-write proposal expired; create a fresh proposal.');
+    }
+
+    // `confirming` is a short-lived lease. It prevents concurrent confirms
+    // from racing the canonical writer, while a retry can reclaim a process
+    // that died before recording the durable confirmation receipt.
+    if (proposal.status === 'confirming') {
+      const confirmingAt = proposal.confirming_at ? new Date(proposal.confirming_at).getTime() : 0;
+      if (confirmingAt > Date.now() - PAGE_WRITE_CONFIRMING_STALE_SECONDS * 1000) {
+        return {
+          proposal_id: proposal.proposal_id,
+          status: 'confirming' as const,
+          retry_after_seconds: PAGE_WRITE_CONFIRMING_STALE_SECONDS,
+        };
+      }
+    }
+
+    // Re-authorize at confirmation time. A grant may have changed since the
+    // preview was made; `federated_write` is never captured as a durable
+    // capability token in the proposal itself.
+    const writeSourceId = resolveWriteSource(ctx, proposal.source_id);
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        proposal_id: proposal.proposal_id,
+        slug: proposal.slug,
+        source_id: writeSourceId,
+        content_hash: proposal.content_hash,
+      };
+    }
+
+    const claimed = await ctx.engine.executeRaw<PageWriteProposalRow>(
+      `UPDATE page_write_proposals
+          SET status = 'confirming', confirming_at = now()
+        WHERE proposal_id = $1 AND actor_id = $2
+          AND status IN ('pending', 'confirming') AND expires_at > now()
+          AND (status = 'pending' OR confirming_at < now() - ($3 * interval '1 second'))
+      RETURNING proposal_id, actor_id, source_id, slug, content, content_hash,
+                allowed_subject_ids, document_id, document_version_sequence,
+                document_version_hash, status, expires_at, confirmed_at, confirming_at`,
+      [proposalId, actorId, PAGE_WRITE_CONFIRMING_STALE_SECONDS],
+    );
+    proposal = claimed[0] ?? await loadOwnedPageWriteProposal(ctx, proposalId, actorId);
+    if (proposal.status === 'confirmed') return proposalConfirmation(proposal, true);
+    if (proposal.status !== 'confirming') {
+      if (proposal.status === 'expired' || isProposalExpired(proposal)) {
+        await expirePageWriteProposal(ctx, proposalId, actorId);
+        throw new OperationError('proposal_expired', 'This page-write proposal expired; create a fresh proposal.');
+      }
+      throw new OperationError('proposal_not_confirmable', 'This page-write proposal cannot be confirmed in its current state.');
+    }
+
+    try {
+      const actualHash = createHash('sha256').update(proposal.content).digest('hex');
+      if (actualHash !== proposal.content_hash) {
+        throw new OperationError('storage_error', 'Stored proposal content failed its integrity check.');
+      }
+
+      // Canonical page writing remains exclusively in put_page. In particular,
+      // this keeps document fences, source provenance, and native chunking
+      // exactly aligned with every other page write.
+      await put_page.handler(ctx, {
+        slug: proposal.slug,
+        content: proposal.content,
+        source: writeSourceId,
+        ...(proposal.allowed_subject_ids ? { allowed_subject_ids: proposal.allowed_subject_ids } : {}),
+        ...(proposal.document_id ? { document_id: proposal.document_id } : {}),
+        ...(proposal.document_version_sequence ? { document_version_sequence: proposal.document_version_sequence } : {}),
+        ...(proposal.document_version_hash ? { document_version_hash: proposal.document_version_hash } : {}),
+      });
+
+      const confirmed = await ctx.engine.executeRaw<PageWriteProposalRow>(
+        `UPDATE page_write_proposals
+            SET status = 'confirmed', confirmed_at = now()
+          WHERE proposal_id = $1 AND actor_id = $2 AND status = 'confirming'
+        RETURNING proposal_id, actor_id, source_id, slug, content, content_hash,
+                  allowed_subject_ids, document_id, document_version_sequence,
+                  document_version_hash, status, expires_at, confirmed_at, confirming_at`,
+        [proposalId, actorId],
+      );
+      return proposalConfirmation(confirmed[0] ?? { ...proposal, confirmed_at: new Date() }, false);
+    } catch (error) {
+      // A rejected canonical write leaves the proposal reviewable/cancellable;
+      // only this actor's still-owned lease can be reset. A crash after the
+      // page write is handled by the stale lease retry above, and put_page's
+      // content-hash path makes that replay idempotent.
+      await ctx.engine.executeRaw(
+        `UPDATE page_write_proposals
+            SET status = 'pending', confirming_at = NULL
+          WHERE proposal_id = $1 AND actor_id = $2 AND status = 'confirming' AND expires_at > now()`,
+        [proposalId, actorId],
+      ).catch(() => {});
+      throw error;
+    }
+  },
+  cliHints: { name: 'confirm-page-write', positional: ['proposal_id'] },
+};
+
+const cancel_page_write: Operation = {
+  name: 'cancel_page_write',
+  description: 'Cancel a pending native-knowledge page write proposal. Cancellation is actor-bound and never writes the proposed page.',
+  params: {
+    proposal_id: { type: 'string', required: true, description: 'Proposal id returned by propose_page_write.' },
+  },
+  mutating: true,
+  scope: 'write',
+  handler: async (ctx, p) => {
+    const actorId = governedWriteActor(ctx);
+    const proposalId = p.proposal_id as string;
+    const proposal = await loadOwnedPageWriteProposal(ctx, proposalId, actorId);
+    if (proposal.status === 'confirmed') {
+      throw new OperationError('proposal_already_confirmed', 'A confirmed page-write proposal cannot be cancelled.');
+    }
+    if (proposal.status === 'expired' || isProposalExpired(proposal)) {
+      await expirePageWriteProposal(ctx, proposalId, actorId);
+      return { proposal_id: proposalId, status: 'expired' as const };
+    }
+    if (proposal.status === 'cancelled') return { proposal_id: proposalId, status: 'cancelled' as const, idempotent: true };
+    if (proposal.status === 'confirming') {
+      throw new OperationError('proposal_confirmation_in_progress', 'This page-write proposal is currently being confirmed. Retry shortly.');
+    }
+    if (ctx.dryRun) return { dry_run: true, proposal_id: proposalId, status: 'cancelled' as const };
+    const cancelled = await ctx.engine.executeRaw<PageWriteProposalRow>(
+      `UPDATE page_write_proposals
+          SET status = 'cancelled', cancelled_at = now()
+        WHERE proposal_id = $1 AND actor_id = $2 AND status = 'pending'
+      RETURNING proposal_id, actor_id, source_id, slug, content, content_hash,
+                allowed_subject_ids, document_id, document_version_sequence,
+                document_version_hash, status, expires_at, confirmed_at, confirming_at`,
+      [proposalId, actorId],
+    );
+    if (cancelled.length === 0) {
+      const current = await loadOwnedPageWriteProposal(ctx, proposalId, actorId);
+      if (current.status === 'confirmed') {
+        throw new OperationError('proposal_already_confirmed', 'A confirmed page-write proposal cannot be cancelled.');
+      }
+      if (current.status === 'confirming') {
+        throw new OperationError('proposal_confirmation_in_progress', 'This page-write proposal is currently being confirmed. Retry shortly.');
+      }
+      if (current.status === 'cancelled') return { proposal_id: proposalId, status: 'cancelled' as const, idempotent: true };
+      throw new OperationError('proposal_not_cancellable', 'This page-write proposal cannot be cancelled in its current state.');
+    }
+    return { proposal_id: proposalId, status: 'cancelled' as const, idempotent: false };
+  },
+  cliHints: { name: 'cancel-page-write', positional: ['proposal_id'] },
 };
 
 // v0.31.2: isFactsBackstopEligible moved to src/core/facts/eligibility.ts
@@ -1882,17 +2449,24 @@ const delete_page: Operation = {
     // Authorized via resolveWriteSource against {ctx.sourceId} ∪ federated_write —
     // you may soft-delete anywhere you're allowed to write. Omit → ctx.sourceId.
     source: { type: 'string', required: false, description: 'Target source/sala the page lives in. Must be the client\'s source_id or one of its federated_write sources. Omit to use the client\'s default source_id.' },
+    source_id: { type: 'string', required: false, description: 'Alias for source. Stable source/sala identity for the page to delete.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
     enforceClientSlugFence(ctx, slug, 'delete_page');
+    const sourceAlias = typeof p.source === 'string' ? p.source : undefined;
+    const sourceId = typeof p.source_id === 'string' ? p.source_id : undefined;
+    if (sourceAlias && sourceId && sourceAlias !== sourceId) {
+      throw new OperationError('invalid_params', 'source and source_id must match when both are provided');
+    }
     // v118-symmetry: resolve + authorize the target sala BEFORE the dry-run
     // short-circuit (mirrors put_page). FAIL-CLOSED — a client-supplied `source`
     // outside {ctx.sourceId} ∪ federated_write throws permission_denied. Delete
     // rights track write rights: you may delete wherever you may write.
-    const writeSourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    const writeSourceId = resolveWriteSource(ctx, sourceId ?? sourceAlias);
+    await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
     if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug, source: writeSourceId };
     const sourceOpts = { sourceId: writeSourceId };
     // v0.26.5: rewired from hard-delete to soft-delete. The hard-delete primitive
@@ -1930,6 +2504,7 @@ const restore_page: Operation = {
     enforceClientSlugFence(ctx, slug, 'restore_page');
     // v118-symmetry: resolve + authorize target sala before dry-run (see delete_page).
     const writeSourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
     if (ctx.dryRun) return { dry_run: true, action: 'restore_page', slug, source: writeSourceId };
     const sourceOpts = { sourceId: writeSourceId };
     const ok = await ctx.engine.restorePage(slug, sourceOpts);
@@ -2728,33 +3303,85 @@ const remove_link: Operation = {
   cliHints: { name: 'unlink', aliases: ['link-rm'], positional: ['from', 'to'] },
 };
 
+async function resolveGraphPageRef(
+  ctx: OperationContext,
+  p: Record<string, unknown>,
+): Promise<{ id: number; source_id: string; slug: string }> {
+  const slug = typeof p.slug === 'string' && p.slug.length > 0 ? p.slug : undefined;
+  const rawPageId = p.page_id;
+  const pageId = typeof rawPageId === 'number' && Number.isInteger(rawPageId) && rawPageId > 0
+    ? rawPageId
+    : undefined;
+  if (rawPageId !== undefined && pageId === undefined) {
+    throw new OperationError('invalid_params', 'page_id must be a positive integer');
+  }
+  if (!slug && pageId === undefined) {
+    throw new OperationError('invalid_params', 'Provide slug or page_id');
+  }
+
+  const requestedSource = typeof p.source_id === 'string' ? p.source_id : undefined;
+  const sourceScope = requestedSource === undefined
+    ? sourceScopeOpts(ctx)
+    : resolveRequestedScope(ctx, requestedSource, false);
+
+  if (pageId !== undefined) {
+    const page = await ctx.engine.getPageById(pageId, sourceScope);
+    if (!page) throw new OperationError('page_not_found', `Page not found: page_id=${pageId}`);
+    if (slug && page.slug !== slug) {
+      throw new OperationError('invalid_params', `page_id=${pageId} does not match slug='${slug}'`);
+    }
+    return page;
+  }
+
+  if (requestedSource !== undefined) {
+    const page = await ctx.engine.getPage(slug!, sourceScope);
+    if (!page) throw new OperationError('page_not_found', `Page not found: ${slug} (source_id=${requestedSource})`);
+    return page;
+  }
+
+  const readableSources = sourceScope.sourceIds
+    ?? (sourceScope.sourceId ? [sourceScope.sourceId] : undefined);
+  const candidates = await ctx.engine.getPageLayers(slug!, {
+    sourceIds: readableSources,
+    ...(sourceScope.aclSubjectIds !== undefined ? { aclSubjectIds: sourceScope.aclSubjectIds } : {}),
+  });
+  if (candidates.length === 0) throw new OperationError('page_not_found', `Page not found: ${slug}`);
+  if (candidates.length > 1) {
+    throw new OperationError(
+      'AMBIGUOUS_PAGE_REF',
+      `Slug '${slug}' exists in more than one authorized source; pass source_id or page_id`,
+      JSON.stringify(candidates.map((page) => ({ source_id: page.source_id, page_id: page.id, slug: page.slug }))),
+    );
+  }
+  return candidates[0];
+}
+
 const get_links: Operation = {
   name: 'get_links',
-  description: 'List outgoing links from a page',
+  description: 'List outgoing links from an exact page reference. Prefer page_id + source_id; slug is supported only when it resolves to one authorized page.',
   params: {
-    slug: { type: 'string', required: true },
+    slug: { type: 'string', description: 'Human-readable page alias; ambiguous aliases are rejected.' },
+    source_id: { type: 'string', description: 'Exact source/sala for slug resolution.' },
+    page_id: { type: 'number', description: 'Stable numeric page identity.' },
   },
   handler: async (ctx, p) => {
-    // #2200: linkReadScopeOpts so a federated grant — and an untrusted remote
-    // scalar scope (promoted to sourceIds[]) — reaches the engine's all-endpoint
-    // branch. Trusted local/internal callers keep the scalar cross-source view.
-    const sourceOpts = linkReadScopeOpts(ctx);
-    return ctx.engine.getLinks(p.slug as string, sourceOpts);
+    const page = await resolveGraphPageRef(ctx, p);
+    return ctx.engine.getLinks(page.slug, { ...linkReadScopeOpts(ctx), ...pageAccessOpts(ctx), pageId: page.id });
   },
   scope: 'read',
 };
 
 const get_backlinks: Operation = {
   name: 'get_backlinks',
-  description: 'List incoming links to a page',
+  description: 'List incoming links to an exact page reference. Prefer page_id + source_id; slug is supported only when it resolves to one authorized page.',
   params: {
-    slug: { type: 'string', required: true },
+    slug: { type: 'string', description: 'Human-readable page alias; ambiguous aliases are rejected.' },
+    source_id: { type: 'string', description: 'Exact source/sala for slug resolution.' },
+    page_id: { type: 'number', description: 'Stable numeric page identity.' },
   },
   handler: async (ctx, p) => {
-    // #2200: linkReadScopeOpts — federated grant + untrusted remote scalar
-    // (promoted to sourceIds[]) reach the engine's all-endpoint branch.
-    const sourceOpts = linkReadScopeOpts(ctx);
-    return ctx.engine.getBacklinks(p.slug as string, sourceOpts);
+    const page = await resolveGraphPageRef(ctx, p);
+    return ctx.engine.getBacklinks(page.slug, { ...linkReadScopeOpts(ctx), ...pageAccessOpts(ctx), pageId: page.id });
   },
   scope: 'read',
   cliHints: { name: 'backlinks', positional: ['slug'] },
@@ -2788,15 +3415,17 @@ const TRAVERSE_DEPTH_CAP = 10;
 
 const traverse_graph: Operation = {
   name: 'traverse_graph',
-  description: 'Traverse link graph from a page. With link_type/direction, returns edges (GraphPath[]) instead of nodes.',
+  description: 'Traverse link graph from an exact page reference. With link_type/direction, returns edges (GraphPath[]) instead of nodes.',
   params: {
-    slug: { type: 'string', required: true },
+    slug: { type: 'string', description: 'Human-readable page alias; ambiguous aliases are rejected.' },
+    source_id: { type: 'string', description: 'Exact source/sala for slug resolution.' },
+    page_id: { type: 'number', description: 'Stable numeric page identity.' },
     depth: { type: 'number', description: `Max traversal depth (default 5, capped at ${TRAVERSE_DEPTH_CAP})` },
     link_type: { type: 'string', description: 'Filter to one link type (per-edge filter, traversal only follows matching edges)' },
     direction: { type: 'string', enum: ['in', 'out', 'both'], description: 'Traversal direction (default out)' },
   },
   handler: async (ctx, p) => {
-    const slug = p.slug as string;
+    const page = await resolveGraphPageRef(ctx, p);
     const requestedDepth = (p.depth as number) || 5;
     if (requestedDepth > TRAVERSE_DEPTH_CAP) {
       ctx.logger.warn(`[gbrain] traverse_graph depth clamped from ${requestedDepth} to ${TRAVERSE_DEPTH_CAP}`);
@@ -2812,9 +3441,9 @@ const traverse_graph: Operation = {
     // Backward compat: when neither link_type nor direction is provided, return
     // the legacy GraphNode[] shape. Once either is set, switch to GraphPath[].
     if (linkType === undefined && direction === undefined) {
-      return ctx.engine.traverseGraph(slug, depth, scope);
+      return ctx.engine.traverseGraph(page.slug, depth, { ...scope, pageId: page.id });
     }
-    return ctx.engine.traversePaths(slug, { depth, linkType, direction, ...scope });
+    return ctx.engine.traversePaths(page.slug, { depth, linkType, direction, ...scope, pageId: page.id });
   },
   scope: 'read',
   cliHints: { name: 'graph', positional: ['slug'] },
@@ -3237,13 +3866,23 @@ const get_versions: Operation = {
     slug: { type: 'string', required: true },
   },
   handler: async (ctx, p) => {
-    const versions = await ctx.engine.getVersions(p.slug as string, sourceScopeOpts(ctx));
-    // Same takes-allow-list privacy boundary as get_page. Snapshots persist
-    // historical compiled_truth verbatim, including the takes fence, so
-    // a remote token bypassing get_page via /history would re-introduce
-    // the same leak across every prior version.
-    if (!ctx.takesHoldersAllowList) return versions;
-    return versions.map(v => ({ ...v, compiled_truth: stripTakesFence(v.compiled_truth) }));
+    // ACL gate before opening the historical body channel. Version rows do
+    // not duplicate page ACLs; authorization is inherited from the current
+    // stable page identity and checked server-side here.
+    const page = await ctx.engine.getPage(p.slug as string, sourceScopeOpts(ctx));
+    if (!page) return [];
+    const versions = await ctx.engine.getVersions(p.slug as string, {
+      sourceId: page.source_id,
+    });
+    // Keep the historical body channel on the exact same untrusted-reader
+    // boundary as get_page: no Takes rows and only world-visible Facts.
+    if (ctx.remote !== true) return versions;
+    return versions.map((version) => ({
+      ...version,
+      compiled_truth: stripFactsFence(stripTakesFence(version.compiled_truth), {
+        keepVisibility: ['world'],
+      }),
+    }));
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },
@@ -3255,18 +3894,47 @@ const revert_version: Operation = {
   params: {
     slug: { type: 'string', required: true },
     version_id: { type: 'number', required: true },
+    source: { type: 'string', required: false, description: 'Target source/sala for the page version.' },
+    source_id: { type: 'string', required: false, description: 'Alias for source.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
-    enforceClientSlugFence(ctx, p.slug as string, 'revert_version');
-    if (ctx.dryRun) return { dry_run: true, action: 'revert_version', slug: p.slug, version_id: p.version_id };
-    // v0.31.8 (D7): thread ctx.sourceId so multi-source brains revert the
-    // intended page row instead of whichever same-slug row Postgres returns
-    // first.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.createVersion(p.slug as string, sourceOpts);
-    await ctx.engine.revertToVersion(p.slug as string, p.version_id as number, sourceOpts);
+    const slug = p.slug as string;
+    enforceClientSlugFence(ctx, slug, 'revert_version');
+    const sourceAlias = typeof p.source === 'string' ? p.source : undefined;
+    const sourceId = typeof p.source_id === 'string' ? p.source_id : undefined;
+    if (sourceAlias && sourceId && sourceAlias !== sourceId) {
+      throw new OperationError('invalid_params', 'source and source_id must match when both are provided');
+    }
+    const writeSourceId = resolveWriteSource(ctx, sourceId ?? sourceAlias);
+    const page = await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
+    if (!page) {
+      throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug and source.');
+    }
+    const versionId = p.version_id as number;
+    const matchingVersions = await ctx.engine.executeRaw<{ id: number }>(
+      `SELECT id FROM page_versions WHERE id = $1 AND page_id = $2 LIMIT 1`,
+      [versionId, page.id],
+    );
+    if (matchingVersions.length === 0) {
+      throw new OperationError(
+        'version_not_found',
+        'The requested version does not belong to the authorized page.',
+      );
+    }
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        action: 'revert_version',
+        slug,
+        version_id: versionId,
+        source: writeSourceId,
+      };
+    }
+    const sourceOpts = { sourceId: writeSourceId };
+    await ctx.engine.createVersion(slug, sourceOpts);
+    await ctx.engine.revertToVersion(slug, versionId, sourceOpts);
     return { status: 'reverted' };
   },
   cliHints: { name: 'revert', positional: ['slug', 'version_id'] },
@@ -6920,7 +7588,7 @@ export const operations: Operation[] = [
   // so `--surface verbs` agents see them at the top of the tool list.
   ...verbOperations,
   // Page CRUD
-  get_page, put_page, delete_page, list_pages,
+  get_page, propose_page_write, confirm_page_write, cancel_page_write, put_page, delete_page, list_pages,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
   restore_page, purge_deleted_pages,
   // Search
