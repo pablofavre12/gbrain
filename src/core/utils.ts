@@ -115,6 +115,16 @@ export function rowToPage(row: Record<string, unknown>): Page {
   // to null, populated columns carry the writer identity.
   const lastWriteClientId = row.last_write_client_id === undefined ? undefined : (row.last_write_client_id as string | null);
   const lastWriteClientName = row.last_write_client_name === undefined ? undefined : (row.last_write_client_name as string | null);
+  const aclSubjectIds = row.acl_subject_ids === undefined
+    ? undefined
+    : (row.acl_subject_ids as string[] | null);
+  const documentId = row.document_id === undefined ? undefined : (row.document_id as string | null);
+  const documentVersionSequence = row.document_version_sequence === undefined
+    ? undefined
+    : (row.document_version_sequence == null ? null : Number(row.document_version_sequence));
+  const documentVersionHash = row.document_version_hash === undefined
+    ? undefined
+    : (row.document_version_hash as string | null);
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -143,6 +153,10 @@ export function rowToPage(row: Record<string, unknown>): Page {
     // Author attribution (migration v9002). Optional in SELECT projection.
     ...(lastWriteClientId !== undefined && { last_write_client_id: lastWriteClientId }),
     ...(lastWriteClientName !== undefined && { last_write_client_name: lastWriteClientName }),
+    ...(aclSubjectIds !== undefined && { acl_subject_ids: aclSubjectIds }),
+    ...(documentId !== undefined && { document_id: documentId }),
+    ...(documentVersionSequence !== undefined && { document_version_sequence: documentVersionSequence }),
+    ...(documentVersionHash !== undefined && { document_version_hash: documentVersionHash }),
     // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
     // can thread it through getChunks / upsertChunks without defaulting to 'default'.
     // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now

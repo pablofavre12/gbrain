@@ -142,6 +142,14 @@ CREATE TABLE IF NOT EXISTS pages (
   -- rows against any current generation.
   contextual_retrieval_mode  TEXT,
   corpus_generation          TEXT,
+  -- Per-page ACL for Platform-owned versioned documents. NULL preserves the
+  -- historical source-level visibility contract; non-empty arrays require an
+  -- overlap with server-resolved caller subjects.
+  acl_subject_ids             TEXT[],
+  -- Monotonic destination fence for Platform document ingestion.
+  document_id                 TEXT,
+  document_version_sequence   BIGINT,
+  document_version_hash       TEXT,
   -- v0.40.3.0 cache invalidation gate (migration v91). Monotonic per-page
   -- counter bumped by bump_page_generation_trg on INSERT (initial value =
   -- MAX(generation) + 1 so the bookmark fires for any cache row stored
@@ -149,8 +157,21 @@ CREATE TABLE IF NOT EXISTS pages (
   -- the content allow-list IS DISTINCT FROM. Read by the per-page snapshot
   -- check in query-cache-gate.ts.
   generation     BIGINT NOT NULL DEFAULT 1,
+  CONSTRAINT pages_acl_nonempty_check
+    CHECK (acl_subject_ids IS NULL OR cardinality(acl_subject_ids) > 0),
+  CONSTRAINT pages_document_fence_shape_check CHECK (
+    (document_id IS NULL AND document_version_sequence IS NULL AND document_version_hash IS NULL)
+    OR
+    (document_id IS NOT NULL AND char_length(document_id) BETWEEN 1 AND 200
+      AND document_version_sequence >= 1
+      AND document_version_hash ~ '^[a-f0-9]{64}$')
+  ),
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
+
+CREATE INDEX IF NOT EXISTS pages_acl_subject_ids_idx
+  ON pages USING GIN (acl_subject_ids)
+  WHERE acl_subject_ids IS NOT NULL;
 
 -- v0.40.3.0 cache invalidation trigger (migration v91; mirrored in
 -- src/core/pglite-schema.ts). BEFORE INSERT OR UPDATE so every write path
@@ -676,6 +697,39 @@ CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
   ON oauth_clients USING GIN (federated_read);
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_write
   ON oauth_clients USING GIN (federated_write);
+
+-- Governed native-knowledge writes: proposal payloads are durable but inert
+-- until the same server-authenticated actor confirms through put_page.
+CREATE TABLE IF NOT EXISTS page_write_proposals (
+  proposal_id               TEXT PRIMARY KEY,
+  actor_id                  TEXT NOT NULL,
+  source_id                 TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  slug                      TEXT NOT NULL,
+  content                   TEXT NOT NULL,
+  content_hash              TEXT NOT NULL CHECK (content_hash ~ '^[a-f0-9]{64}$'),
+  allowed_subject_ids       TEXT[],
+  document_id               TEXT,
+  document_version_sequence BIGINT,
+  document_version_hash     TEXT,
+  status                    TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending', 'confirming', 'confirmed', 'cancelled', 'expired')),
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at                TIMESTAMPTZ NOT NULL,
+  confirming_at             TIMESTAMPTZ,
+  confirmed_at              TIMESTAMPTZ,
+  cancelled_at              TIMESTAMPTZ,
+  CONSTRAINT page_write_proposals_acl_nonempty_check
+    CHECK (allowed_subject_ids IS NULL OR cardinality(allowed_subject_ids) > 0),
+  CONSTRAINT page_write_proposals_document_fence_shape_check CHECK (
+    (document_id IS NULL AND document_version_sequence IS NULL AND document_version_hash IS NULL)
+    OR
+    (document_id IS NOT NULL AND char_length(document_id) BETWEEN 1 AND 200
+      AND document_version_sequence >= 1
+      AND document_version_hash ~ '^[a-f0-9]{64}$')
+  )
+);
+CREATE INDEX IF NOT EXISTS page_write_proposals_actor_status_expires_idx
+  ON page_write_proposals (actor_id, status, expires_at);
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash   TEXT PRIMARY KEY,

@@ -70,6 +70,16 @@ describe('delete_page honors federated_write (delete tracks write)', () => {
     expect(result2).toMatchObject({ dry_run: true, source: 'lideres' });
   });
 
+  test('source_id is the stable alias and cannot disagree with source', async () => {
+    const result = await delete_page.handler(directorioCtx(), {
+      slug: 'wiki/x', source_id: 'campo',
+    });
+    expect(result).toMatchObject({ dry_run: true, source: 'campo' });
+    await expect(delete_page.handler(directorioCtx(), {
+      slug: 'wiki/x', source: 'campo', source_id: 'lideres',
+    })).rejects.toMatchObject({ code: 'invalid_params' });
+  });
+
   test('(c) source not in set → rejected (preview surfaces the rejection)', async () => {
     const p = delete_page.handler(directorioCtx(), { slug: 'wiki/x', source: 'finanzas' });
     await expect(p).rejects.toBeInstanceOf(OperationError);
