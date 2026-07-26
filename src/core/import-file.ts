@@ -277,6 +277,11 @@ export async function importFromContent(
      */
     last_write_client_id?: string | null;
     last_write_client_name?: string | null;
+    /** Page-level ACL + monotonic Platform document fence (put_page only). */
+    acl_subject_ids?: string[];
+    document_id?: string;
+    document_version_sequence?: number;
+    document_version_hash?: string;
     /**
      * v0.42 (#1699 trust boundary). When `true` (untrusted caller — remote MCP
      * put_page), gate-owned frontmatter markers (`quarantine`, `content_flag`,
@@ -568,7 +573,14 @@ export async function importFromContent(
   };
 
   const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
-  if (existing?.content_hash === hash && !opts.forceRechunk) {
+  const exactDocumentReplay =
+    opts.document_id !== undefined
+    && existing?.document_id === opts.document_id
+    && existing.document_version_sequence === opts.document_version_sequence
+    && existing.document_version_hash === opts.document_version_hash
+    && JSON.stringify([...(existing.acl_subject_ids ?? [])].sort())
+      === JSON.stringify([...(opts.acl_subject_ids ?? [])].sort());
+  if (existing?.content_hash === hash && !opts.forceRechunk && (opts.document_id === undefined || exactDocumentReplay)) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
 
@@ -787,6 +799,10 @@ export async function importFromContent(
       // import CLI). Engine applies COALESCE-preserve UPDATE.
       last_write_client_id: opts.last_write_client_id ?? null,
       last_write_client_name: opts.last_write_client_name ?? null,
+      acl_subject_ids: opts.acl_subject_ids,
+      document_id: opts.document_id,
+      document_version_sequence: opts.document_version_sequence,
+      document_version_hash: opts.document_version_hash,
     }, txOpts);
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside

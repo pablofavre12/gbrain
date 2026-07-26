@@ -15,7 +15,7 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import type { GraphPath } from '../core/types.ts';
+import type { BrainPageRef, GraphPath } from '../core/types.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 
@@ -188,32 +188,38 @@ export async function runGraphQuery(engine: BrainEngine, argv: string[]) {
   }
 }
 
-/** Render the GraphPath[] as an indented tree rooted at the given slug. */
+/** Render the GraphPath[] as an identity-safe tree rooted at the given slug. */
 function printTree(rootSlug: string, paths: GraphPath[], direction: 'in' | 'out' | 'both') {
-  // Build adjacency: for direction='out' the root is a from_slug; for 'in' the
-  // root is a to_slug; for 'both' the root could be either.
-  // Group by parent (from_slug for 'out', to_slug for 'in').
+  const keyOf = (ref: BrainPageRef) => `${ref.source_id}:${ref.page_id}`;
+  const labelOf = (ref: BrainPageRef) => `${ref.slug} [${ref.source_id}]`;
+  // Group by stable page identity, never by slug: a federated graph can
+  // legitimately contain two pages with the same slug from different sources.
   const byParent = new Map<string, GraphPath[]>();
   for (const p of paths) {
-    const parent = direction === 'in' ? p.to_slug : p.from_slug;
+    const parent = direction === 'in' ? keyOf(p.to) : keyOf(p.from);
     const list = byParent.get(parent) ?? [];
     list.push(p);
     byParent.set(parent, list);
   }
 
-  function walk(parent: string, indent: number, seen: Set<string>) {
-    if (seen.has(parent)) return;
-    seen.add(parent);
-    const children = byParent.get(parent) ?? [];
+  const first = paths.find((path) => (direction === 'in' ? path.to.slug : path.from.slug) === rootSlug);
+  if (!first) return;
+  const root = direction === 'in' ? first.to : first.from;
+
+  function walk(parent: BrainPageRef, indent: number, seen: Set<string>) {
+    const parentKey = keyOf(parent);
+    if (seen.has(parentKey)) return;
+    seen.add(parentKey);
+    const children = byParent.get(parentKey) ?? [];
     children.sort((a, b) => a.depth - b.depth || a.to_slug.localeCompare(b.to_slug));
     for (const c of children) {
-      const next = direction === 'in' ? c.from_slug : c.to_slug;
+      const next = direction === 'in' ? c.from : c.to;
       const arrow = direction === 'in' ? '<-' : '--';
       const tail = direction === 'in' ? '--' : '->';
-      console.log(`${'  '.repeat(indent + 1)}${arrow}${c.link_type}${tail} ${next} (depth ${c.depth})`);
+      console.log(`${'  '.repeat(indent + 1)}${arrow}${c.link_type}${tail} ${labelOf(next)} (depth ${c.depth})`);
       walk(next, indent + 1, seen);
     }
   }
 
-  walk(rootSlug, 0, new Set());
+  walk(root, 0, new Set());
 }

@@ -33,6 +33,7 @@ import { parseRelationalQuery, type RelationalQuery, type RelationVocab } from '
 export interface RelationalArmOpts {
   sourceId?: string;
   sourceIds?: string[];
+  aclSubjectIds?: string[];
   depth?: number;
   limit?: number;
   vocab?: RelationVocab;
@@ -177,6 +178,7 @@ export async function buildRelationalArm(
       direction: parsed.direction,
       depth: opts.depth,
       limit: opts.limit,
+      aclSubjectIds: opts.aclSubjectIds,
     };
 
     if (parsed.kind === 'connects' && parsed.seeds.length === 2) {

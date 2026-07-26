@@ -6,7 +6,8 @@
  * ONE ambiguous row. v119:
  *   - get_page(slug, source='campo')  → ONLY that layer, scope-checked.
  *   - get_page(slug) with 1 readable layer  → the single page (legacy shape).
- *   - get_page(slug) with >1 readable layer → {slug, multi_source:true, layers}
+ *   - get_page(slug) with >1 readable layer → AMBIGUOUS_PAGE_REF.
+ *   - get_page(slug, include_layers=true) → {slug, multi_source:true, layers}
  *     ordered most-public → most-restricted.
  *   - source outside the caller's read grant → forbidden_source.
  *
@@ -65,6 +66,14 @@ function makeEngine(layersBySlug: Record<string, Page[]>): BrainEngine {
     );
     return inScope[0] ?? null;
   };
+  const getPageById: BrainEngine['getPageById'] = async (pageId, opts) => {
+    const all = Object.values(layersBySlug).flat();
+    const ids = opts?.sourceIds;
+    const id = opts?.sourceId;
+    return all.find((pg) => pg.id === pageId && (
+      ids && ids.length > 0 ? ids.includes(pg.source_id) : id ? pg.source_id === id : true
+    )) ?? null;
+  };
   const getPageLayers: BrainEngine['getPageLayers'] = async (slug, opts) => {
     const all = layersBySlug[slug] ?? [];
     const ids = opts?.sourceIds;
@@ -80,6 +89,7 @@ function makeEngine(layersBySlug: Record<string, Page[]>): BrainEngine {
   };
   return {
     getPage,
+    getPageById,
     getPageLayers,
     getTags,
     async resolveSlugs() {
@@ -155,11 +165,16 @@ describe('get_page explicit source → single layer', () => {
 });
 
 describe('get_page union (no source)', () => {
-  test('(b) >1 readable layer → multi_source envelope, public→restricted order', async () => {
+  test('(b) >1 readable layer requires explicit include_layers=true', async () => {
     const engine = makeEngine({
       'personas/x': [page({ source_id: 'directorio' }), page({ source_id: 'campo' })],
     });
-    const result: any = await get_page.handler(directorioCtx(engine), { slug: 'personas/x' });
+    await expect(get_page.handler(directorioCtx(engine), { slug: 'personas/x' })).rejects.toMatchObject({
+      code: 'AMBIGUOUS_PAGE_REF',
+    });
+    const result: any = await get_page.handler(directorioCtx(engine), {
+      slug: 'personas/x', include_layers: true,
+    });
     expect(result.multi_source).toBe(true);
     expect(result.slug).toBe('personas/x');
     expect(result.layers).toHaveLength(2);
@@ -168,6 +183,8 @@ describe('get_page union (no source)', () => {
     // Each layer carries its own per-source tags + the layer shape.
     expect(result.layers[0]).toMatchObject({
       source_id: 'campo',
+      page_id: expect.any(Number),
+      slug: 'personas/x',
       title: 'title-campo',
       type: 'note',
       tags: ['tag-campo'],
@@ -198,9 +215,24 @@ describe('get_page union (no source)', () => {
         page({ source_id: 'finanzas' }), // outside grant
       ],
     });
-    const result: any = await get_page.handler(directorioCtx(engine), { slug: 'personas/x' });
+    const result: any = await get_page.handler(directorioCtx(engine), {
+      slug: 'personas/x', include_layers: true,
+    });
     expect(result.multi_source).toBe(true);
     expect(result.layers.map((l: any) => l.source_id)).toEqual(['campo', 'directorio']);
+  });
+
+  test('page_id + source_id reads one exact authorized layer and validates slug', async () => {
+    const campo = page({ id: 101, source_id: 'campo' });
+    const directorio = page({ id: 202, source_id: 'directorio' });
+    const engine = makeEngine({ 'personas/x': [campo, directorio] });
+    const result: any = await get_page.handler(directorioCtx(engine), {
+      page_id: 202, source_id: 'directorio', slug: 'personas/x',
+    });
+    expect(result).toMatchObject({ source_id: 'directorio', page_id: 202, slug: 'personas/x' });
+    await expect(get_page.handler(directorioCtx(engine), {
+      page_id: 202, source_id: 'directorio', slug: 'other/slug',
+    })).rejects.toMatchObject({ code: 'invalid_params' });
   });
 
   test('not found → page_not_found', async () => {

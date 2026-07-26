@@ -744,6 +744,11 @@ export function parseOpArgs(op: Operation, args: string[]): Record<string, unkno
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg.startsWith('--')) {
+      // Shared operations render unknown/default shapes as JSON already.
+      // Accepting --json explicitly keeps automation invocations stable and,
+      // crucially, prevents the generic parser from consuming the next flag
+      // as an accidental value.
+      if (arg === '--json') continue;
       if (arg.startsWith('--no-')) {
         const positiveKey = arg.slice(5).replace(/-/g, '_');
         const positiveDef = op.params[positiveKey];
@@ -752,13 +757,22 @@ export function parseOpArgs(op: Operation, args: string[]): Record<string, unkno
           continue;
         }
       }
-      const key = arg.slice(2).replace(/-/g, '_');
+      const rawKey = arg.slice(2).replace(/-/g, '_');
+      // Ergonomic repeatable singular spelling for the document ACL CLI:
+      //   --allowed-subject-id user:a --allowed-subject-id user:b
+      const key = rawKey === 'allowed_subject_id' ? 'allowed_subject_ids' : rawKey;
       const paramDef = op.params[key];
       if (paramDef?.type === 'boolean') {
         params[key] = true;
       } else if (i + 1 < args.length) {
-        params[key] = args[++i];
-        if (paramDef?.type === 'number') params[key] = Number(params[key]);
+        const value = args[++i];
+        if (paramDef?.type === 'array') {
+          const items = value.split(',').map((v) => v.trim()).filter(Boolean);
+          const current = Array.isArray(params[key]) ? params[key] as unknown[] : [];
+          params[key] = [...current, ...items];
+        } else {
+          params[key] = paramDef?.type === 'number' ? Number(value) : value;
+        }
       }
     } else if (posIdx < positional.length) {
       const key = positional[posIdx++];

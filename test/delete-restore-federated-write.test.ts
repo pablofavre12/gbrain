@@ -29,7 +29,9 @@ const restore_page = operations.find(o => o.name === 'restore_page') as Operatio
 if (!restore_page) throw new Error('restore_page op missing');
 
 function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
-  const engine = {} as BrainEngine; // dry_run short-circuits before touching the engine
+  // ACL authorization is intentionally evaluated before dry-run so previews
+  // cannot be used to probe or bypass a protected current page.
+  const engine = { executeRaw: async () => [] } as unknown as BrainEngine;
   return {
     engine,
     config: { engine: 'postgres' } as any,
@@ -68,6 +70,16 @@ describe('delete_page honors federated_write (delete tracks write)', () => {
     expect(result).toMatchObject({ dry_run: true, source: 'campo' });
     const result2 = await delete_page.handler(directorioCtx(), { slug: 'wiki/x', source: 'lideres' });
     expect(result2).toMatchObject({ dry_run: true, source: 'lideres' });
+  });
+
+  test('source_id is the stable alias and cannot disagree with source', async () => {
+    const result = await delete_page.handler(directorioCtx(), {
+      slug: 'wiki/x', source_id: 'campo',
+    });
+    expect(result).toMatchObject({ dry_run: true, source: 'campo' });
+    await expect(delete_page.handler(directorioCtx(), {
+      slug: 'wiki/x', source: 'campo', source_id: 'lideres',
+    })).rejects.toMatchObject({ code: 'invalid_params' });
   });
 
   test('(c) source not in set → rejected (preview surfaces the rejection)', async () => {

@@ -10,6 +10,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { createHash } from 'node:crypto';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import type { SearchResult, SearchOpts, HybridSearchMeta } from '../types.ts';
 import { embed, embedQuery } from '../embedding.ts';
@@ -427,6 +428,8 @@ export interface PostFusionOpts {
    * metadata stages so a title hit can't bury a strong semantic match.
    */
   titleBoost?: number;
+  /** Server-resolved visibility scope for graph-derived ranking signals. */
+  pageAccess?: Pick<SearchOpts, 'sourceId' | 'sourceIds' | 'aclSubjectIds'>;
 }
 
 export async function runPostFusionStages(
@@ -457,7 +460,7 @@ export async function runPostFusionStages(
   if (opts.applyBacklinks) {
     try {
       const slugs = Array.from(new Set(results.map(r => r.slug)));
-      const counts = await engine.getBacklinkCounts(slugs);
+      const counts = await engine.getBacklinkCounts(slugs, opts.pageAccess);
       applyBacklinkBoost(results, counts, floorThreshold);
     } catch {
       // Non-fatal; preserves the existing pre-v0.29.1 contract.
@@ -523,7 +526,7 @@ export async function runPostFusionStages(
   // shares the same floor-threshold so a weak hub gets the same
   // protection v0.35.6.0 added for other metadata boosts. Fail-open at
   // this level matches the per-stage non-fatal contract.
-  if (opts.graphSignalsEnabled) {
+  if (opts.graphSignalsEnabled && opts.pageAccess?.aclSubjectIds === undefined) {
     try {
       const { applyGraphSignals } = await import('./graph-signals.ts');
       await applyGraphSignals(results, engine, {
@@ -637,7 +640,7 @@ export async function applyAliasHop(
   engine: import('../engine.ts').BrainEngine,
   results: SearchResult[],
   query: string,
-  opts: { sourceId?: string; sourceIds?: string[] },
+  opts: Pick<SearchOpts, 'sourceId' | 'sourceIds' | 'aclSubjectIds'>,
 ): Promise<SearchResult[]> {
   if (!query) return results;
   const qNorm = normalizeAlias(query);
@@ -645,7 +648,7 @@ export async function applyAliasHop(
 
   let aliasMap: Map<string, Array<{ slug: string; source_id: string }>>;
   try {
-    aliasMap = await engine.resolveAliases([qNorm], { sourceId: opts.sourceId, sourceIds: opts.sourceIds });
+    aliasMap = await engine.resolveAliases([qNorm], opts);
   } catch {
     return results; // pre-v110 table-missing OR transient error -> fail-open
   }
@@ -672,7 +675,10 @@ export async function applyAliasHop(
     // Absent canonical: fetch (in its OWN source) + inject at top-of-organic + epsilon.
     let page;
     try {
-      page = await engine.getPage(ref.slug, { sourceId: ref.source_id });
+      page = await engine.getPage(ref.slug, {
+        sourceId: ref.source_id,
+        aclSubjectIds: opts.aclSubjectIds,
+      });
     } catch {
       continue;
     }
@@ -912,6 +918,7 @@ export async function hybridSearch(
     // ordering means we can't lazy-spread the full opts).
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
+    aclSubjectIds: opts?.aclSubjectIds,
     // v0.36 (D11): pass the pre-validated descriptor into the engine so
     // it never has to read config. Engines normalize string-or-descriptor
     // via normalizeEngineColumn; the descriptor path is the strict one.
@@ -1016,6 +1023,11 @@ export async function hybridSearch(
     // The raw query drives the matcher; default factor when the knob is unset.
     query,
     titleBoost: resolvedMode.title_boost,
+    pageAccess: {
+      sourceId: opts?.sourceId,
+      sourceIds: opts?.sourceIds,
+      aclSubjectIds: opts?.aclSubjectIds,
+    },
   };
 
   // v0.43 — build the relational recall arm ONCE here, before any return
@@ -1029,6 +1041,7 @@ export async function hybridSearch(
     relationalList = await buildRelationalArm(engine, query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
+      aclSubjectIds: opts?.aclSubjectIds,
       depth: resolvedMode.relational_retrieval_depth,
       limit: opts?.limit ?? resolvedMode.searchLimit,
       onMeta: opts?.onRelationalMeta,
@@ -1063,6 +1076,7 @@ export async function hybridSearch(
     const noEmbedHopped = await applyAliasHop(engine, dedupResults(noEmbedResults), query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
+      aclSubjectIds: opts?.aclSubjectIds,
     });
     stampEvidence(noEmbedHopped);
     const noEmbedSliced = noEmbedHopped.slice(offset, offset + limit);
@@ -1295,6 +1309,7 @@ export async function hybridSearch(
     const kwHopped = await applyAliasHop(engine, dedupResults(fallbackResults), query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
+      aclSubjectIds: opts?.aclSubjectIds,
     });
     stampEvidence(kwHopped);
     const kwSliced = kwHopped.slice(offset, offset + limit);
@@ -1394,7 +1409,13 @@ export async function hybridSearch(
   // structural neighbors from the same file/class are the whole point
   // of two-pass; clipping them at 2/page defeats A2 (codex F5).
   const walkDepth = Math.min(opts?.walkDepth ?? 0, 2);
-  const needsExpansion = walkDepth > 0 || Boolean(opts?.nearSymbol);
+  // The legacy structural-expansion engine uses raw chunk/edge lookups that
+  // do not carry page ACL identity. Until that engine has an ACL-aware public
+  // contract, remote page-ACL searches fail closed by disabling this optional
+  // recall arm instead of risking a hidden neighbor injection.
+  const needsExpansion =
+    opts?.aclSubjectIds === undefined
+    && (walkDepth > 0 || Boolean(opts?.nearSymbol));
   let dedupOpts = opts?.dedupOpts;
 
   if (needsExpansion) {
@@ -1468,6 +1489,7 @@ export async function hybridSearch(
   const aliasHopped = await applyAliasHop(engine, reranked, query, {
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
+    aclSubjectIds: opts?.aclSubjectIds,
   });
 
   // T4 — stamp evidence + create_safety so the agent's don't-duplicate
@@ -1844,11 +1866,20 @@ function rrfKey(r: SearchResult): string {
  *   - scalar sourceId           → the id itself (single-source unchanged)
  *   - unscoped                  → `'default'` (single-source brains unchanged)
  */
-export function cacheScopeKey(opts?: { sourceId?: string; sourceIds?: string[] }): string {
-  if (opts?.sourceIds && opts.sourceIds.length > 0) {
-    return '__set__:' + [...opts.sourceIds].sort().join(',');
-  }
-  return opts?.sourceId ?? 'default';
+export function cacheScopeKey(
+  opts?: Pick<SearchOpts, 'sourceId' | 'sourceIds' | 'aclSubjectIds'>,
+): string {
+  const sourceScope = opts?.sourceIds && opts.sourceIds.length > 0
+    ? '__set__:' + [...opts.sourceIds].sort().join(',')
+    : opts?.sourceId ?? 'default';
+  // Undefined means trusted/local legacy behavior. Remote callers always
+  // provide an array (possibly empty), so their semantic-cache rows are
+  // partitioned by the server-resolved identity set. Hash the IDs to avoid
+  // persisting human identifiers in the cache key itself.
+  if (opts?.aclSubjectIds === undefined) return sourceScope;
+  const canonical = [...new Set(opts.aclSubjectIds)].sort().join('\0');
+  const digest = createHash('sha256').update(canonical).digest('hex').slice(0, 24);
+  return `${sourceScope}::acl:${digest}`;
 }
 
 /**
