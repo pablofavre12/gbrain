@@ -17,6 +17,10 @@ inherits the current page ACL and applies the same Takes/Facts redaction as
 `get_page`. Native agent writes use `propose_page_write` →
 `confirm_page_write`/`cancel_page_write`; proposals are bound to a verified
 `user:*` subject when present, with `client:*` only as the M2M fallback.
+Remote callers may set the versioned-document fence only when their
+server-derived `AuthInfo.capabilities` contains `versioned_document_write`;
+generic write scope is insufficient, so it cannot be used to claim and lock a
+legacy public page.
 `src/core/engine.ts`, `src/core/postgres-engine.ts`, and
 `src/core/pglite-engine.ts` carry `PageReferenceOpts` (`sourceId`, federated
 `sourceIds`, stable `pageId`, and authenticated `aclSubjectIds`) through graph

@@ -300,6 +300,16 @@ export interface AuthInfo {
    * never populate this field. `client:<clientId>` is added automatically.
    */
   subjectIds?: string[];
+  /**
+   * Server-established capabilities that may unlock narrower privileged
+   * contracts. Wire params never populate this field.
+   *
+   * `versioned_document_write` is required for remote callers that set the
+   * Platform document fence (`document_id` + version sequence/hash). This
+   * prevents a generic write-scoped client from claiming a public page as a
+   * versioned document and locking subsequent writers out.
+   */
+  capabilities?: string[];
 }
 
 export interface OperationContext {
@@ -917,6 +927,7 @@ const get_page: Operation = {
 const PAGE_WRITE_PROPOSAL_TTL_MINUTES = 15;
 const PAGE_WRITE_PROPOSAL_MAX_BYTES = 5_000_000;
 const PAGE_WRITE_CONFIRMING_STALE_SECONDS = 120;
+const VERSIONED_DOCUMENT_WRITE_CAPABILITY = 'versioned_document_write';
 
 type PageWriteProposalRow = {
   proposal_id: string;
@@ -998,6 +1009,18 @@ function hasPageAclAccess(ctx: OperationContext, allowedSubjects: unknown): bool
   return callerSubjects.some((subject) => allowedSubjects.includes(subject));
 }
 
+function requireVersionedDocumentWriteCapability(ctx: OperationContext): void {
+  if (
+    ctx.remote !== false
+    && !ctx.auth?.capabilities?.includes(VERSIONED_DOCUMENT_WRITE_CAPABILITY)
+  ) {
+    throw new OperationError(
+      'permission_denied',
+      'Versioned document writes require a server-verified document capability.',
+    );
+  }
+}
+
 type CurrentPageWriteTarget = {
   id: number;
   acl_subject_ids: string[] | null;
@@ -1050,6 +1073,9 @@ const propose_page_write: Operation = {
     const proposalId = randomUUID();
     const expiresAt = new Date(Date.now() + PAGE_WRITE_PROPOSAL_TTL_MINUTES * 60_000);
     const allowedSubjectIds = p.allowed_subject_ids === undefined ? null : p.allowed_subject_ids;
+    if (p.document_id !== undefined) {
+      requireVersionedDocumentWriteCapability(ctx);
+    }
 
     if (ctx.dryRun) {
       return proposalPreview({ proposal_id: proposalId, slug, source_id: sourceId, content, content_hash: contentHash, expires_at: expiresAt });
@@ -1129,6 +1155,9 @@ const put_page: Operation = {
         'invalid_params',
         'document_id, document_version_sequence and document_version_hash must be supplied together',
       );
+    }
+    if (documentId !== undefined) {
+      requireVersionedDocumentWriteCapability(ctx);
     }
     if (documentId !== undefined && (!documentId || documentId.length > 200 || /[\u0000-\u001f\u007f]/.test(documentId))) {
       throw new OperationError('invalid_params', 'document_id must be 1-200 characters without control characters');

@@ -12,7 +12,12 @@ const op = (name: string) => {
 
 const markdown = (title: string, body: string) => `---\ntitle: ${title}\n---\n${body}`;
 
-function actorCtx(clientId: string, opts: { sourceId?: string; federatedWrite?: string[]; subjects?: string[] } = {}): OperationContext {
+function actorCtx(clientId: string, opts: {
+  sourceId?: string;
+  federatedWrite?: string[];
+  subjects?: string[];
+  capabilities?: string[];
+} = {}): OperationContext {
   const sourceId = opts.sourceId ?? 'campo';
   return {
     engine,
@@ -29,6 +34,7 @@ function actorCtx(clientId: string, opts: { sourceId?: string; federatedWrite?: 
       allowedSources: [sourceId, ...(opts.federatedWrite ?? [])],
       federatedWrite: opts.federatedWrite ?? [],
       subjectIds: opts.subjects ?? [],
+      capabilities: opts.capabilities ?? [],
     },
   };
 }
@@ -167,5 +173,30 @@ describe('governed native page writes', () => {
     await expect(op('propose_page_write').handler(anonymous, {
       slug: 'notes/no-actor', content: markdown('No actor', 'no write'),
     })).rejects.toBeInstanceOf(OperationError);
+  });
+
+  test('rejects a versioned-document proposal before persistence without the server capability', async () => {
+    const params = {
+      slug: 'documents/guarded',
+      content: markdown('Guarded document', 'version one'),
+      allowed_subject_ids: ['user:alice'],
+      document_id: 'platform-document-guarded',
+      document_version_sequence: 1,
+      document_version_hash: 'b'.repeat(64),
+    };
+
+    await expect(op('propose_page_write').handler(actorCtx('shared-bff', {
+      subjects: ['user:alice'],
+    }), params)).rejects.toMatchObject({ code: 'permission_denied' });
+
+    const rows = await engine.executeRaw<{ count: number | string }>(
+      'SELECT COUNT(*)::int AS count FROM page_write_proposals',
+    );
+    expect(Number(rows[0]?.count ?? 0)).toBe(0);
+
+    await expect(op('propose_page_write').handler(actorCtx('shared-bff', {
+      subjects: ['user:alice'],
+      capabilities: ['versioned_document_write'],
+    }), params)).resolves.toMatchObject({ status: 'pending' });
   });
 });

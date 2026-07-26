@@ -24,7 +24,7 @@ const op = (name: string) => {
   return found;
 };
 
-function remoteCtx(subjectIds: string[]): OperationContext {
+function remoteCtx(subjectIds: string[], capabilities: string[] = []): OperationContext {
   return {
     engine,
     config: {} as any,
@@ -39,6 +39,7 @@ function remoteCtx(subjectIds: string[]): OperationContext {
       sourceId: 'default',
       allowedSources: ['default'],
       subjectIds,
+      capabilities,
     },
   };
 }
@@ -216,6 +217,32 @@ describe('page-level ACL is fail-closed on PGLite read surfaces', () => {
       content: 'new private page',
       allowed_subject_ids: ['user:bob'],
     })).rejects.toMatchObject({ code: 'permission_denied' });
+  });
+
+  test('remote writers cannot claim a page as a versioned document without a server capability', async () => {
+    await engine.putPage('docs/public-contract', basePage('Public contract', 'legacy public body'));
+    const documentWrite = {
+      slug: 'docs/public-contract',
+      content: 'platform version one',
+      allowed_subject_ids: ['user:alice'],
+      document_id: 'platform-document-123',
+      document_version_sequence: 1,
+      document_version_hash: 'a'.repeat(64),
+    };
+
+    await expect(op('put_page').handler(remoteCtx(['user:alice']), documentWrite))
+      .rejects.toMatchObject({ code: 'permission_denied' });
+    expect((await engine.getPage('docs/public-contract'))?.document_id).toBeNull();
+
+    await expect(op('put_page').handler(
+      remoteCtx(['user:alice'], ['versioned_document_write']),
+      documentWrite,
+    )).resolves.toMatchObject({
+      slug: 'docs/public-contract',
+    });
+    expect((await engine.getPage('docs/public-contract', {
+      aclSubjectIds: ['user:alice'],
+    }))?.document_id).toBe('platform-document-123');
   });
 });
 
