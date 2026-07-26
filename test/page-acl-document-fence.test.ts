@@ -146,6 +146,77 @@ describe('page-level ACL is fail-closed on PGLite read surfaces', () => {
     expect(history).toHaveLength(1);
     expect(history[0].compiled_truth).toBe('historical private body');
   });
+
+  test('remote history applies the same Takes and Facts redaction as get_page', async () => {
+    const fencedBody = `visible prose
+<!--- gbrain:takes:begin -->
+| # | claim | kind | who | weight | since | source |
+|---|---|---|---|---|---|---|
+| 1 | private take marker | take | brain | 0.8 | 2026-01 | test |
+<!--- gbrain:takes:end -->
+<!--- gbrain:facts:begin -->
+| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | world fact marker | fact | 1 | world | high | 2026-01-01 | | test | |
+| 2 | private fact marker | fact | 1 | private | high | 2026-01-01 | | test | |
+<!--- gbrain:facts:end -->`;
+    await engine.putPage('docs/history-fences', {
+      ...basePage('History fences', fencedBody),
+      acl_subject_ids: ['user:alice'],
+    });
+    await engine.createVersion('docs/history-fences', { sourceId: 'default' });
+
+    const history = await op('get_versions').handler(remoteCtx(['user:alice']), {
+      slug: 'docs/history-fences',
+    }) as any[];
+    expect(history[0].compiled_truth).toContain('visible prose');
+    expect(history[0].compiled_truth).toContain('world fact marker');
+    expect(history[0].compiled_truth).not.toContain('private take marker');
+    expect(history[0].compiled_truth).not.toContain('private fact marker');
+  });
+
+  test('remote mutators require current ACL access and bind reverts to the authorized page', async () => {
+    await engine.putPage('docs/protected', {
+      ...basePage('Protected', 'protected-v1'),
+      acl_subject_ids: ['user:alice'],
+    });
+    const protectedVersion = await engine.createVersion('docs/protected', { sourceId: 'default' });
+    await engine.putPage('docs/other', basePage('Other', 'other-v1'));
+    const otherVersion = await engine.createVersion('docs/other', { sourceId: 'default' });
+
+    await expect(op('put_page').handler(remoteCtx(['user:bob']), {
+      slug: 'docs/protected',
+      content: 'attempted overwrite',
+    })).rejects.toMatchObject({ code: 'permission_denied' });
+    await expect(op('delete_page').handler(remoteCtx(['user:bob']), {
+      slug: 'docs/protected',
+    })).rejects.toMatchObject({ code: 'permission_denied' });
+    await expect(op('revert_version').handler(remoteCtx(['user:bob']), {
+      slug: 'docs/protected',
+      version_id: protectedVersion.id,
+    })).rejects.toMatchObject({ code: 'permission_denied' });
+    await expect(op('revert_version').handler(remoteCtx(['user:alice']), {
+      slug: 'docs/protected',
+      version_id: otherVersion.id,
+    })).rejects.toMatchObject({ code: 'version_not_found' });
+
+    await engine.softDeletePage('docs/protected', { sourceId: 'default' });
+    await expect(op('restore_page').handler(remoteCtx(['user:bob']), {
+      slug: 'docs/protected',
+    })).rejects.toMatchObject({ code: 'permission_denied' });
+    expect((await engine.getPage('docs/protected', {
+      sourceId: 'default',
+      includeDeleted: true,
+    }))?.deleted_at).not.toBeNull();
+  });
+
+  test('remote ACL changes must retain a server-verified caller subject', async () => {
+    await expect(op('put_page').handler(remoteCtx(['user:alice']), {
+      slug: 'docs/new-private',
+      content: 'new private page',
+      allowed_subject_ids: ['user:bob'],
+    })).rejects.toMatchObject({ code: 'permission_denied' });
+  });
 });
 
 describe('document version fence', () => {

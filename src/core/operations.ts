@@ -940,6 +940,10 @@ function governedWriteActor(ctx: OperationContext): string {
   // MCP intentionally has no OAuth identity, so it cannot silently collapse
   // all callers into one shared "anonymous" actor and bypass confirmation.
   if (ctx.remote !== false) {
+    const verifiedUserSubject = ctx.auth?.subjectIds
+      ?.filter((subject) => subject.startsWith('user:'))
+      .sort()[0];
+    if (verifiedUserSubject) return verifiedUserSubject;
     if (!ctx.auth?.clientId) {
       throw new OperationError(
         'permission_denied',
@@ -992,6 +996,31 @@ function hasPageAclAccess(ctx: OperationContext, allowedSubjects: unknown): bool
   if (!Array.isArray(allowedSubjects) || allowedSubjects.length === 0) return false;
   const callerSubjects = pageAccessOpts(ctx).aclSubjectIds ?? [];
   return callerSubjects.some((subject) => allowedSubjects.includes(subject));
+}
+
+type CurrentPageWriteTarget = {
+  id: number;
+  acl_subject_ids: string[] | null;
+  deleted_at: Date | string | null;
+};
+
+async function loadAuthorizedPageWriteTarget(
+  ctx: OperationContext,
+  slug: string,
+  sourceId: string,
+): Promise<CurrentPageWriteTarget | null> {
+  const rows = await ctx.engine.executeRaw<CurrentPageWriteTarget>(
+    `SELECT id, acl_subject_ids, deleted_at
+       FROM pages
+      WHERE slug = $1 AND source_id = $2
+      LIMIT 1`,
+    [slug, sourceId],
+  );
+  const page = rows[0] ?? null;
+  if (page && !hasPageAclAccess(ctx, page.acl_subject_ids)) {
+    throw new OperationError('permission_denied', 'You are not authorized to modify this page.');
+  }
+  return page;
 }
 
 const propose_page_write: Operation = {
@@ -1139,6 +1168,16 @@ const put_page: Operation = {
         'Versioned documents require a non-empty allowed_subject_ids ACL',
       );
     }
+    if (
+      allowedSubjectIds !== undefined
+      && ctx.remote !== false
+      && !hasPageAclAccess(ctx, allowedSubjectIds)
+    ) {
+      throw new OperationError(
+        'permission_denied',
+        'Remote callers must retain one of their server-verified subjects in the page ACL.',
+      );
+    }
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
     // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
@@ -1201,6 +1240,7 @@ const put_page: Operation = {
       }
     }
 
+    await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug, source: writeSourceId };
     // Skip embedding when the AI gateway has no embedding provider configured.
     // Checks all auth env vars for the resolved provider, not just OPENAI_API_KEY,
@@ -1660,19 +1700,6 @@ const confirm_page_write: Operation = {
     }
 
     try {
-      // Do not allow a source-level writer to overwrite an existing page whose
-      // page ACL excludes its server-resolved subjects. This reads only ACL
-      // metadata and returns a generic denial, never the protected content.
-      const existingRows = await ctx.engine.executeRaw<{ acl_subject_ids: string[] | null }>(
-        `SELECT acl_subject_ids FROM pages
-          WHERE slug = $1 AND source_id = $2 AND deleted_at IS NULL
-          LIMIT 1`,
-        [proposal.slug, writeSourceId],
-      );
-      if (existingRows[0] && !hasPageAclAccess(ctx, existingRows[0].acl_subject_ids)) {
-        throw new OperationError('permission_denied', 'You are not authorized to modify this page.');
-      }
-
       const actualHash = createHash('sha256').update(proposal.content).digest('hex');
       if (actualHash !== proposal.content_hash) {
         throw new OperationError('storage_error', 'Stored proposal content failed its integrity check.');
@@ -1973,6 +2000,7 @@ const delete_page: Operation = {
     // outside {ctx.sourceId} ∪ federated_write throws permission_denied. Delete
     // rights track write rights: you may delete wherever you may write.
     const writeSourceId = resolveWriteSource(ctx, sourceId ?? sourceAlias);
+    await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
     if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug, source: writeSourceId };
     const sourceOpts = { sourceId: writeSourceId };
     // v0.26.5: rewired from hard-delete to soft-delete. The hard-delete primitive
@@ -2009,6 +2037,7 @@ const restore_page: Operation = {
     const slug = p.slug as string;
     // v118-symmetry: resolve + authorize target sala before dry-run (see delete_page).
     const writeSourceId = resolveWriteSource(ctx, p.source as string | undefined);
+    await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
     if (ctx.dryRun) return { dry_run: true, action: 'restore_page', slug, source: writeSourceId };
     const sourceOpts = { sourceId: writeSourceId };
     const ok = await ctx.engine.restorePage(slug, sourceOpts);
@@ -3277,12 +3306,15 @@ const get_versions: Operation = {
     const versions = await ctx.engine.getVersions(p.slug as string, {
       sourceId: page.source_id,
     });
-    // Same takes-allow-list privacy boundary as get_page. Snapshots persist
-    // historical compiled_truth verbatim, including the takes fence, so
-    // a remote token bypassing get_page via /history would re-introduce
-    // the same leak across every prior version.
-    if (!ctx.takesHoldersAllowList) return versions;
-    return versions.map(v => ({ ...v, compiled_truth: stripTakesFence(v.compiled_truth) }));
+    // Keep the historical body channel on the exact same untrusted-reader
+    // boundary as get_page: no Takes rows and only world-visible Facts.
+    if (ctx.remote !== true) return versions;
+    return versions.map((version) => ({
+      ...version,
+      compiled_truth: stripFactsFence(stripTakesFence(version.compiled_truth), {
+        keepVisibility: ['world'],
+      }),
+    }));
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },
@@ -3294,17 +3326,46 @@ const revert_version: Operation = {
   params: {
     slug: { type: 'string', required: true },
     version_id: { type: 'number', required: true },
+    source: { type: 'string', required: false, description: 'Target source/sala for the page version.' },
+    source_id: { type: 'string', required: false, description: 'Alias for source.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
-    if (ctx.dryRun) return { dry_run: true, action: 'revert_version', slug: p.slug, version_id: p.version_id };
-    // v0.31.8 (D7): thread ctx.sourceId so multi-source brains revert the
-    // intended page row instead of whichever same-slug row Postgres returns
-    // first.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.createVersion(p.slug as string, sourceOpts);
-    await ctx.engine.revertToVersion(p.slug as string, p.version_id as number, sourceOpts);
+    const slug = p.slug as string;
+    const sourceAlias = typeof p.source === 'string' ? p.source : undefined;
+    const sourceId = typeof p.source_id === 'string' ? p.source_id : undefined;
+    if (sourceAlias && sourceId && sourceAlias !== sourceId) {
+      throw new OperationError('invalid_params', 'source and source_id must match when both are provided');
+    }
+    const writeSourceId = resolveWriteSource(ctx, sourceId ?? sourceAlias);
+    const page = await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
+    if (!page) {
+      throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug and source.');
+    }
+    const versionId = p.version_id as number;
+    const matchingVersions = await ctx.engine.executeRaw<{ id: number }>(
+      `SELECT id FROM page_versions WHERE id = $1 AND page_id = $2 LIMIT 1`,
+      [versionId, page.id],
+    );
+    if (matchingVersions.length === 0) {
+      throw new OperationError(
+        'version_not_found',
+        'The requested version does not belong to the authorized page.',
+      );
+    }
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        action: 'revert_version',
+        slug,
+        version_id: versionId,
+        source: writeSourceId,
+      };
+    }
+    const sourceOpts = { sourceId: writeSourceId };
+    await ctx.engine.createVersion(slug, sourceOpts);
+    await ctx.engine.revertToVersion(slug, versionId, sourceOpts);
     return { status: 'reverted' };
   },
   cliHints: { name: 'revert', positional: ['slug', 'version_id'] },

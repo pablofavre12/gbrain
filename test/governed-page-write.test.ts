@@ -110,6 +110,27 @@ describe('governed native page writes', () => {
     expect(await engine.getPage('notes/cancelled', { sourceId: 'campo' })).toBeNull();
   });
 
+  test('shared OAuth clients still bind proposals to the verified user subject', async () => {
+    const proposal = await op('propose_page_write').handler(actorCtx('shared-bff', {
+      subjects: ['user:alice'],
+    }), {
+      slug: 'notes/user-bound',
+      content: markdown('User bound', 'only Alice may confirm'),
+    }) as any;
+
+    await expect(op('confirm_page_write').handler(actorCtx('shared-bff', {
+      subjects: ['user:bob'],
+    }), {
+      proposal_id: proposal.proposal_id,
+    })).rejects.toMatchObject({ code: 'permission_denied' });
+
+    await expect(op('confirm_page_write').handler(actorCtx('shared-bff', {
+      subjects: ['user:alice'],
+    }), {
+      proposal_id: proposal.proposal_id,
+    })).resolves.toMatchObject({ status: 'confirmed' });
+  });
+
   test('expiration and ACL are enforced at confirmation time without exposing protected content', async () => {
     const expiring = await op('propose_page_write').handler(actorCtx('agent-a'), {
       slug: 'notes/expired', content: markdown('Expired', 'never write me'),

@@ -29,7 +29,9 @@ const restore_page = operations.find(o => o.name === 'restore_page') as Operatio
 if (!restore_page) throw new Error('restore_page op missing');
 
 function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
-  const engine = {} as BrainEngine; // dry_run short-circuits before touching the engine
+  // ACL authorization is intentionally evaluated before dry-run so previews
+  // cannot be used to probe or bypass a protected current page.
+  const engine = { executeRaw: async () => [] } as unknown as BrainEngine;
   return {
     engine,
     config: { engine: 'postgres' } as any,
