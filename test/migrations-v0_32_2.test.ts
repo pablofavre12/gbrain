@@ -237,6 +237,27 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const rows = await (engine as any).db.query('SELECT row_num FROM facts');
     expect(rows.rows[0].row_num).toBeNull();
   });
+
+  test('fails before writing when configured local_path does not exist', async () => {
+    const missingPath = join(brainDir, 'missing-checkout');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+      [missingPath],
+    );
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Must stay DB-only' });
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(r.detail).toContain('configured local_path does not exist');
+    expect(existsSync(missingPath)).toBe(false);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT row_num, source_markdown_slug FROM facts',
+    );
+    expect(rows.rows[0]).toMatchObject({ row_num: null, source_markdown_slug: null });
+  });
 });
 
 describe('phaseBFenceFacts — dirty-tree refusal scoping (#927)', () => {
@@ -313,6 +334,28 @@ describe('phaseCVerify', () => {
     expect(r.status).toBe('failed');
     expect(r.detail).toContain('drifted');
     expect(r.detail).toContain('people/alice');
+  });
+
+  test('returns failed when fenced DB rows point at a missing checkout', async () => {
+    const missingPath = join(brainDir, 'lost-checkout');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+      [missingPath],
+    );
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Orphaned fence' });
+    // Reproduce an ephemeral release that stamped the DB before its files vanished.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts
+          SET row_num = 1, source_markdown_slug = 'people/alice'
+        WHERE fact = 'Orphaned fence'`,
+    );
+
+    const r = await __testing.phaseCVerify(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(r.detail).toContain('configured local_path does not exist');
+    expect(r.detail).toContain('default');
   });
 });
 
