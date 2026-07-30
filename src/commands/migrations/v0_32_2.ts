@@ -28,7 +28,7 @@
  * forever; they live in the legacy keyspace permanently.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
@@ -129,9 +129,11 @@ interface PhaseBOutcome {
 }
 
 /**
- * Dirty-tree refusal: mirror src/core/dry-fix.ts behavior. Refuses to
- * write if any source's local_path has uncommitted changes. Dry-run
- * skips this check (no writes happen anyway).
+ * Checkout validation + dirty-tree refusal: a configured local_path must
+ * already exist as a directory, and any git checkout there must be clean.
+ * Missing paths fail closed instead of being recreated implicitly: otherwise
+ * an ephemeral release host can stamp DB rows for files that disappear when
+ * the host exits. Dry-run skips these checks (no writes happen anyway).
  */
 function isLocalPathDirty(localPath: string): boolean {
   try {
@@ -145,6 +147,17 @@ function isLocalPathDirty(localPath: string): boolean {
     // user opted out of git tracking, which is allowed). The fence
     // writes are still atomic via .tmp + rename.
     return false;
+  }
+}
+
+function localPathIssue(localPath: string): string | null {
+  try {
+    if (!statSync(localPath).isDirectory()) {
+      return `configured local_path is not a directory: ${localPath}`;
+    }
+    return null;
+  } catch {
+    return `configured local_path does not exist: ${localPath}`;
   }
 }
 
@@ -186,14 +199,24 @@ async function phaseBFenceFacts(
     const localPathById = new Map<string, string | null>();
     for (const s of sources) localPathById.set(s.id, s.local_path);
 
-    // Dirty-tree refusal: check every source's local_path before writing.
+    // Fail closed on missing paths, then enforce a clean tracked checkout.
     for (const [id, localPath] of localPathById) {
-      if (localPath && isLocalPathDirty(localPath)) {
-        return {
-          name: 'fence_facts',
-          status: 'failed',
-          detail: `source "${id}" has uncommitted changes in ${localPath}. Commit or stash, then re-run.`,
-        };
+      if (localPath) {
+        const pathIssue = localPathIssue(localPath);
+        if (pathIssue) {
+          return {
+            name: 'fence_facts',
+            status: 'failed',
+            detail: `source "${id}" ${pathIssue}. Restore the canonical checkout or clear local_path before re-running.`,
+          };
+        }
+        if (isLocalPathDirty(localPath)) {
+          return {
+            name: 'fence_facts',
+            status: 'failed',
+            detail: `source "${id}" has uncommitted changes in ${localPath}. Commit or stash, then re-run.`,
+          };
+        }
       }
     }
 
@@ -381,6 +404,11 @@ async function phaseCVerify(
     for (const g of groups) {
       const localPath = localPathById.get(g.source_id);
       if (!localPath) continue;
+      const pathIssue = localPathIssue(localPath);
+      if (pathIssue) {
+        mismatches.push(`${g.source_id} (${pathIssue})`);
+        continue;
+      }
       const filePath = join(localPath, `${g.source_markdown_slug}.md`);
       if (!existsSync(filePath)) {
         mismatches.push(`${g.source_markdown_slug} (file missing)`);
@@ -475,4 +503,5 @@ export const __testing = {
   phaseBFenceFacts,
   phaseCVerify,
   isLocalPathDirty,
+  localPathIssue,
 };
