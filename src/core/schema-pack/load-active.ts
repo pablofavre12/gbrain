@@ -60,6 +60,21 @@ export interface LoadActivePackInput {
   dbConfig?: string;
 }
 
+/** Minimal engine surface needed to resolve DB-plane schema-pack config. */
+export interface SchemaPackConfigReader {
+  getConfig(key: string): Promise<string | null | undefined>;
+}
+
+export interface LoadActivePackForEngineInput
+  extends Omit<LoadActivePackInput, 'dbConfig' | 'perSourceDb'> {
+  engine: SchemaPackConfigReader;
+}
+
+export interface ActivePackForEngine {
+  pack: ResolvedPack;
+  resolution: ResolutionResult;
+}
+
 /**
  * Test seam — a function that maps a pack name to the file path on disk.
  * Production wires this to the built-in + ~/.gbrain/schema-packs lookup.
@@ -172,6 +187,40 @@ export async function loadActivePack(input: LoadActivePackInput): Promise<Resolv
   return await resolvePack(manifest, loadPackManifestByName, {
     loadByPath: (name) => _packLocator(name),
   });
+}
+
+/**
+ * Engine-aware active-pack boundary.
+ *
+ * DB-plane config cannot be discovered by the pure resolver above. Runtime
+ * callers with an engine MUST use this helper so tier 3
+ * `schema_pack.source.<id>` and tier 4 `schema_pack` participate in the
+ * documented resolution chain. Config read failures propagate: silently
+ * falling back to a different pack would make writes use the wrong schema.
+ */
+export async function loadActivePackForEngine(
+  input: LoadActivePackForEngineInput,
+): Promise<ActivePackForEngine> {
+  const dbConfig = normalizeConfigValue(await input.engine.getConfig('schema_pack'));
+  const perSourceDb = new Map<string, string>();
+  if (input.sourceId) {
+    const sourcePack = normalizeConfigValue(
+      await input.engine.getConfig(`schema_pack.source.${input.sourceId}`),
+    );
+    if (sourcePack) perSourceDb.set(input.sourceId, sourcePack);
+  }
+  const hydrated: LoadActivePackInput = {
+    cfg: input.cfg,
+    remote: input.remote,
+    perCall: input.perCall,
+    sourceId: input.sourceId,
+    gbrainYml: input.gbrainYml,
+    dbConfig,
+    perSourceDb,
+  };
+  const resolution = resolveActivePackNameOnly(hydrated);
+  const pack = await loadActivePack(hydrated);
+  return { pack, resolution };
 }
 
 /**
@@ -292,4 +341,9 @@ function buildResolutionInput(input: LoadActivePackInput): ResolutionInput {
     gbrainYml: input.gbrainYml,
     homeConfig,
   };
+}
+
+function normalizeConfigValue(value: string | null | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized || undefined;
 }
