@@ -1674,22 +1674,17 @@ const put_page: Operation = {
     // just didn't pass it.
     // v0.39 T1.5: load active pack ONCE per put_page invocation; thread to
     // parseMarkdown via importFromContent so type inference honors user-defined
-    // page_types. Best-effort: pack load failure falls back to legacy inferType
-    // (parity gate preserved). Federated-read closure correction is T19's scope.
-    let activePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
-    try {
-      const { loadActivePack } = await import('./schema-pack/load-active.ts');
-      const { loadConfig } = await import('./config.ts');
-      const resolved = await loadActivePack({
-        cfg: loadConfig(),
-        remote: ctx.remote === false ? false : true,
-        sourceId: writeSourceId,
-      });
-      activePack = { page_types: resolved.manifest.page_types };
-    } catch {
-      // Pack load failed; fall through to legacy inferType behavior.
-      activePack = undefined;
-    }
+    // page_types. Fail closed: a configured source pack that cannot load must
+    // never make a write silently use legacy inference.
+    const { loadActivePackForEngine } = await import('./schema-pack/load-active.ts');
+    const { loadConfig } = await import('./config.ts');
+    const { pack: resolved } = await loadActivePackForEngine({
+      engine: ctx.engine,
+      cfg: loadConfig(),
+      remote: ctx.remote === false ? false : true,
+      sourceId: writeSourceId,
+    });
+    const activePack = { page_types: resolved.manifest.page_types };
     let result: Awaited<ReturnType<typeof importFromContent>>;
     try {
       result = await importFromContent(ctx.engine, slug, p.content as string, {
@@ -6614,13 +6609,15 @@ const get_active_schema_pack: Operation = {
   params: {},
   scope: 'read',
   handler: async (ctx) => {
-    const { loadActivePack, resolveActivePackNameOnly } = await import('./schema-pack/load-active.ts');
+    const { loadActivePackForEngine } = await import('./schema-pack/load-active.ts');
     const { loadConfig } = await import('./config.ts');
     const cfg = loadConfig();
-    const sourceOpts: Record<string, unknown> = {};
-    if (ctx.sourceId) sourceOpts.sourceId = ctx.sourceId;
-    const resolution = resolveActivePackNameOnly({ cfg, remote: ctx.remote ?? true, ...sourceOpts });
-    const pack = await loadActivePack({ cfg, remote: ctx.remote ?? true, ...sourceOpts });
+    const { pack, resolution } = await loadActivePackForEngine({
+      engine: ctx.engine,
+      cfg,
+      remote: ctx.remote ?? true,
+      sourceId: ctx.sourceId,
+    });
     const primitiveSummary: Record<string, number> = {};
     for (const t of pack.manifest.page_types) {
       primitiveSummary[t.primitive] = (primitiveSummary[t.primitive] ?? 0) + 1;
@@ -6687,7 +6684,7 @@ const schema_lint: Operation = {
   scope: 'read',
   handler: async (ctx, p) => {
     const { runAllLintRules } = await import('./schema-pack/lint-rules.ts');
-    const { loadActivePack } = await import('./schema-pack/load-active.ts');
+    const { loadActivePackForEngine } = await import('./schema-pack/load-active.ts');
     const { loadConfig, gbrainPath } = await import('./config.ts');
     const { existsSync } = await import('node:fs');
     const { join } = await import('node:path');
@@ -6707,7 +6704,12 @@ const schema_lint: Operation = {
       const { loadPackFromFile: loader } = await import('./schema-pack/loader.ts');
       manifest = loader(path);
     } else {
-      const resolved = await loadActivePack({ cfg, remote: ctx.remote ?? true, sourceId: ctx.sourceId });
+      const { pack: resolved } = await loadActivePackForEngine({
+        engine: ctx.engine,
+        cfg,
+        remote: ctx.remote ?? true,
+        sourceId: ctx.sourceId,
+      });
       manifest = resolved.manifest;
     }
     // File-plane only over MCP; the engine-aware --with-db opt-in is
@@ -6722,10 +6724,15 @@ const schema_graph: Operation = {
   params: {},
   scope: 'read',
   handler: async (ctx) => {
-    const { loadActivePack } = await import('./schema-pack/load-active.ts');
+    const { loadActivePackForEngine } = await import('./schema-pack/load-active.ts');
     const { loadConfig } = await import('./config.ts');
     const cfg = loadConfig();
-    const pack = await loadActivePack({ cfg, remote: ctx.remote ?? true, sourceId: ctx.sourceId });
+    const { pack } = await loadActivePackForEngine({
+      engine: ctx.engine,
+      cfg,
+      remote: ctx.remote ?? true,
+      sourceId: ctx.sourceId,
+    });
     const nodes = pack.manifest.page_types.map((t) => ({ name: t.name, primitive: t.primitive }));
     const edges: Array<{ from: string; verb: string; to: string }> = [];
     for (const lt of pack.manifest.link_types) {
@@ -6752,10 +6759,15 @@ const schema_explain_type: Operation = {
   },
   scope: 'read',
   handler: async (ctx, p) => {
-    const { loadActivePack } = await import('./schema-pack/load-active.ts');
+    const { loadActivePackForEngine } = await import('./schema-pack/load-active.ts');
     const { loadConfig } = await import('./config.ts');
     const cfg = loadConfig();
-    const pack = await loadActivePack({ cfg, remote: ctx.remote ?? true, sourceId: ctx.sourceId });
+    const { pack } = await loadActivePackForEngine({
+      engine: ctx.engine,
+      cfg,
+      remote: ctx.remote ?? true,
+      sourceId: ctx.sourceId,
+    });
     const found = pack.manifest.page_types.find((t) => t.name === p.type);
     if (!found) return { error: 'type_not_found', type: p.type as string, pack: pack.manifest.name };
     return { schema_version: 1, pack: pack.manifest.name, type: found };

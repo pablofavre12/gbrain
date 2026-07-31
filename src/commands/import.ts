@@ -126,19 +126,17 @@ export async function runImport(
   }
   // v0.39 T1.5: load active pack ONCE at runImport entry; thread to every
   // per-file importFile call below. Codex perf finding #7 — never per-file.
-  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
-  try {
-    const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
-    const { loadConfig } = await import('../core/config.ts');
-    const resolved = await loadActivePack({
-      cfg: loadConfig(),
-      remote: false, // CLI import is trusted
-      sourceId: opts.sourceId,
-    });
-    importActivePack = { page_types: resolved.manifest.page_types };
-  } catch {
-    importActivePack = undefined;
-  }
+  // Fail closed: a configured source pack that cannot load must never make
+  // imports silently fall back to legacy inference.
+  const { loadActivePackForEngine } = await import('../core/schema-pack/load-active.ts');
+  const { loadConfig } = await import('../core/config.ts');
+  const { pack: importResolvedPack } = await loadActivePackForEngine({
+    engine,
+    cfg: loadConfig(),
+    remote: false, // CLI import is trusted
+    sourceId: opts.sourceId,
+  });
+  const importActivePack = { page_types: importResolvedPack.manifest.page_types };
 
   // v0.30.x follow-up to PR #707: programmatic sourceId support so internal
   // callers (performFullSync, future Step 6 paths) can route to a named

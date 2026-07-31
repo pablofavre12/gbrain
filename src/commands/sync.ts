@@ -1923,26 +1923,24 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // v0.39 T1.5: load active pack ONCE at sync entry; pass to every per-file
   // importFile call below. Codex perf finding #7: per-file loadActivePack adds
   // disk/YAML/hash overhead × thousands of files. Best-effort: pack load
-  // failure falls through to legacy inferType (parity preserved).
+  // failure is fatal so a configured source pack cannot silently drift to
+  // legacy inference. `--no-schema-pack` remains the explicit escape hatch.
   let syncActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
-  try {
-    // v0.41.37.0 #1569: --no-schema-pack escape hatch. Skip pack load entirely so
-    // no user-supplied pack regex (markdown.ts subtype path_pattern) runs during
-    // sync; pages fall back to legacy prefix typing.
-    if (opts.noSchemaPack) {
-      serr('[sync] --no-schema-pack: skipping schema pack; pages use legacy prefix typing');
-      throw new Error('schema-pack-skipped');
-    }
-    const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
+  // v0.41.37.0 #1569: --no-schema-pack escape hatch. Skip pack load entirely so
+  // no user-supplied pack regex (markdown.ts subtype path_pattern) runs during
+  // sync; pages fall back to legacy prefix typing.
+  if (opts.noSchemaPack) {
+    serr('[sync] --no-schema-pack: skipping schema pack; pages use legacy prefix typing');
+  } else {
+    const { loadActivePackForEngine } = await import('../core/schema-pack/load-active.ts');
     const { loadConfig } = await import('../core/config.ts');
-    const resolved = await loadActivePack({
+    const { pack: resolved } = await loadActivePackForEngine({
+      engine,
       cfg: loadConfig(),
       remote: false, // sync is always a trusted CLI / autopilot caller
       sourceId: opts.sourceId,
     });
     syncActivePack = { page_types: resolved.manifest.page_types };
-  } catch {
-    syncActivePack = undefined;
   }
 
   // v0.28: source-aware re-clone branch. When the source has a remote_url

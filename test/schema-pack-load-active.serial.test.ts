@@ -7,6 +7,7 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
 import {
   loadActivePack,
+  loadActivePackForEngine,
   resolveActivePackNameOnly,
   __setPackLocatorForTests,
   _resetPackLocatorForTests,
@@ -74,6 +75,92 @@ describe('loadActivePack boundary helper', () => {
     });
     expect(result.pack_name).toBe('family-archive');
     expect(result.source).toBe('per-source-db');
+  });
+
+  test('engine-aware resolver applies one source override and unset rolls back to global', async () => {
+    _resetPackCacheForTests();
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-source-pack-'));
+    const manifest = (name: string) => `api_version: gbrain-schema-pack-v1
+name: ${name}
+version: 0.1.0
+description: test
+extends: null
+page_types: []
+link_types: []
+`;
+    const globalPath = join(dir, 'global-pack.yaml');
+    const sourcePath = join(dir, 'source-pack.yaml');
+    writeFileSync(globalPath, manifest('global-pack'));
+    writeFileSync(sourcePath, manifest('source-pack'));
+    __setPackLocatorForTests((name) => {
+      if (name === 'global-pack') return globalPath;
+      if (name === 'source-pack') return sourcePath;
+      return null;
+    });
+    const config = new Map<string, string>([
+      ['schema_pack', 'global-pack'],
+      ['schema_pack.source.wachines', 'source-pack'],
+    ]);
+    const engine = {
+      getConfig: async (key: string) => config.get(key) ?? null,
+    };
+
+    try {
+      const wachines = await loadActivePackForEngine({
+        engine,
+        cfg: null,
+        remote: false,
+        sourceId: 'wachines',
+      });
+      expect(wachines.pack.manifest.name).toBe('source-pack');
+      expect(wachines.resolution.source).toBe('per-source-db');
+
+      const perennia = await loadActivePackForEngine({
+        engine,
+        cfg: null,
+        remote: false,
+        sourceId: 'perennia',
+      });
+      expect(perennia.pack.manifest.name).toBe('global-pack');
+      expect(perennia.resolution.source).toBe('db-config');
+
+      config.delete('schema_pack.source.wachines');
+      const rolledBack = await loadActivePackForEngine({
+        engine,
+        cfg: null,
+        remote: false,
+        sourceId: 'wachines',
+      });
+      expect(rolledBack.pack.manifest.name).toBe('global-pack');
+      expect(rolledBack.resolution.source).toBe('db-config');
+    } finally {
+      _resetPackLocatorForTests();
+      _resetPackCacheForTests();
+    }
+  });
+
+  test('engine-aware resolver fails closed when a configured source pack is missing', async () => {
+    _resetPackCacheForTests();
+    __setPackLocatorForTests(() => null);
+    const engine = {
+      getConfig: async (key: string) => (
+        key === 'schema_pack.source.wachines' ? 'missing-source-pack' : null
+      ),
+    };
+    try {
+      await expect(loadActivePackForEngine({
+        engine,
+        cfg: null,
+        remote: false,
+        sourceId: 'wachines',
+      })).rejects.toThrow(/unknown schema pack: missing-source-pack/);
+    } finally {
+      _resetPackLocatorForTests();
+      _resetPackCacheForTests();
+    }
   });
 
   test('tier-7 default falls back to gbrain-base when nothing set', () => {

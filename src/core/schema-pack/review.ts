@@ -12,7 +12,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { runDetect } from './detect.ts';
-import { loadActivePack } from './load-active.ts';
+import { loadActivePackForEngine } from './load-active.ts';
 import { loadConfig, gbrainPath, configPath } from '../config.ts';
 import { existsSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -46,7 +46,12 @@ export async function runReviewCandidates(
   let activeTypeNames = new Set<string>();
   let activePackName = 'gbrain-base';
   try {
-    const pack = await loadActivePack({ cfg, remote: false, sourceId });
+    const { pack } = await loadActivePackForEngine({
+      engine,
+      cfg,
+      remote: false,
+      sourceId,
+    });
     activePackName = pack.manifest.name;
     activeTypeNames = new Set(pack.manifest.page_types.map((t) => t.name));
   } catch {
