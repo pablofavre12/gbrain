@@ -90,10 +90,14 @@ export {
 
 export {
   loadActivePack,
+  loadActivePackForEngine,
   resolveActivePackNameOnly,
   __setPackLocatorForTests,
   _resetPackLocatorForTests,
   type LoadActivePackInput,
+  type LoadActivePackForEngineInput,
+  type ActivePackForEngine,
+  type SchemaPackConfigReader,
   type PackLocator,
 } from './load-active.ts';
 
