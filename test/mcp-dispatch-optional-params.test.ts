@@ -86,12 +86,12 @@ describe('recall tolerates the absent-idioms for optional params', () => {
 });
 
 describe('deliberate non-goals stay loud', () => {
-  test('null on a REQUIRED param is still a missing-parameter error', async () => {
+  test('null on one arm of an alternative reference stays a loud validation error', async () => {
     const r = await dispatchToolCall(engine, 'get_page', { slug: null }, OPTS);
     expect(r.isError).toBe(true);
     const payload = JSON.parse(r.content[0].text);
     expect(payload.error).toBe('invalid_params');
-    expect(payload.message).toContain('Missing required parameter: slug');
+    expect(payload.message).toContain('Provide slug or page_id');
   });
 
   test('type-mismatched junk on an optional param still errors (limit: "")', async () => {
@@ -129,10 +129,10 @@ describe('normalizeOptionalParams unit behavior', () => {
 
   test('empty string is stripped only for string-typed optionals', () => {
     const getPage = operations.find(o => o.name === 'get_page') as Operation;
-    // get_page.slug is required — "" must survive normalization untouched
-    // (and required-null likewise), so validateParams stays the judge.
+    // get_page.slug is optional because page_id is the preferred alternative;
+    // an empty slug therefore normalizes to absence.
     const out = normalizeOptionalParams(getPage, { slug: '' });
-    expect(out.slug).toBe('');
+    expect(out.slug).toBeUndefined();
     expect(validateParams(getPage, out)).toBeNull();
   });
 });

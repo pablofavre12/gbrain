@@ -3353,7 +3353,7 @@ export class PGLiteEngine implements BrainEngine {
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
       const idx = params.length;
-      where.push(`f.source_id = $${idx}`, `t.source_id = $${idx}`);
+      where.push(`f.source_id = $${idx}`);
     }
     if (opts?.aclSubjectIds !== undefined) {
       if (opts.aclSubjectIds.length > 0) {
@@ -3395,7 +3395,7 @@ export class PGLiteEngine implements BrainEngine {
     } else if (opts?.sourceId) {
       params.push(opts.sourceId);
       const idx = params.length;
-      where.push(`f.source_id = $${idx}`, `t.source_id = $${idx}`);
+      where.push(`t.source_id = $${idx}`);
     }
     if (opts?.aclSubjectIds !== undefined) {
       if (opts.aclSubjectIds.length > 0) {
@@ -6059,7 +6059,7 @@ export class PGLiteEngine implements BrainEngine {
       brain_score: brainScore,
       dead_links: deadLinks,
       link_coverage: Number(r.link_coverage),
-      timeline_coverage: timelineCoverageDensity,
+      timeline_coverage: Number(r.timeline_coverage),
       most_connected: (connected as { slug: string; link_count: number }[]).map(c => ({
         slug: c.slug,
         link_count: Number(c.link_count),

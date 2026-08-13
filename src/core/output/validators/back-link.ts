@@ -48,8 +48,8 @@ export const backLinkValidator: PageValidator = {
 
     for (const target of uniqueEdges.values()) {
       const targetOpts = federatedSourceIds
-        ? { sourceIds: federatedSourceIds }
-        : { sourceId: target.to_source_id };
+        ? { sourceIds: federatedSourceIds, pageId: target.to_page_id }
+        : { pageId: target.to_page_id };
       const targetOutbound = await ctx.engine.getLinks(target.to_slug, targetOpts);
       const hasReverse = targetOutbound.some(link =>
         link.from_source_id === target.to_source_id

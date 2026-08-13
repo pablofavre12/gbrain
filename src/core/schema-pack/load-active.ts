@@ -181,12 +181,18 @@ export async function loadActivePack(input: LoadActivePackInput): Promise<Resolv
 export async function loadActivePackForEngine(
   input: LoadActivePackForEngineInput,
 ): Promise<ActivePackForEngine> {
-  const dbConfig = normalizeConfigValue(await input.engine.getConfig('schema_pack'));
+  const readConfig = async (key: string): Promise<string | undefined> => {
+    try {
+      return normalizeConfigValue(await input.engine.getConfig(key));
+    } catch (error) {
+      if (/relation ["']?config["']? does not exist/i.test((error as Error).message)) return undefined;
+      throw error;
+    }
+  };
+  const dbConfig = await readConfig('schema_pack');
   const perSourceDb = new Map<string, string>();
   if (input.sourceId) {
-    const sourcePack = normalizeConfigValue(
-      await input.engine.getConfig(`schema_pack.source.${input.sourceId}`),
-    );
+    const sourcePack = await readConfig(`schema_pack.source.${input.sourceId}`);
     if (sourcePack) perSourceDb.set(input.sourceId, sourcePack);
   }
   const hydrated: LoadActivePackInput = {

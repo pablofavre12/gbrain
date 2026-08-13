@@ -76,12 +76,13 @@ describe('applyThinClientSourceScope (#2098)', () => {
     });
   });
 
-  test('--source on an op with no source_id wire param errors instead of silently dropping', async () => {
+  test('an op-owned --source target is preserved even without source_id', async () => {
     await withEnv({ GBRAIN_SOURCE: undefined }, () => {
       const op = operationsByName.add_tag;
       expect('source_id' in op.params).toBe(false);
       const params = { slug: 'x', tag: 'y', source: 'wiki' };
-      expect(() => applyThinClientSourceScope(op, params, '/')).toThrow(/--source/);
+      applyThinClientSourceScope(op, params, '/');
+      expect(params.source).toBe('wiki');
     });
   });
 

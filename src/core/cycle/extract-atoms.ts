@@ -711,7 +711,7 @@ export async function runPhaseExtractAtoms(
           // v0.41-perennia: link the source page to the atom so atoms aren't orphans.
           if (item.kind === 'page') {
             try {
-              await engine.addLink(
+              await engine.addLink( // gbrain-allow-direct-insert: cycle extraction records derived page-to-atom provenance
                 item.slug,
                 slug,
                 atom.source_quote ?? '',

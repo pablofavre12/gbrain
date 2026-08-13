@@ -79,6 +79,7 @@ jobs:
       - name: Open conflict issue
         if: steps.merge.outputs.conflict == 'true'
         run: |
+          # shellcheck disable=SC2016 -- single-quoted markdown template is intentional.
           BODY=$(printf 'Automated upstream sync hit merge conflicts merging `upstream/master` into `%s`.\n\nConflicting files:\n\n```\n%s\n```\n\nResolve manually — see FORK.md "Sync process" and the migration-band rule:\n\n```bash\ngit fetch origin\ngit switch -c sync/upstream-manual %s\ngit merge origin/master\n```\n' "$BASE_BRANCH" "$(cat /tmp/conflicts.txt)" "$BASE_BRANCH")
           # Try with the label; if it doesn't exist, retry without it.
           gh issue create --repo "$GITHUB_REPOSITORY" \
@@ -109,6 +110,7 @@ jobs:
           else
             STATUS="⚠️ typecheck or unit suite FAILED in the sync job — review before merge."
           fi
+          # shellcheck disable=SC2016 -- markdown backticks and GitHub expression are intentional literals.
           BODY=$(printf 'Automated upstream sync: merges `upstream/master` (garrytan/gbrain) into `%s`.\n\n%s\n\nReview against FORK.md:\n- migration band intact (`test/migration-fork-band.test.ts`)\n- conflict hotspots (operations.ts, engines, oauth) resolved sanely\n- no upstream migration silently shadowed\n\n%s commit(s) of upstream picked up.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$BASE_BRANCH" "$STATUS" "${{ steps.ahead.outputs.behind }}")
           gh pr create \
             --repo "$GITHUB_REPOSITORY" \

@@ -168,9 +168,14 @@ Resolution chain (7-tier, tier 1 trust-gated):
 async function runActive(args: string[]): Promise<void> {
   const { json, source } = parseFlags(args);
   const cfg = loadConfig();
-  const { pack, resolution } = await withConnectedEngine((engine) =>
-    loadActivePackForEngine({ engine, cfg, remote: false, sourceId: source }),
-  );
+  const { pack, resolution } = cfg?.database_url || cfg?.database_path
+    ? await withConnectedEngine((engine) =>
+        loadActivePackForEngine({ engine, cfg, remote: false, sourceId: source }),
+      )
+    : {
+        pack: await loadActivePack({ cfg, remote: false, sourceId: source }),
+        resolution: resolveActivePackNameOnly({ cfg, remote: false, sourceId: source }),
+      };
   if (json) {
     console.log(JSON.stringify({
       schema_version: 1,

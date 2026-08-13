@@ -3262,7 +3262,7 @@ export class PostgresEngine implements BrainEngine {
     const sourceScope = opts?.sourceIds && opts.sourceIds.length > 0
       ? sql`AND f.source_id = ANY(${opts.sourceIds}::text[]) AND t.source_id = ANY(${opts.sourceIds}::text[])`
       : opts?.sourceId
-        ? sql`AND f.source_id = ${opts.sourceId} AND t.source_id = ${opts.sourceId}`
+        ? sql`AND f.source_id = ${opts.sourceId}`
         : sql``;
     const pageMatch = opts?.pageId ? sql`f.id = ${opts.pageId}` : sql`f.slug = ${slug}`;
     const aclScope = opts?.aclSubjectIds === undefined
@@ -3298,7 +3298,7 @@ export class PostgresEngine implements BrainEngine {
     const sourceScope = opts?.sourceIds && opts.sourceIds.length > 0
       ? sql`AND f.source_id = ANY(${opts.sourceIds}::text[]) AND t.source_id = ANY(${opts.sourceIds}::text[])`
       : opts?.sourceId
-        ? sql`AND f.source_id = ${opts.sourceId} AND t.source_id = ${opts.sourceId}`
+        ? sql`AND t.source_id = ${opts.sourceId}`
         : sql``;
     const pageMatch = opts?.pageId ? sql`t.id = ${opts.pageId}` : sql`t.slug = ${slug}`;
     const aclScope = opts?.aclSubjectIds === undefined
@@ -5899,7 +5899,7 @@ export class PostgresEngine implements BrainEngine {
       brain_score: brainScore,
       dead_links: deadLinks,
       link_coverage: Number(h.link_coverage),
-      timeline_coverage: timelineCoverageWhole,
+      timeline_coverage: Number(h.timeline_coverage),
       most_connected: (connected as unknown as { slug: string; link_count: number }[]).map(c => ({
         slug: c.slug,
         link_count: Number(c.link_count),

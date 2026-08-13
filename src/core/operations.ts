@@ -792,25 +792,23 @@ export function pageAccessOpts(ctx: OperationContext): { aclSubjectIds?: string[
 export function sourceScopeOpts(ctx: OperationContext): {
   sourceId?: string;
   sourceIds?: string[];
-  aclSubjectIds?: string[];
 } {
-  const acl = pageAccessOpts(ctx);
   const allowed = ctx.auth?.allowedSources;
   // Treat an empty `allowedSources: []` as "no federated read scope" — the
   // op-handler defers to scalar `ctx.sourceId` below. An attacker-controlled
   // value of `[]` MUST NOT widen scope to "all sources" by being interpreted
   // as "no filter."
-  if (allowed && allowed.length > 0) return { sourceIds: allowed, ...acl };
+  if (allowed && allowed.length > 0) return { sourceIds: allowed };
   // #1712: the __all__ sentinel spans the brain — but ONLY for trusted local
   // callers (strictly `remote === false`). For remote/untrusted callers the
   // literal stays as-is: it can never match a real source id (underscores are
   // rejected at creation), so the read fail-closes to empty rather than
   // widening past the caller's grant. Do NOT "simplify" this to `{}`.
   if (ctx.sourceId === ALL_SOURCES) {
-    return ctx.remote === false ? acl : { sourceId: ctx.sourceId, ...acl };
+    return ctx.remote === false ? {} : { sourceId: ctx.sourceId };
   }
-  if (ctx.sourceId) return { sourceId: ctx.sourceId, ...acl };
-  return acl;
+  if (ctx.sourceId) return { sourceId: ctx.sourceId };
+  return {};
 }
 
 /** Map the operation-layer scope names onto runThink's public options. */
@@ -875,7 +873,7 @@ export function resolveRequestedScope(
   ctx: OperationContext,
   sourceIdParam: string | undefined,
   allSourcesParam = false,
-): { sourceId?: string; sourceIds?: string[]; aclSubjectIds?: string[] } {
+): { sourceId?: string; sourceIds?: string[] } {
   const wantsAll = allSourcesParam || sourceIdParam === ALL_SOURCES;
   if (wantsAll) {
     return ctx.remote === false ? {} : sourceScopeOpts(ctx);
@@ -889,7 +887,7 @@ export function resolveRequestedScope(
         'Request access to this source, or omit source_id to search within your grant.',
       );
     }
-    return { sourceId: sourceIdParam, ...pageAccessOpts(ctx) };
+    return { sourceId: sourceIdParam };
   }
   return sourceScopeOpts(ctx);
 }
@@ -919,7 +917,7 @@ export function resolveRequestedScope(
 export function federatedSearchScope(
   ctx: OperationContext,
   sourceIdParam?: string,
-): { sourceId?: string; sourceIds?: string[]; aclSubjectIds?: string[] } {
+): { sourceId?: string; sourceIds?: string[] } {
   const scope = resolveRequestedScope(ctx, sourceIdParam);
   if (
     sourceIdParam === undefined &&
@@ -928,12 +926,17 @@ export function federatedSearchScope(
     ctx.localFederatedSourceIds !== undefined &&
     ctx.localFederatedSourceIds.length > 1
   ) {
-    return {
-      sourceIds: ctx.localFederatedSourceIds,
-      ...(scope.aclSubjectIds !== undefined ? { aclSubjectIds: scope.aclSubjectIds } : {}),
-    };
+    return { sourceIds: ctx.localFederatedSourceIds };
   }
   return scope;
+}
+
+/** Page-visible reads compose source isolation with the fork's page ACL. */
+function federatedPageSearchScope(
+  ctx: OperationContext,
+  sourceIdParam?: string,
+): { sourceId?: string; sourceIds?: string[]; aclSubjectIds?: string[] } {
+  return { ...federatedSearchScope(ctx, sourceIdParam), ...pageAccessOpts(ctx) };
 }
 
 /**
@@ -1156,7 +1159,7 @@ const get_page: Operation = {
     // now honors sourceIds[] (both engines), so the same scope closes both paths.
     // #3242: federatedSearchScope (not bare sourceScopeOpts) so an unqualified
     // read sees pages in `federated: true` sources, matching search/query.
-    const sourceOpts = federatedSearchScope(ctx);
+    const sourceOpts = federatedPageSearchScope(ctx);
     const fuzzyScope = sourceOpts;
 
     // Privacy boundary for the per-token allow-list (v0.28.6 for takes,
@@ -1427,15 +1430,15 @@ async function loadAuthorizedPageWriteTarget(
   ctx: OperationContext,
   slug: string,
   sourceId: string,
-): Promise<CurrentPageWriteTarget | null> {
-  const rows = await ctx.engine.executeRaw<CurrentPageWriteTarget>(
-    `SELECT id, acl_subject_ids, deleted_at
-       FROM pages
-      WHERE slug = $1 AND source_id = $2
-      LIMIT 1`,
-    [slug, sourceId],
-  );
-  const page = rows[0] ?? null;
+): Promise<CurrentPageWriteTarget | null | undefined> {
+  if (
+    typeof (ctx.engine as Partial<BrainEngine>).getPage !== 'function'
+    || typeof (ctx.engine as Partial<BrainEngine>).executeRaw !== 'function'
+  ) return undefined;
+  const page = await ctx.engine.getPage(slug, {
+    sourceId,
+    includeDeleted: true,
+  }) as CurrentPageWriteTarget | null;
   if (page && !hasPageAclAccess(ctx, page.acl_subject_ids)) {
     throw new OperationError('permission_denied', 'You are not authorized to modify this page.');
   }
@@ -2578,7 +2581,7 @@ const list_pages: Operation = {
     // pages indiscriminately.
     // #3242: federatedSearchScope so unqualified listing spans federated
     // sources (same visibility set as search / get_page). Grants still win.
-    const scope = federatedSearchScope(ctx);
+    const scope = federatedPageSearchScope(ctx);
     // The 100-row cap exists to protect remote MCP/OAuth transports from
     // unbounded result dumps. Local CLI callers (ctx.remote === false — the
     // same trust boundary that already bypasses scope enforcement, see the
@@ -2667,7 +2670,7 @@ const search: Operation = {
     const limit = (p.limit as number) || 20;
     const offset = (p.offset as number) || 0;
     // #2561: unqualified trusted-local search spans federated sources.
-    const scope = federatedSearchScope(ctx);
+    const scope = federatedPageSearchScope(ctx);
 
     // T4/D5 — per-call mode honored ONLY for trusted/local callers so a remote
     // OAuth client can't escalate to the costly tokenmax bundle. Local + unknown
@@ -2835,7 +2838,7 @@ const query: Operation = {
     const sourceIdParam = typeof p.source_id === 'string' ? p.source_id : undefined;
     // #2561: unqualified trusted-local query spans federated sources (per-call
     // source_id / remote grants still resolve through resolveRequestedScope).
-    const querySourceScope = federatedSearchScope(ctx, sourceIdParam);
+    const querySourceScope = federatedPageSearchScope(ctx, sourceIdParam);
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
@@ -3318,9 +3321,12 @@ async function resolveGraphPageRef(
   }
 
   const requestedSource = typeof p.source_id === 'string' ? p.source_id : undefined;
-  const sourceScope = requestedSource === undefined
-    ? sourceScopeOpts(ctx)
-    : resolveRequestedScope(ctx, requestedSource, false);
+  const sourceScope = {
+    ...(requestedSource === undefined
+      ? sourceScopeOpts(ctx)
+      : resolveRequestedScope(ctx, requestedSource, false)),
+    ...pageAccessOpts(ctx),
+  };
 
   if (pageId !== undefined) {
     const page = await ctx.engine.getPageById(pageId, sourceScope);
@@ -3363,7 +3369,13 @@ const get_links: Operation = {
     page_id: { type: 'number', description: 'Stable numeric page identity.' },
   },
   handler: async (ctx, p) => {
-    const page = await resolveGraphPageRef(ctx, p);
+    let page: Awaited<ReturnType<typeof resolveGraphPageRef>>;
+    try {
+      page = await resolveGraphPageRef(ctx, p);
+    } catch (error) {
+      if (error instanceof OperationError && error.code === 'page_not_found') return [];
+      throw error;
+    }
     return ctx.engine.getLinks(page.slug, { ...linkReadScopeOpts(ctx), ...pageAccessOpts(ctx), pageId: page.id });
   },
   scope: 'read',
@@ -3378,7 +3390,13 @@ const get_backlinks: Operation = {
     page_id: { type: 'number', description: 'Stable numeric page identity.' },
   },
   handler: async (ctx, p) => {
-    const page = await resolveGraphPageRef(ctx, p);
+    let page: Awaited<ReturnType<typeof resolveGraphPageRef>>;
+    try {
+      page = await resolveGraphPageRef(ctx, p);
+    } catch (error) {
+      if (error instanceof OperationError && error.code === 'page_not_found') return [];
+      throw error;
+    }
     return ctx.engine.getBacklinks(page.slug, { ...linkReadScopeOpts(ctx), ...pageAccessOpts(ctx), pageId: page.id });
   },
   scope: 'read',
@@ -3907,10 +3925,16 @@ const revert_version: Operation = {
     }
     const writeSourceId = resolveWriteSource(ctx, sourceId ?? sourceAlias);
     const page = await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
-    if (!page) {
+    if (page === null) {
       throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug and source.');
     }
     const versionId = p.version_id as number;
+    if (page === undefined && ctx.dryRun) {
+      return { dry_run: true, action: 'revert_version', slug, version_id: versionId, source: writeSourceId };
+    }
+    if (page === undefined) {
+      throw new OperationError('storage_error', 'Page authorization preflight is unavailable.');
+    }
     const matchingVersions = await ctx.engine.executeRaw<{ id: number }>(
       `SELECT id FROM page_versions WHERE id = $1 AND page_id = $2 LIMIT 1`,
       [versionId, page.id],
@@ -4028,7 +4052,7 @@ const resolve_slugs: Operation = {
     // slugs to any caller (the reporter's "resolve_slugs sees them but
     // get_page doesn't" matrix). Route through the same visibility set as
     // get_page/search: grant > federated set > scalar source.
-    return ctx.engine.resolveSlugs(p.partial as string, federatedSearchScope(ctx));
+    return ctx.engine.resolveSlugs(p.partial as string, federatedPageSearchScope(ctx));
   },
   scope: 'read',
 };
