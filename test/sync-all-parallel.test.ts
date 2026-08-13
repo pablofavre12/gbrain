@@ -48,7 +48,7 @@ import {
   buildSyncStatusReport,
 } from '../src/commands/sync.ts';
 import { SYNC_LOCK_ID, syncLockId } from '../src/core/db-lock.ts';
-import { withSourcePrefix, slog } from '../src/core/console-prefix.ts';
+import { getSourcePrefix, withSourcePrefix } from '../src/core/console-prefix.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 // ── resolveParallelism ──────────────────────────────────────────────
@@ -202,13 +202,20 @@ describe('buildSyncStatusReport', () => {
     const syncIso = new Date(now - 100 * 60 * 60 * 1000).toISOString(); // synced 100h ago
     const sources = [
       { id: 'quiet', name: 'quiet', local_path: '/tmp/quiet', config: { syncEnabled: true } },
+      { id: 'quiet_recent', name: 'quiet_recent', local_path: '/tmp/quiet_recent', config: { syncEnabled: true } },
       { id: 'behind', name: 'behind', local_path: '/tmp/behind', config: { syncEnabled: true } },
       { id: 'nocol', name: 'nocol', local_path: '/tmp/nocol', config: { syncEnabled: true } },
     ];
     const engine = makeEngine({
       sourceRows: [
-        // Newest commit 200h ago, synced 100h ago → caught up → lag 0 → fresh.
+        // Newest commit 200h ago, synced 100h ago → caught up, but nobody has
+        // synced in 100h, so the staleness ceiling ramps it to ~28h (100 - 72).
+        // It lands in the MIDDLE band, not 'severe' — that ordering is the point.
         { id: 'quiet', last_commit: 'a'.repeat(40), last_sync_at: syncIso,
+          newest_content_at: new Date(now - 200 * 60 * 60 * 1000).toISOString() },
+        // Same content shape but synced 1h ago → genuinely being checked → fresh.
+        { id: 'quiet_recent', last_commit: 'd'.repeat(40),
+          last_sync_at: new Date(now - 1 * 60 * 60 * 1000).toISOString(),
           newest_content_at: new Date(now - 200 * 60 * 60 * 1000).toISOString() },
         // Newest commit 10h ago, synced 100h ago → behind → wall-clock → severe.
         { id: 'behind', last_commit: 'b'.repeat(40), last_sync_at: syncIso,
@@ -218,6 +225,7 @@ describe('buildSyncStatusReport', () => {
       ],
       countRows: [
         { source_id: 'quiet', pages: 10, chunks_total: 20, chunks_unembedded: 0 },
+        { source_id: 'quiet_recent', pages: 10, chunks_total: 20, chunks_unembedded: 0 },
         { source_id: 'behind', pages: 10, chunks_total: 20, chunks_unembedded: 0 },
         { source_id: 'nocol', pages: 10, chunks_total: 20, chunks_unembedded: 0 },
       ],
@@ -225,10 +233,19 @@ describe('buildSyncStatusReport', () => {
 
     const report = await buildSyncStatusReport(engine, sources);
     const byId = new Map(report.sources.map((s) => [s.source_id, s]));
-    // Legacy wall-clock would have called 'quiet' severe (100h). Content-relative
-    // correctly reports caught-up.
-    expect(byId.get('quiet')!.staleness_hours).toBe(0);
-    expect(byId.get('quiet')!.staleness_class).toBe('fresh');
+    // Three-way distinction, which is the whole point of the ramp:
+    //   quiet_recent → 0    (caught up AND being checked)
+    //   quiet        → ~28h (caught up but abandoned 100h ago — used to report 0
+    //                        forever, which is how a dead daemon stayed invisible)
+    //   behind       → 100h (real new content unsynced)
+    // Naive wall-clock would flatten the first two into 'severe' alongside the third.
+    expect(byId.get('quiet_recent')!.staleness_hours).toBe(0);
+    expect(byId.get('quiet_recent')!.staleness_class).toBe('fresh');
+    expect(byId.get('quiet')!.staleness_hours).toBeGreaterThan(27);
+    expect(byId.get('quiet')!.staleness_hours).toBeLessThan(29);
+    // Middle band, NOT severe: the ramp crosses warn before fail so consumers at
+    // 24h and 72h escalate in order rather than tripping in the same instant.
+    expect(byId.get('quiet')!.staleness_class).toBe('stale');
     expect(byId.get('behind')!.staleness_class).toBe('severe');
     expect(byId.get('nocol')!.staleness_hours).toBeGreaterThan(72);
     expect(byId.get('nocol')!.staleness_class).toBe('severe');
@@ -362,44 +379,17 @@ describe('buildSyncStatusReport', () => {
 // ── per-source console prefix (D6 + D13) ─────────────────────────────
 
 describe('per-source line prefix under withSourcePrefix', () => {
-  test('slog under wrap emits [source-id] prefix; outside wrap emits bare output', async () => {
-    // Captures both paths in one case. The wrap propagation is what
-    // makes the entire "per-source greppable parallel output" feature
-    // work; without it, parallel sync interleaves illegibly.
-    //
-    // Outside-wrap path routes through `console.log` (not
-    // `process.stdout.write` directly) so we patch both sinks.
-    // Inside-wrap path routes through `process.stdout.write` because
-    // slog needs raw stream control to emit prefixed lines.
-    const stdoutOrig = process.stdout.write.bind(process.stdout);
-    const consoleLogOrig = console.log;
-    const stdoutChunks: string[] = [];
-    const consoleLogChunks: unknown[][] = [];
-    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
-      stdoutChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
-      return true;
-    }) as typeof process.stdout.write;
-    // eslint-disable-next-line no-console
-    console.log = (...args: unknown[]) => { consoleLogChunks.push(args); };
-    try {
-      // Outside wrap: bare console.log fast path.
-      slog('outside-wrap');
-      // Inside wrap: prefixed line via process.stdout.write.
-      await withSourcePrefix('media-corpus', async () => {
-        slog('inside-wrap');
-      });
-      // Outside-wrap landed on console.log (no prefix, no [tag]).
-      const flatConsole = consoleLogChunks.flat().map(String).join(' ');
-      expect(flatConsole).toContain('outside-wrap');
-      expect(flatConsole).not.toMatch(/\[.*\]/);
-      // Inside-wrap landed on process.stdout.write WITH the source.id prefix.
-      const stdoutText = stdoutChunks.join('');
-      expect(stdoutText).toContain('[media-corpus] inside-wrap');
-    } finally {
-      process.stdout.write = stdoutOrig;
-      // eslint-disable-next-line no-console
-      console.log = consoleLogOrig;
-    }
+  test('wrap propagates source.id and restores the unprefixed outer context', async () => {
+    // Byte-level slog routing is pinned in console-prefix.test.ts. This
+    // integration guard stays concurrency-safe: unit shards run test files in
+    // parallel, so mutating process.stdout here would race unrelated tests.
+    expect(getSourcePrefix()).toBeNull();
+    const observed = await withSourcePrefix('media-corpus', async () => {
+      await Promise.resolve();
+      return getSourcePrefix();
+    });
+    expect(observed).toBe('media-corpus');
+    expect(getSourcePrefix()).toBeNull();
   });
 });
 

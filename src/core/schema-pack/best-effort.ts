@@ -24,7 +24,7 @@
 
 import { loadConfig } from '../config.ts';
 import type { OperationContext } from '../operations.ts';
-import { loadActivePack } from './load-active.ts';
+import { loadActivePackForEngine } from './load-active.ts';
 import type { ResolvedPack } from './registry.ts';
 
 /**
@@ -48,11 +48,13 @@ export async function loadActivePackBestEffort(
   ctx: OperationContext,
 ): Promise<ResolvedPack | null> {
   try {
-    return await loadActivePack({
+    const { pack } = await loadActivePackForEngine({
+      engine: ctx.engine,
       cfg: loadConfig(),
       remote: ctx.remote ?? true,
       sourceId: ctx.sourceId,
     });
+    return pack;
   } catch {
     return null;
   }

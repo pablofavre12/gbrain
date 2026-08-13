@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'crypto';
 import type { Page, PageInput, PageType, Chunk, SearchResult, StalePageRow } from './types.ts';
-import type { Take, TakeKind } from './engine.ts';
+import type { Take, TakeKind, TakeHit } from './engine.ts';
 
 /**
  * SHA-256 hash a token/secret for storage. Never store plaintext tokens.
@@ -19,10 +19,35 @@ export function generateToken(prefix: string): string {
 /**
  * Validate and normalize a slug. Slugs are lowercased repo-relative paths.
  * Rejects empty slugs, path traversal (..), and leading /.
+ *
+ * SECURITY (#1647-slug / codex #6): also rejects a small set of dangerous
+ * characters that survive the `..` check but can still produce a hostile
+ * filename at the write-through FS sink or hide the real target — NUL/control
+ * bytes, Unicode bidirectional/RTL overrides, backslashes, and URL-encoded
+ * path separators/traversal. None appear in legitimate slugs (lowercase
+ * alphanumerics, hyphens, dots, underscores, slashes, unicode letters, and CJK
+ * all still pass), so this is pure hardening, not a behavior change. This is the
+ * shared chokepoint for both `putPage` and `updateSlug` on both engines.
  */
 export function validateSlug(slug: string): string {
   if (!slug || /(^|\/)\.\.($|\/)/.test(slug) || /^\//.test(slug)) {
     throw new Error(`Invalid slug: "${slug}". Slugs cannot be empty, start with /, or contain path traversal.`);
+  }
+  // Control / NUL bytes (C0 + DEL + C1).
+  if (/[\x00-\x1f\x7f-\x9f]/.test(slug)) {
+    throw new Error(`Invalid slug: "${slug}". Slugs cannot contain control characters.`);
+  }
+  // Unicode bidirectional / RTL overrides (visual-spoofing of the real path).
+  if (/[\u202a-\u202e\u2066-\u2069]/.test(slug)) {
+    throw new Error(`Invalid slug: "${slug}". Slugs cannot contain bidirectional/RTL override characters.`);
+  }
+  // Backslash (Windows-style separator / escape).
+  if (slug.includes('\\')) {
+    throw new Error(`Invalid slug: "${slug}". Backslashes are not allowed in slugs.`);
+  }
+  // URL-encoded path separators / traversal (%2e=., %2f=/, %5c=\).
+  if (/%2e|%2f|%5c/i.test(slug)) {
+    throw new Error(`Invalid slug: "${slug}". URL-encoded path separators are not allowed in slugs.`);
   }
   return slug.toLowerCase();
 }
@@ -85,6 +110,27 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const sourceUri = row.source_uri === undefined ? undefined : (row.source_uri as string | null);
   const ingestedVia = row.ingested_via === undefined ? undefined : (row.ingested_via as string | null);
   const ingestedAt = readOptionalDate(row.ingested_at);
+  // #3507: the CR tier the page was last embedded under (three-state, same
+  // pattern as the provenance columns above). Re-embed paths (`embed --stale`
+  // and friends) read this to reproduce the page's stored wrapping convention.
+  const contextualRetrievalMode = row.contextual_retrieval_mode === undefined
+    ? undefined
+    : (row.contextual_retrieval_mode as Page['contextual_retrieval_mode']);
+  // Author attribution (migration v9002). Three-state read mirrors provenance:
+  // absent SELECT projections compile unchanged (undefined), NULL columns map
+  // to null, populated columns carry the writer identity.
+  const lastWriteClientId = row.last_write_client_id === undefined ? undefined : (row.last_write_client_id as string | null);
+  const lastWriteClientName = row.last_write_client_name === undefined ? undefined : (row.last_write_client_name as string | null);
+  const aclSubjectIds = row.acl_subject_ids === undefined
+    ? undefined
+    : (row.acl_subject_ids as string[] | null);
+  const documentId = row.document_id === undefined ? undefined : (row.document_id as string | null);
+  const documentVersionSequence = row.document_version_sequence === undefined
+    ? undefined
+    : (row.document_version_sequence == null ? null : Number(row.document_version_sequence));
+  const documentVersionHash = row.document_version_hash === undefined
+    ? undefined
+    : (row.document_version_hash as string | null);
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -110,6 +156,14 @@ export function rowToPage(row: Record<string, unknown>): Page {
     ...(sourceUri !== undefined && { source_uri: sourceUri }),
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
+    ...(contextualRetrievalMode !== undefined && { contextual_retrieval_mode: contextualRetrievalMode }),
+    // Author attribution (migration v9002). Optional in SELECT projection.
+    ...(lastWriteClientId !== undefined && { last_write_client_id: lastWriteClientId }),
+    ...(lastWriteClientName !== undefined && { last_write_client_name: lastWriteClientName }),
+    ...(aclSubjectIds !== undefined && { acl_subject_ids: aclSubjectIds }),
+    ...(documentId !== undefined && { document_id: documentId }),
+    ...(documentVersionSequence !== undefined && { document_version_sequence: documentVersionSequence }),
+    ...(documentVersionHash !== undefined && { document_version_hash: documentVersionHash }),
     // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
     // can thread it through getChunks / upsertChunks without defaulting to 'default'.
     // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now
@@ -304,6 +358,7 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     parent_symbol_path: (row.parent_symbol_path as string[] | null | undefined) ?? null,
     doc_comment: (row.doc_comment as string | null | undefined) ?? null,
     symbol_name_qualified: (row.symbol_name_qualified as string | null | undefined) ?? null,
+    modality: (row.modality as 'text' | 'image' | undefined) ?? undefined,
   };
 }
 
@@ -355,6 +410,19 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
       result.effective_date_source = raw;
     }
   }
+  if (typeof row.message_id === 'string' && row.message_id.trim().length > 0) {
+    result.message_id = row.message_id;
+  }
+  if (typeof row.thread_id === 'string' && row.thread_id.length > 0) {
+    result.thread_id = row.thread_id;
+  }
+  if (
+    result.message_id &&
+    typeof row.source_subject === 'string' &&
+    row.source_subject.length > 0
+  ) {
+    result.source_subject = row.source_subject;
+  }
   return result;
 }
 
@@ -400,5 +468,26 @@ export function takeRowToTake(row: Record<string, unknown>): Take {
     resolved_by: row.resolved_by == null ? null : String(row.resolved_by),
     created_at: isoOrNull(row.created_at) ?? '',
     updated_at: isoOrNull(row.updated_at) ?? '',
+  };
+}
+
+/**
+ * Convert a takes search-hit SQL row to the `TakeHit` shape. The Postgres
+ * driver returns int8 columns (`take_id`/`page_id` are BIGSERIAL-backed) as
+ * native BigInt, which crashes JSON.stringify at the MCP/CLI serialization
+ * boundary (#2450-class). Number() is the same 2^53 envelope takeRowToTake
+ * already accepts for these ids.
+ */
+export function takeHitRowToHit(row: Record<string, unknown>): TakeHit {
+  return {
+    take_id: Number(row.take_id),
+    page_id: Number(row.page_id),
+    page_slug: String(row.page_slug ?? ''),
+    row_num: Number(row.row_num),
+    claim: String(row.claim),
+    kind: row.kind as TakeKind,
+    holder: String(row.holder),
+    weight: Number(row.weight),
+    score: Number(row.score),
   };
 }

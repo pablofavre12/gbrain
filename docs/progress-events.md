@@ -26,6 +26,7 @@ Any of these commands stream events when `--progress-json` is set:
 - `gbrain lint`
 - `gbrain integrity auto`
 - `gbrain eval`
+- `gbrain eval brainbench`
 - `gbrain apply-migrations` (the orchestrator + every child command)
 
 Non-bulk commands (`stats`, `graph-query`, `get`, `put`, etc.) don't emit
@@ -140,11 +141,17 @@ Stable phase names shipped in v0.15.2:
 - `import.files`
 - `sync.deletes`, `sync.renames`, `sync.imports`
 - `migrate.copy_pages`, `migrate.copy_links`
+- `migrate.reembed` (the re-embed pass of `gbrain migrate embeddings`; total is the
+  stale-chunk backlog at the start of the pass, so it can grow slightly if a
+  writer adds chunks mid-run)
 - `repair_jsonb.run`, `repair_jsonb.<table>.<column>`
 - `backlinks.scan`
 - `lint.pages`
 - `integrity.auto`
 - `eval.single`, `eval.ab`
+- `eval.brainbench` — ticks carry a `note` but no `total`: continuity pairs
+  replay once per (writer, reader) ordering, so the tick count exceeds the
+  fixture count and a percentage would lie
 - `export.pages`
 - `files.sync`
 

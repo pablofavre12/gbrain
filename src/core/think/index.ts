@@ -23,6 +23,7 @@ import { runGather, renderPagesBlock, takesHitToTakeForPrompt } from './gather.t
 import { renderTakesBlock } from './sanitize.ts';
 import { buildThinkSystemPrompt, buildThinkUserMessage } from './prompt.ts';
 import { resolveCitations, type ParsedCitation } from './cite-render.ts';
+import { resolveOwnerHolder } from '../owner-holder.ts';
 import { resolveModel } from '../model-config.ts';
 import { chat as gatewayChat, probeChatModel, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
@@ -76,8 +77,8 @@ export interface RunThinkOpts {
    */
   withCalibration?: boolean;
   /**
-   * Holder to retrieve the calibration profile for. Default 'garry'. Only
-   * consulted when withCalibration=true.
+   * Holder to retrieve the calibration profile for. Resolves via resolveOwnerHolder
+   * (config emotional_weight.user_holder, else 'self'). Only consulted when withCalibration=true.
    */
   calibrationHolder?: string;
   /**
@@ -139,6 +140,13 @@ export interface ThinkResult {
    * pre-existing/test `ThinkResult` literals → treated as persistable (back-compat).
    */
   synthesisOk?: boolean;
+  /**
+   * MEMORY_VERBS v1 [E2] — gateway token usage for the synthesis call(s),
+   * summed across rounds. Best-effort: null when no LLM ran (graceful stub),
+   * when a test client returns no usage, or when a provider omits accounting.
+   * The synthesize verb maps this to its frozen `cost` block.
+   */
+  usage?: { input_tokens: number; output_tokens: number } | null;
   /** Only set when --save was true and the caller persisted a synthesis page. */
   savedSlug?: string;
   /** Diagnostics for `--explain` callers (CLI surface for v0.29). */
@@ -148,9 +156,35 @@ export interface ThinkResult {
     takesFromVector: number;
     graphHits: number;
   };
+  /** USD cost computed from `usage` + `canonicalLookup(modelUsed)`, when both are available. */
+  cost_usd?: number;
 }
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4000;
+
+// Thinking-by-default Claude 5 models (`anthropic:claude-*-5`) spend a large
+// share of the output budget on internal reasoning before emitting any answer,
+// so the 4000 default leaves `think` with empty or truncated text. Give those
+// models headroom; providers bill actual tokens, not the cap. Everything else
+// keeps 4000.
+const THINKING_DEFAULT_MAX_OUTPUT_TOKENS = 16000;
+const THINKING_BY_DEFAULT_MODEL_RE = /^anthropic[:/]claude-[a-z0-9]+-5(?:[.-]|$)/i;
+// OpenAI reasoning models spend output budget on internal reasoning tokens
+// the same way — reasoning tokens are billed as output and count against
+// `max_tokens` — so they get the same headroom. Deliberately scoped to the
+// gpt-5 family and the numbered o-series only; anything else (gpt-4o, the
+// non-reasoning `*-chat` snapshots like gpt-5-chat-latest, other providers'
+// reasoning models routed through their own recipes) keeps the conservative
+// 4000 default.
+const OPENAI_REASONING_MODEL_RE = /^openai[:/](?:gpt-5|o[0-9]+)(?:[.-]|$)/i;
+const OPENAI_CHAT_SNAPSHOT_RE = /-chat(?:-|$)/i; // gpt-5-chat-latest, gpt-5.2-chat-latest
+export function maxOutputTokensFor(modelStr: string): number {
+  const openaiReasoning =
+    OPENAI_REASONING_MODEL_RE.test(modelStr) && !OPENAI_CHAT_SNAPSHOT_RE.test(modelStr);
+  return THINKING_BY_DEFAULT_MODEL_RE.test(modelStr) || openaiReasoning
+    ? THINKING_DEFAULT_MAX_OUTPUT_TOKENS
+    : DEFAULT_MAX_OUTPUT_TOKENS;
+}
 
 function inferIntent(question: string, anchor?: string): string {
   if (anchor) return 'entity';
@@ -270,10 +304,12 @@ export async function runThink(
     anchor: opts.anchor,
     questionEmbedding,
     takesHoldersAllowList: opts.takesHoldersAllowList,
+    ...(opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
+    ...(opts.allowedSources !== undefined ? { sourceIds: opts.allowedSources } : {}),
   });
 
   // Render evidence blocks for the prompt
-  const pagesBlock = renderPagesBlock(gather.pages);
+  const pagesBlock = renderPagesBlock(gather.pages, 600, opts.question);
   const takesForPrompt = gather.takes.map(takesHitToTakeForPrompt);
   const { rendered: takesBlock, sanitizedCount } = renderTakesBlock(takesForPrompt);
   if (sanitizedCount > 0) {
@@ -293,7 +329,10 @@ export async function runThink(
     try {
       const { getLatestProfile } = await import('../../commands/calibration.ts');
       const profile = await getLatestProfile(engine, {
-        holder: opts.calibrationHolder ?? 'garry',
+        holder: resolveOwnerHolder({
+          override: opts.calibrationHolder,
+          configValue: await engine.getConfig('emotional_weight.user_holder'),
+        }),
       });
       if (profile) {
         calibrationBlockOpts = {
@@ -421,6 +460,9 @@ export async function runThink(
   // sentinel, which is non-JSON) and on the no-client early return below; the final
   // return ANDs it with a non-empty-answer check (catches valid-but-empty JSON).
   let synthesisOk = true;
+  // [E2] best-effort usage aggregation across synthesis calls (single-pass in
+  // v0.28+, but summed so the round loop inherits it when gap-fill lands).
+  let usage: { input_tokens: number; output_tokens: number } | null = null;
   let response: ThinkResponse;
   if (opts.stubResponse) {
     response = opts.stubResponse;
@@ -439,13 +481,31 @@ export async function runThink(
     // Closes #952 (think over MCP returns "no LLM available").
     const client = opts.client ?? await tryBuildGatewayClient(modelUsed, { explicitModel: opts.modelExplicit });
     if (!client) {
-      warnings.push('NO_ANTHROPIC_API_KEY');
+      // Label the failure honestly: a missing key and an unusable model id are
+      // different incidents with different fixes. Pre-fix EVERY null client was
+      // stamped NO_ANTHROPIC_API_KEY, which sent operators chasing env/keychain
+      // problems when the real cause was a model id the recipe didn't know
+      // (e.g. a tier-configured model newer than the recipe list). The re-probe
+      // is pure and cheap (no IO): same predicate tryBuildGatewayClient used.
+      const probe = probeChatModel(normalizeModelId(modelUsed));
+      const modelProblem = !probe.ok && probe.reason !== 'unavailable';
+      warnings.push(
+        modelProblem ? `MODEL_NOT_USABLE:${(probe as { reason: string }).reason}` : 'NO_ANTHROPIC_API_KEY',
+      );
+      const detail = !probe.ok ? probe.detail : '';
+      const fix = !probe.ok && probe.fix ? ` Fix: ${probe.fix}` : '';
       // Degrade gracefully: return the gather without synthesis. Better than throwing.
       return {
         question: opts.question,
-        answer: '(no LLM available — set ANTHROPIC_API_KEY or pass `client`)',
+        answer: modelProblem
+          ? `(model "${modelUsed}" not usable — ${detail}${fix})`
+          : '(no LLM available — set ANTHROPIC_API_KEY or pass `client`)',
         citations: [],
-        gaps: ['no LLM available; gather succeeded but synthesis skipped'],
+        gaps: [
+          modelProblem
+            ? `model "${modelUsed}" not usable (${(probe as { reason: string }).reason}); gather succeeded but synthesis skipped`
+            : 'no LLM available; gather succeeded but synthesis skipped',
+        ],
         pagesGathered: gather.pages.length,
         takesGathered: gather.takes.length,
         graphHits: gather.graphSlugs.length,
@@ -453,6 +513,7 @@ export async function runThink(
         rounds: 0,
         warnings,
         synthesisOk: false,  // #1698: no LLM ran — never persist this
+        usage: null,         // [E2] no LLM ran — no accounting
         diagnostics: {
           pagesFromHybrid: gather.diagnostics.pagesFromHybrid,
           takesFromKeyword: gather.diagnostics.takesFromKeyword,
@@ -463,10 +524,21 @@ export async function runThink(
     }
     const result = await client.create({
       model: modelUsed,
-      max_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+      max_tokens: maxOutputTokensFor(normalizeModelId(modelUsed)),
       system: systemPrompt,
       messages: [{ role: 'user', content: userMessage }],
     });
+    // [E2] capture usage when the message carries it (test-injected clients
+    // and providers without accounting leave it null).
+    const u = (result as { usage?: { input_tokens?: number; output_tokens?: number } }).usage;
+    if (u && typeof u.input_tokens === 'number' && typeof u.output_tokens === 'number') {
+      // Single synthesis call in v0.28+; when gap-driven rounds land, sum here.
+      const prev = usage as { input_tokens: number; output_tokens: number } | null;
+      usage = {
+        input_tokens: (prev?.input_tokens ?? 0) + u.input_tokens,
+        output_tokens: (prev?.output_tokens ?? 0) + u.output_tokens,
+      };
+    }
     const block = result.content.find(b => b.type === 'text');
     const text = block && 'text' in block ? block.text : '';
     const parsed = tryParseJSON(text);
@@ -511,6 +583,7 @@ export async function runThink(
     // #1698: persistable only when a real synthesis produced a non-empty answer.
     // ANDs the not-JSON/sentinel flag with a content check (catches valid-but-empty JSON).
     synthesisOk: synthesisOk && response.answer.trim().length > 0,
+    usage,
     diagnostics: {
       pagesFromHybrid: gather.diagnostics.pagesFromHybrid,
       takesFromKeyword: gather.diagnostics.takesFromKeyword,
@@ -518,6 +591,40 @@ export async function runThink(
       graphHits: gather.diagnostics.graphHits,
     },
   };
+}
+
+/**
+ * Strip a "## Gaps" section from an answer body.
+ *
+ * `think` returns gaps in the structured `gaps` array, which the CLI and the
+ * persisted synthesis page render exactly once. The system prompt also used to
+ * ask for a "Gaps" section inside the answer prose, so a model that still emits
+ * one would make the output show "## Gaps" twice — once from the prose, once
+ * from the structured array. This removes the prose section so the structured
+ * array stays the single source of truth.
+ *
+ * Matches a heading line `## Gaps` (level 2-6, case-insensitive) and removes it
+ * through the next heading of the same-or-higher level, or end of string.
+ * Returns the input unchanged when there is no such section.
+ */
+export function stripGapsSection(answer: string): string {
+  if (!answer) return answer;
+  const lines = answer.split('\n');
+  let start = -1;
+  let level = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(#{2,6})\s+gaps\s*$/i.exec(lines[i]);
+    if (m) { start = i; level = m[1].length; break; }
+  }
+  if (start === -1) return answer;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    const h = /^(#{1,6})\s+\S/.exec(lines[i]);
+    if (h && h[1].length <= level) { end = i; break; }
+  }
+  const kept = [...lines.slice(0, start), ...lines.slice(end)].join('\n');
+  // Drop trailing blank lines left by removing a trailing section.
+  return kept.replace(/\s+$/, '');
 }
 
 /**
@@ -549,7 +656,7 @@ export async function persistSynthesis(
   const body = [
     `# ${result.question}`,
     '',
-    result.answer,
+    stripGapsSection(result.answer),
     '',
     result.gaps.length > 0 ? '## Gaps\n\n' + result.gaps.map(g => `- ${g}`).join('\n') : '',
   ].filter(Boolean).join('\n');
@@ -634,7 +741,9 @@ async function tryBuildGatewayClient(
   const modelStr = normalizeModelId(modelUsed);
 
   // #1698: ONE shared probe (resolveRecipe + assertTouchpoint + isAvailable).
-  // assertTouchpoint catches typo'd native models; isAvailable catches missing keys.
+  // assertTouchpoint catches chat-less providers (voyage/ollama); isAvailable
+  // catches missing keys. Model-id typos are NOT caught locally (no runtime
+  // allowlist) — a nonexistent id fails at the provider with model_not_found.
   // For an EXPLICIT model the user typed, an unusable model is a HARD ERROR (throw)
   // — never silently degrade to the no-LLM stub. For the default/configured-model
   // path, return null so the caller falls through to the graceful "no LLM" stub
@@ -680,7 +789,7 @@ async function tryBuildGatewayClient(
         // existing JSON-parse path produces the graceful degradation answer.
         if (e instanceof AIConfigError) {
           if (opts.explicitModel) throw e;
-          return buildGracefulMessage(modelStr) as unknown as Anthropic.Message;
+          return buildGracefulMessage(modelStr, e) as unknown as Anthropic.Message;
         }
         throw e;
       }
@@ -729,12 +838,19 @@ function mapStopReason(s: ChatResult['stopReason']): 'end_turn' | 'max_tokens' |
 }
 
 /**
- * Sentinel Message returned when gateway.chat throws AIConfigError (typically
- * missing API key for the resolved provider). The caller's JSON parser will
- * fail on this text, fall through to `LLM_OUTPUT_NOT_JSON`, and surface the
- * sentinel as the answer — matches the legacy graceful-degradation shape.
+ * Sentinel Message returned when gateway.chat throws AIConfigError (missing
+ * API key, or the provider rejecting the model/config with a 4xx — with no
+ * runtime model allowlist, a nonexistent model id surfaces here as the
+ * provider's model_not_found). The caller's JSON parser will fail on this
+ * text, fall through to `LLM_OUTPUT_NOT_JSON`, and surface the sentinel as
+ * the answer — matches the legacy graceful-degradation shape.
+ *
+ * When the thrown error is in hand, its own message + fix are surfaced (they
+ * name the actual cause: which key is missing, or what the provider rejected)
+ * instead of the generic key advice — the generic text key-blamed provider
+ * 4xxs like model_not_found.
  */
-function buildGracefulMessage(modelStr: string): {
+function buildGracefulMessage(modelStr: string, err?: AIConfigError): {
   id: string;
   type: 'message';
   role: 'assistant';
@@ -748,7 +864,12 @@ function buildGracefulMessage(modelStr: string): {
     type: 'message',
     role: 'assistant',
     model: modelStr,
-    content: [{ type: 'text', text: '(no LLM available — set anthropic_api_key via gbrain config or ANTHROPIC_API_KEY env)' }],
+    content: [{
+      type: 'text',
+      text: err
+        ? `(no LLM available — ${err.message}${err.fix ? ` Fix: ${err.fix}` : ''})`
+        : '(no LLM available — set anthropic_api_key via gbrain config or ANTHROPIC_API_KEY env)',
+    }],
     usage: { input_tokens: 0, output_tokens: 0 },
     stop_reason: 'end_turn',
   };

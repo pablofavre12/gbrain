@@ -90,6 +90,8 @@ export const BATCH_AUDIT_SITES = [
   'extract.stale',
   // operations.ts MCP put_page auto-link path.
   'mcp.put_page.autolink',
+  // contradiction-probe timeline writer (gbrain timeline-apply).
+  'timeline-writer.contradictions',
   // sync.ts/reindex.ts orchestrator labels.
   'sync.import_file',
   'reindex.markdown',

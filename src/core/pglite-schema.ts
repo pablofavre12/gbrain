@@ -22,6 +22,7 @@
  */
 
 import { applyChunkEmbeddingIndexPolicy } from './vector-index.ts';
+import { applyFtsLanguagePolicy } from './fts-language.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 
 const PGLITE_SCHEMA_SQL_TEMPLATE = `
@@ -110,13 +111,31 @@ CREATE TABLE IF NOT EXISTS pages (
   -- query_cache.page_generations invalidation.
   contextual_retrieval_mode  TEXT,
   corpus_generation          TEXT,
+  -- Per-page ACL + Platform document version fence (mirrors src/schema.sql).
+  acl_subject_ids             TEXT[],
+  document_id                 TEXT,
+  document_version_sequence   BIGINT,
+  document_version_hash       TEXT,
   -- v0.40.3.0 cache invalidation gate (migration v91; mirrors src/schema.sql).
   -- Bumped by bump_page_generation_trg on INSERT (initial) and on UPDATE
   -- when content columns IS DISTINCT FROM. Read by the per-page snapshot
   -- check in query-cache-gate.ts.
   generation     BIGINT NOT NULL DEFAULT 1,
+  CONSTRAINT pages_acl_nonempty_check
+    CHECK (acl_subject_ids IS NULL OR cardinality(acl_subject_ids) > 0),
+  CONSTRAINT pages_document_fence_shape_check CHECK (
+    (document_id IS NULL AND document_version_sequence IS NULL AND document_version_hash IS NULL)
+    OR
+    (document_id IS NOT NULL AND char_length(document_id) BETWEEN 1 AND 200
+      AND document_version_sequence >= 1
+      AND document_version_hash ~ '^[a-f0-9]{64}$')
+  ),
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
+
+CREATE INDEX IF NOT EXISTS pages_acl_subject_ids_idx
+  ON pages USING GIN (acl_subject_ids)
+  WHERE acl_subject_ids IS NOT NULL;
 
 -- v0.40.3.0 cache invalidation trigger (migration v91; mirrors src/schema.sql).
 -- BEFORE INSERT OR UPDATE so every write path bumps generation per D6 /
@@ -124,7 +143,7 @@ CREATE TABLE IF NOT EXISTS pages (
 -- bookmark gate fires for any cache row stored before the new page existed.
 -- UPDATE: bumps only when content columns IS DISTINCT FROM (allow-list of
 -- 10 widened per D6) so read-time mutations don't invalidate every cache.
-CREATE OR REPLACE FUNCTION bump_page_generation_fn() RETURNS trigger AS $func$
+CREATE OR REPLACE FUNCTION bump_page_generation_fn() RETURNS trigger SET search_path = pg_catalog, public AS $func$
 BEGIN
   IF (TG_OP = 'INSERT') THEN
     NEW.generation := COALESCE((SELECT MAX(generation) FROM pages), 0) + 1;
@@ -164,9 +183,24 @@ INSERT INTO page_generation_clock (id, value)
   VALUES (1, COALESCE((SELECT MAX(generation) FROM pages), 0))
   ON CONFLICT (id) DO NOTHING;
 
-CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn() RETURNS trigger AS $func$
+-- v0.42.x: contention-free clock. nextval() takes a microsecond LWLock, not a
+-- transaction-length row lock. Load-bearing setval (2-arg -> is_called=true) so
+-- the first write strictly exceeds the seed; floor 1 (sequence MINVALUE).
+-- Layer-1 reads last_value. Table + trigger names retained.
+CREATE SEQUENCE IF NOT EXISTS page_generation_clock_seq;
+-- Monotonic seed: GREATEST over the sequence's OWN last_value too, so replaying
+-- this blob on an already-upgraded brain (initSchema is re-runnable) can never
+-- move last_value BACKWARD below a stored query_cache bookmark.
+SELECT setval('page_generation_clock_seq', GREATEST(
+  1,
+  COALESCE((SELECT last_value FROM page_generation_clock_seq), 0),
+  COALESCE((SELECT value FROM page_generation_clock WHERE id = 1), 0),
+  COALESCE((SELECT MAX(generation) FROM pages), 0)
+));
+
+CREATE OR REPLACE FUNCTION bump_page_generation_clock_fn() RETURNS trigger SET search_path = pg_catalog, public AS $func$
 BEGIN
-  UPDATE page_generation_clock SET value = value + 1 WHERE id = 1;
+  PERFORM nextval('page_generation_clock_seq');
   RETURN NULL;
 END;
 $func$ LANGUAGE plpgsql;
@@ -356,6 +390,9 @@ CREATE TABLE IF NOT EXISTS timeline_entries (
   source   TEXT    NOT NULL DEFAULT '',
   summary  TEXT    NOT NULL,
   detail   TEXT    NOT NULL DEFAULT '',
+  -- v0.42.x (Life Chronicle #2390): event-projection pointer. NULL for
+  -- ordinary rows. See src/schema.sql for the full rationale.
+  event_page_id INTEGER REFERENCES pages(id) ON DELETE CASCADE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -365,6 +402,9 @@ CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_entries(date);
 -- v0.41.18.0 (codex finding #11): widened to include source so distinct
 -- meeting provenance survives. Legacy rows have source='' (schema default).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_dedup ON timeline_entries(page_id, date, summary, source);
+-- v0.42.x (Life Chronicle): event-projection lookup + dedup (partial).
+CREATE INDEX IF NOT EXISTS idx_timeline_event_page ON timeline_entries(event_page_id) WHERE event_page_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_event_dedup ON timeline_entries(event_page_id, date) WHERE event_page_id IS NOT NULL;
 
 -- ============================================================
 -- page_versions: snapshot history
@@ -756,7 +796,7 @@ CREATE TABLE IF NOT EXISTS take_proposals (
   predicted_brier_bucket_n    INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS take_proposals_idempotency_idx
-  ON take_proposals (source_id, page_slug, content_hash, prompt_version);
+  ON take_proposals (source_id, page_slug, content_hash, prompt_version, md5(claim_text));
 CREATE INDEX IF NOT EXISTS take_proposals_pending_idx
   ON take_proposals (source_id, status, proposed_at DESC)
   WHERE status = 'pending';
@@ -869,6 +909,7 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   deleted_at              TIMESTAMPTZ,
   source_id               TEXT REFERENCES sources(id) ON DELETE RESTRICT,
   federated_read          TEXT[] NOT NULL DEFAULT '{}',
+  federated_write         TEXT[] NOT NULL DEFAULT '{}',
   -- v0.38 Slice 2 + 3: per-OAuth-client budget cap (v84) + agent binding (v85).
   -- bound_* columns are NULL on legacy clients (no agent scope by default).
   budget_usd_per_day      NUMERIC(10, 2) NULL,
@@ -884,10 +925,50 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 -- read sources beyond its source_id). Migration v60 adds source_id;
 -- v61-v65 add federated_read + GIN index + flip FK to RESTRICT. Fresh
 -- installs land in the post-migration shape via the inline columns above.
+-- federated_write (v118) is the WRITE-side mirror of federated_read: the set
+-- of sources a token may write to (write ops choose the target per call,
+-- authorized against source_id ∪ federated_write). Empty '{}' = writes locked
+-- to source_id (the pre-v118 default).
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
   ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
   ON oauth_clients USING GIN (federated_read);
+CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_write
+  ON oauth_clients USING GIN (federated_write);
+
+-- Governed native-knowledge writes: a durable proposal is inert until the
+-- same server-authenticated actor confirms it through the canonical put_page
+-- operation. Mirrors migration v9005 and src/schema.sql.
+CREATE TABLE IF NOT EXISTS page_write_proposals (
+  proposal_id               TEXT PRIMARY KEY,
+  actor_id                  TEXT NOT NULL,
+  source_id                 TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  slug                      TEXT NOT NULL,
+  content                   TEXT NOT NULL,
+  content_hash              TEXT NOT NULL CHECK (content_hash ~ '^[a-f0-9]{64}$'),
+  allowed_subject_ids       TEXT[],
+  document_id               TEXT,
+  document_version_sequence BIGINT,
+  document_version_hash     TEXT,
+  status                    TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending', 'confirming', 'confirmed', 'cancelled', 'expired')),
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at                TIMESTAMPTZ NOT NULL,
+  confirming_at             TIMESTAMPTZ,
+  confirmed_at              TIMESTAMPTZ,
+  cancelled_at              TIMESTAMPTZ,
+  CONSTRAINT page_write_proposals_acl_nonempty_check
+    CHECK (allowed_subject_ids IS NULL OR cardinality(allowed_subject_ids) > 0),
+  CONSTRAINT page_write_proposals_document_fence_shape_check CHECK (
+    (document_id IS NULL AND document_version_sequence IS NULL AND document_version_hash IS NULL)
+    OR
+    (document_id IS NOT NULL AND char_length(document_id) BETWEEN 1 AND 200
+      AND document_version_sequence >= 1
+      AND document_version_hash ~ '^[a-f0-9]{64}$')
+  )
+);
+CREATE INDEX IF NOT EXISTS page_write_proposals_actor_status_expires_idx
+  ON page_write_proposals (actor_id, status, expires_at);
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash   TEXT PRIMARY KEY,
@@ -924,7 +1005,11 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
 CREATE TABLE IF NOT EXISTS op_checkpoints (
   op             TEXT NOT NULL,
   fingerprint    TEXT NOT NULL,
-  completed_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
+  -- v0.42.x: must be a JSONB array. The loader runs jsonb_array_elements_text
+  -- over it; a scalar would throw and wipe the whole checkpoint load. CHECK is
+  -- the DB-enforced always-on guard (mirrors migration v119).
+  completed_keys JSONB NOT NULL DEFAULT '[]'::jsonb
+    CONSTRAINT op_checkpoints_completed_keys_array CHECK (jsonb_typeof(completed_keys) = 'array'),
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (op, fingerprint)
 );
@@ -966,6 +1051,20 @@ CREATE INDEX IF NOT EXISTS context_volunteer_events_src_time_idx
 CREATE INDEX IF NOT EXISTS context_volunteer_events_src_slug_idx
   ON context_volunteer_events (source_id, slug);
 
+-- session_context_state (v0.45.7 / migration v126 — ambient recall issue #1).
+CREATE TABLE IF NOT EXISTS session_context_state (
+  source_id         TEXT NOT NULL,
+  client_id         TEXT NOT NULL DEFAULT 'local',
+  session_id        TEXT NOT NULL,
+  standing_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+  surfaced_slugs    JSONB NOT NULL DEFAULT '[]'::jsonb,
+  last_wake_at      TIMESTAMPTZ,
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, client_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
+  ON session_context_state (updated_at);
+
 -- ============================================================
 -- migration_impact_log (v0.41.18.0 — gbrain onboard wave)
 -- ============================================================
@@ -997,7 +1096,13 @@ ALTER TABLE pages ADD COLUMN IF NOT EXISTS search_vector tsvector;
 
 CREATE INDEX IF NOT EXISTS idx_pages_search ON pages USING GIN(search_vector);
 
-CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger AS $$
+-- #2704: compiled_truth (unbounded whole-page body) deliberately NOT
+-- indexed — overflows Postgres's 1MB tsvector cap on large pages.
+-- content_chunks.search_vector (chunk-grain, populated separately) is
+-- what searchKeyword() actually queries. See migrate.ts's v124 migration
+-- for the full rationale; keep in sync with that + reindex-search-vector.ts
+-- + schema-embedded.ts.
+CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger SET search_path = pg_catalog, public AS $$
 DECLARE
   timeline_text TEXT;
 BEGIN
@@ -1008,7 +1113,6 @@ BEGIN
 
   NEW.search_vector :=
     setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(NEW.compiled_truth, '')), 'B') ||
     setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
     setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
 
@@ -1084,7 +1188,7 @@ export function getPGLiteSchema(
     throw new Error(`Invalid embedding dimensions: ${dims}`);
   }
   const sanitizedModel = String(model).replace(/'/g, "''");
-  return applyChunkEmbeddingIndexPolicy(PGLITE_SCHEMA_SQL_TEMPLATE, parsedDims)
+  return applyFtsLanguagePolicy(applyChunkEmbeddingIndexPolicy(PGLITE_SCHEMA_SQL_TEMPLATE, parsedDims))
     .replace(/__EMBEDDING_DIMS__/g, String(parsedDims))
     .replace(/__EMBEDDING_MODEL__/g, sanitizedModel);
 }

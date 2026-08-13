@@ -10,10 +10,11 @@
  * __setTestEngineOverride so we don't need a configured brain.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
@@ -236,6 +237,73 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     const rows = await (engine as any).db.query('SELECT row_num FROM facts');
     expect(rows.rows[0].row_num).toBeNull();
   });
+
+  test('fails before writing when configured local_path does not exist', async () => {
+    const missingPath = join(brainDir, 'missing-checkout');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+      [missingPath],
+    );
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Must stay DB-only' });
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(r.detail).toContain('configured local_path does not exist');
+    expect(existsSync(missingPath)).toBe(false);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT row_num, source_markdown_slug FROM facts',
+    );
+    expect(rows.rows[0]).toMatchObject({ row_num: null, source_markdown_slug: null });
+  });
+});
+
+describe('phaseBFenceFacts — dirty-tree refusal scoping (#927)', () => {
+  let dirtyDir: string;
+
+  beforeEach(async () => {
+    // A second source whose local_path is a git repo with uncommitted changes.
+    dirtyDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-dirty-'));
+    execFileSync('git', ['-C', dirtyDir, 'init', '-q']);
+    writeFileSync(join(dirtyDir, 'uncommitted.md'), 'dirty', 'utf-8');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ('other', 'other', $1)`,
+      [dirtyDir],
+    );
+  });
+
+  afterEach(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(`DELETE FROM sources WHERE id = 'other'`);
+    rmSync(dirtyDir, { recursive: true, force: true });
+  });
+
+  test('no legacy facts at all → complete, dirty unrelated source ignored', async () => {
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('complete');
+    expect(r.detail).toContain('scanned=0');
+  });
+
+  test('facts scoped to a clean source fence despite dirty unrelated source', async () => {
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme' });
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('complete');
+    expect(r.detail).toContain('fenced=1');
+    expect(existsSync(join(brainDir, 'people/alice.md'))).toBe(true);
+  });
+
+  test('still refuses when the TARGETED source is dirty', async () => {
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'F1', source_id: 'other' });
+
+    const r = await __testing.phaseBFenceFacts(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(r.detail).toContain('"other"');
+    expect(r.detail).toContain('uncommitted changes');
+  });
 });
 
 describe('phaseCVerify', () => {
@@ -266,6 +334,28 @@ describe('phaseCVerify', () => {
     expect(r.status).toBe('failed');
     expect(r.detail).toContain('drifted');
     expect(r.detail).toContain('people/alice');
+  });
+
+  test('returns failed when fenced DB rows point at a missing checkout', async () => {
+    const missingPath = join(brainDir, 'lost-checkout');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+      [missingPath],
+    );
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Orphaned fence' });
+    // Reproduce an ephemeral release that stamped the DB before its files vanished.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(
+      `UPDATE facts
+          SET row_num = 1, source_markdown_slug = 'people/alice'
+        WHERE fact = 'Orphaned fence'`,
+    );
+
+    const r = await __testing.phaseCVerify(engine, OPTS);
+    expect(r.status).toBe('failed');
+    expect(r.detail).toContain('configured local_path does not exist');
+    expect(r.detail).toContain('default');
   });
 });
 

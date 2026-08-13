@@ -14,7 +14,7 @@
 // F7b — anything not strictly false is treated as untrusted).
 
 import type { OperationContext } from '../operations.ts';
-import { loadActivePack, type LoadActivePackInput } from './load-active.ts';
+import { loadActivePackForEngine } from './load-active.ts';
 import { sourceScopeOpts } from '../operations.ts';
 import type { ResolvedPack } from './registry.ts';
 import { loadConfig } from '../config.ts';
@@ -96,17 +96,19 @@ export async function loadActivePackForOp(
       // source. If they all agree, use the first; if they diverge, fail
       // closed with a permission_denied to surface the drift instead of
       // arbitrary pack selection.
-      const { resolveActivePackName } = await import('./registry.ts');
       const cfg = loadConfig();
       const packNames = new Set<string>();
+      let firstPack: ResolvedPack | null = null;
       for (const sid of scope.sourceIds) {
-        const res = resolveActivePackName({
+        const { pack } = await loadActivePackForEngine({
+          engine: ctx.engine,
+          cfg,
           remote: ctx.remote ?? true,
-          envVar: process.env.GBRAIN_SCHEMA_PACK?.trim() || undefined,
+          perCall,
           sourceId: sid,
-          homeConfig: cfg?.schema_pack?.trim() || undefined,
         });
-        packNames.add(res.pack_name);
+        firstPack ??= pack;
+        packNames.add(pack.manifest.name);
       }
       if (packNames.size > 1) {
         throw new SchemaPackTrustGateError(
@@ -115,16 +117,17 @@ export async function loadActivePackForOp(
           `register an OAuth client scoped to a single source OR have the sources agree on one pack.`,
         );
       }
-      sourceId = scope.sourceIds[0];
+      return firstPack!;
     }
   } else {
     sourceId = scope.sourceId;
   }
-  const input: LoadActivePackInput = {
+  const { pack } = await loadActivePackForEngine({
+    engine: ctx.engine,
     cfg: loadConfig(),
     remote: ctx.remote ?? true, // fail-closed default
     perCall,
     sourceId,
-  };
-  return await loadActivePack(input);
+  });
+  return pack;
 }

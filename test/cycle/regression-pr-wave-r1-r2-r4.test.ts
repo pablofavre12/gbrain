@@ -32,22 +32,28 @@ if (!get_page) throw new Error('get_page op missing');
 if (!put_page) throw new Error('put_page op missing');
 
 function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
+  const alicePage = {
+    id: 1,
+    slug: 'people/alice',
+    type: 'person',
+    title: 'Alice',
+    compiled_truth: 'stub',
+    timeline: '',
+    tags: [],
+    created_at: new Date('2026-05-24'),
+    updated_at: new Date('2026-05-24'),
+    content_hash: 'sha-stub',
+    source_id: 'default',
+    effective_date: null,
+    deleted_at: null,
+  };
   const engine = {
-    getPage: async (_slug: string) => ({
-      id: 1,
-      slug: 'people/alice',
-      type: 'person',
-      title: 'Alice',
-      compiled_truth: 'stub',
-      timeline: '',
-      tags: [],
-      created_at: new Date('2026-05-24'),
-      updated_at: new Date('2026-05-24'),
-      content_hash: 'sha-stub',
-      source_id: 'default',
-      effective_date: null,
-      deleted_at: null,
-    }),
+    getPage: async (_slug: string) => alicePage,
+    // v119: get_page reads via getPageLayers (union-of-sources). The mock
+    // returns a single layer so the handler takes the backward-compatible
+    // single-page path. Without this the handler throws "getPageLayers is not
+    // a function" (the mock predates the v119 get_page refactor).
+    getPageLayers: async (_slug: string) => [alicePage],
     getTags: async () => [],
     resolveSlugs: async () => [],
     putPage: async () => ({ slug: 'stub', id: 1, created: true }),

@@ -46,6 +46,14 @@ export {
 } from './closure.ts';
 
 export {
+  type BorrowedTypes,
+  mergeByKey,
+  mergeUnion,
+  mergePageTypes,
+  mergeInheritedManifest,
+} from './merge.ts';
+
+export {
   type SourceClosureBinding,
   buildPerSourceBindings,
   buildSourceClosureCte,
@@ -90,10 +98,14 @@ export {
 
 export {
   loadActivePack,
+  loadActivePackForEngine,
   resolveActivePackNameOnly,
   __setPackLocatorForTests,
   _resetPackLocatorForTests,
   type LoadActivePackInput,
+  type LoadActivePackForEngineInput,
+  type ActivePackForEngine,
+  type SchemaPackConfigReader,
   type PackLocator,
 } from './load-active.ts';
 
@@ -178,6 +190,9 @@ export {
   removeLinkTypeFromPack,
   setExtractableOnType,
   setExpertRoutingOnType,
+  type BatchMutationRequest,
+  type BatchMutationResult,
+  applyMutationsAtomic,
 } from './mutate.ts';
 
 export { invalidateQueryCache } from './query-cache-invalidator.ts';

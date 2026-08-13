@@ -9,7 +9,52 @@ import { loadConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
 import { filterOutEmbedSkipped } from '../core/embed-skip.ts';
 import { runSlidingPool } from '../core/worker-pool.ts';
-import { isAborted, anySignal } from '../core/abort-check.ts';
+import { isAborted, anySignal, AbortError } from '../core/abort-check.ts';
+import { type DbPacer, createDbPacer, createNoopPacer, observed } from '../core/db-pacer.ts';
+import {
+  resolvePaceMode,
+  loadPaceModeConfig,
+  readPaceEnv,
+  type PaceKeyOverrides,
+} from '../core/pace-mode.ts';
+import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
+import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
+import { AITransientError } from '../core/ai/errors.ts';
+import { wrapChunkTextsForStoredMode } from '../core/embedding-context.ts';
+import { titleTierCorpusGeneration } from '../core/contextual-retrieval-service.ts';
+import type { Page } from '../core/types.ts';
+
+/** #3037: cap failure samples so a corpus-wide outage doesn't bloat --json. */
+const FAILURE_SAMPLE_CAP = 10;
+
+/**
+ * #3037: record embed failures on the run result. `chunkCount` is the number
+ * of chunks left un-embedded by this failure (1 for page-level errors where
+ * the chunk count isn't known at the catch site).
+ */
+function recordFailure(result: EmbedResult, chunkCount: number, slug: string, e: unknown): void {
+  result.failures += chunkCount;
+  if (result.failure_samples.length < FAILURE_SAMPLE_CAP) {
+    result.failure_samples.push(`${slug}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * #3507 — after a plain re-embed fully re-embedded a `per_chunk_synopsis`
+ * page at the title-only tier (see wrapChunkTextsForStoredMode), restamp the
+ * page's CR state to 'title' so `contextual_retrieval_mode` keeps describing
+ * the vectors actually in the column. The reindex sweep restores the synopsis
+ * tier later. No-op for every other mode.
+ */
+export async function restampIfDemotedToTitleTier(
+  engine: BrainEngine,
+  page: Pick<Page, 'contextual_retrieval_mode'> | null | undefined,
+  slug: string,
+  sourceId: string,
+): Promise<void> {
+  if (page?.contextual_retrieval_mode !== 'per_chunk_synopsis') return;
+  await engine.updatePageContextualRetrievalState(slug, sourceId, 'title', titleTierCorpusGeneration());
+}
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -71,6 +116,51 @@ export interface EmbedOpts {
    * with the internal wall-clock budget timer via `anySignal`.
    */
   signal?: AbortSignal;
+  /**
+   * DB-contention pacing (paced-backfill). Raw inputs resolved in
+   * runEmbedCore via env > config > bundle (env beats config = incident
+   * escape hatch). `perCallMode` is from `--pace[=mode]`; `perCall` from
+   * `--pace-max-concurrency` etc. Absent ⇒ resolves from env/config (so a
+   * queued job paced by config alone still throttles). Mode `off` ⇒ no-op.
+   */
+  pace?: {
+    perCallMode?: string;
+    perCall?: PaceKeyOverrides;
+  };
+  /**
+   * When the pace overrides were SERIALIZED from a background-job payload (not
+   * typed at an interactive CLI), resolve them at the config tier so
+   * `GBRAIN_PACE_*` on the worker still overrides at execution (Codex P2). Set
+   * by the `embed` job handler; unset for interactive CLI runs.
+   */
+  paceFromBackground?: boolean;
+  /**
+   * E-2 (paced-backfill): single-flight the stale run by taking the SAME
+   * per-source lock the `embed-backfill` minion handler uses, so a hand-run CLI
+   * backfill and a queued job can't grind the same source at once (closing the
+   * NULL→non-NULL upsert race window that paced — longer — runs widen). Set
+   * ONLY by the CLI (`runEmbed`); the minion path already locks. All-source
+   * runs lock every source in sorted order. dryRun skips it.
+   */
+  singleFlight?: boolean;
+  /**
+   * #394: suppress human stdout summaries (the `[dry-run] Would embed ...` /
+   * `Embedded N chunks ...` slog lines). Set by structured-output callers —
+   * the cycle's embed phase (dream --json must keep stdout JSON-clean per
+   * docs/progress-events.md) reports counts via its own PhaseResult instead.
+   * Errors/warnings still go to stderr regardless.
+   */
+  quiet?: boolean;
+  /**
+   * #3391: widen signature-drift invalidation to pages with NO recorded
+   * embedding_signature (pre-v108). By default those are grandfathered
+   * (never invalidated) so a routine upgrade doesn't surprise-re-embed a
+   * whole corpus — but after a provider/model swap the grandfather clause
+   * silently leaves them in the OLD embedding space, mixing two vector
+   * spaces in one index. `gbrain migrate embeddings` and
+   * `gbrain embed --stale --include-null-signature` set this.
+   */
+  includeNullSignature?: boolean;
 }
 
 /**
@@ -92,8 +182,40 @@ export interface EmbedResult {
   total_chunks: number;
   /** Number of pages processed (whether or not they had stale chunks). */
   pages_processed: number;
+  /**
+   * #3037: chunks that FAILED to embed this run (batch failures + per-chunk
+   * isolation failures). Callers must not read total silence as success:
+   * `src/cli.ts` turns `failures > 0` into a non-zero exit verdict (mirrors
+   * the `import` errors>0 guard), and structured consumers (--json, minion
+   * handlers) can surface it. 0 on a clean run. Additive field.
+   */
+  failures: number;
+  /**
+   * #3037: up to 10 `slug: error-message` samples of what failed, so the
+   * operator gets a diagnosis without scrolling stderr. Capped so a
+   * corpus-wide outage doesn't bloat structured output. Additive field.
+   */
+  failure_samples: string[];
   /** True if this run was a dry-run. */
   dryRun: boolean;
+  /**
+   * E1 (paced-backfill): end-of-run pacing telemetry. Present ONLY when pacing
+   * was active (enabled bundle). The number the operator could not get from an
+   * external wrapper ("zero pauses" ≠ "queue safe").
+   */
+  pacing?: {
+    maxConcurrency: number;
+    /** In-band latency samples folded into the EWMA. */
+    samples: number;
+    /** Final EWMA of observed DB-op latency (ms), or null if no samples. */
+    ewmaMs: number | null;
+    /** Cumulative cooperative-sleep time (ms). */
+    totalSleptMs: number;
+    /** Number of cooperative sleeps. */
+    sleeps: number;
+    /** High-water mark of acquirers blocked on the permit (sync path). */
+    maxWaiters: number;
+  };
 }
 
 /**
@@ -192,6 +314,8 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     would_embed: 0,
     total_chunks: 0,
     pages_processed: 0,
+    failures: 0,
+    failure_samples: [],
     dryRun: !!opts.dryRun,
   };
 
@@ -199,29 +323,215 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     for (const s of opts.slugs) {
       if (isAborted(opts.signal)) break; // #1737: stop the per-slug loop on abort
       try {
-        await embedPage(engine, s, !!opts.dryRun, result, opts.sourceId, opts.signal);
+        await embedPage(engine, s, !!opts.dryRun, result, opts.sourceId, opts.signal, opts.quiet);
       } catch (e: unknown) {
+        if (isAborted(opts.signal)) break; // shutdown, not a failure
+        // #3037: a page-level error (not found, DB write) must not exit 0.
+        // Chunk-level embed failures are counted inside embedPage; this
+        // counts the page itself (chunk count unknown at this site).
+        recordFailure(result, 1, s, e);
         serr(`  Error embedding ${s}: ${e instanceof Error ? e.message : e}`);
       }
     }
     return result;
   }
   if (opts.all || opts.stale) {
-    await embedAll(engine, !!opts.stale, !!opts.dryRun, result, opts.onProgress, opts.sourceId, {
-      batchSize: opts.batchSize,
-      priority: opts.priority,
-      catchUp: opts.catchUp,
-    }, opts.signal);
+    // E-2 (paced-backfill): CLI single-flight. Take the SAME per-source lock as
+    // the embed-backfill minion handler so a hand-run backfill and a queued job
+    // are mutually exclusive per source. All-source runs lock every source in
+    // sorted (deterministic) order to avoid acquire-order deadlock. Released in
+    // the finally below. Skipped for dryRun and when the caller didn't opt in
+    // (cycle / catch-up / sync-auto-embed callers never single-flight).
+    const sfLocks: DbLockHandle[] = [];
+    if (opts.singleFlight && opts.stale && !opts.dryRun) {
+      let lockSourceIds: string[];
+      if (opts.sourceId) {
+        lockSourceIds = [opts.sourceId];
+      } else {
+        try {
+          const rows = await engine.listAllSources();
+          lockSourceIds = rows.map((r) => r.id).sort();
+        } catch {
+          lockSourceIds = [];
+        }
+      }
+      for (const sid of lockSourceIds) {
+        let lock: DbLockHandle | null = null;
+        try {
+          lock = await tryAcquireDbLock(engine, embedBackfillLockId(sid), 60);
+        } catch {
+          // Fail-open: a lock-subsystem error must not crash a backfill. Drop
+          // single-flight for this run (release what we took) and proceed.
+          for (const h of sfLocks) {
+            try { await h.release(); } catch { /* best-effort */ }
+          }
+          sfLocks.length = 0;
+          break;
+        }
+        if (!lock) {
+          // Another backfill (CLI or job) holds this source. Release what we
+          // took and bail cleanly rather than racing the upsert path.
+          for (const h of sfLocks) {
+            try { await h.release(); } catch { /* best-effort */ }
+          }
+          serr(`  [embed] another backfill is already running for source "${sid}"; skipping (single-flight).`);
+          return result;
+        }
+        sfLocks.push(lock);
+      }
+    }
+
+    // Resolve DB-contention pacing (env > config > bundle; env is the
+    // incident escape hatch). dryRun skips it — no writes to pace. A
+    // disabled bundle yields a no-op pacer (zero overhead on the hot path).
+    let pacer: DbPacer = createNoopPacer();
+    let paceMaxConcurrency: number | undefined;
+    if (!opts.dryRun) {
+      try {
+        const cfg = await loadPaceModeConfig(engine);
+        const { envMode, envOverrides } = readPaceEnv();
+        // Codex P2: an interactive CLI flag (--pace) is the most immediate
+        // intent and sits at the per-call tier (beats env). But a flag
+        // SERIALIZED into a background job payload must sit at the CONFIG tier
+        // so GBRAIN_PACE_* on the worker can still override it at execution
+        // (incident escape hatch). paceFromBackground distinguishes the two.
+        const fromBg = !!opts.paceFromBackground;
+        const knobs = resolvePaceMode({
+          mode: fromBg ? (opts.pace?.perCallMode ?? cfg.mode) : cfg.mode,
+          configOverrides: fromBg
+            ? { ...cfg.configOverrides, ...(opts.pace?.perCall ?? {}) }
+            : cfg.configOverrides,
+          envMode,
+          envOverrides,
+          perCallMode: fromBg ? undefined : opts.pace?.perCallMode,
+          perCall: fromBg ? undefined : opts.pace?.perCall,
+        });
+        if (knobs.enabled) {
+          pacer = createDbPacer({ bundle: knobs });
+          paceMaxConcurrency = knobs.maxConcurrency;
+        }
+      } catch {
+        // Fail-open: pacing must never break a backfill.
+        pacer = createNoopPacer();
+      }
+    }
+    try {
+      await embedAll(engine, !!opts.stale, !!opts.dryRun, result, opts.onProgress, opts.sourceId, {
+        batchSize: opts.batchSize,
+        priority: opts.priority,
+        catchUp: opts.catchUp,
+        pacer,
+        paceMaxConcurrency,
+        quiet: opts.quiet,
+        includeNullSignature: opts.includeNullSignature,
+      }, opts.signal);
+    } finally {
+      // E1: surface pacing telemetry (human + structured) when pacing was on.
+      const snap = pacer.snapshot();
+      if (snap.enabled) {
+        result.pacing = {
+          maxConcurrency: snap.maxConcurrency,
+          samples: snap.sampleCount,
+          ewmaMs: snap.ewmaMs,
+          totalSleptMs: snap.totalSleptMs,
+          sleeps: snap.sleepCount,
+          maxWaiters: snap.maxWaiters,
+        };
+        serr(
+          `  [embed] pacing: cap=${snap.maxConcurrency} samples=${snap.sampleCount} ` +
+            `ewma=${snap.ewmaMs === null ? 'n/a' : Math.round(snap.ewmaMs) + 'ms'} ` +
+            `slept=${snap.totalSleptMs}ms/${snap.sleepCount}`,
+        );
+      }
+      pacer.dispose();
+      // E-2: release single-flight locks (reverse order). Best-effort; the
+      // lock TTL is the backstop if a release fails.
+      for (const h of sfLocks.reverse()) {
+        try { await h.release(); } catch { /* best-effort; TTL covers it */ }
+      }
+    }
     return result;
   }
   if (opts.slug) {
-    await embedPage(engine, opts.slug, !!opts.dryRun, result, opts.sourceId, opts.signal);
+    await embedPage(engine, opts.slug, !!opts.dryRun, result, opts.sourceId, opts.signal, opts.quiet);
     return result;
   }
   throw new Error('No embed target specified. Pass { slug }, { slugs }, { all }, or { stale }.');
 }
 
+/**
+ * Parse the `--pace` family from a CLI arg list. Returns ONLY the explicit
+ * overrides (CX5: never the full resolved bundle) so they can be serialized
+ * into a background-job payload and re-resolved (env > config > bundle) at
+ * execution. Returns undefined when no pace flag is present.
+ *
+ * Recognized: `--pace` (bare ⇒ balanced), `--pace=<mode>`,
+ * `--pace-max-concurrency=<n>` / `--pace-max-concurrency <n>`.
+ */
+export function parsePaceArgs(
+  args: string[],
+): { perCallMode?: string; perCall?: PaceKeyOverrides } | undefined {
+  let perCallMode: string | undefined;
+  let perCall: PaceKeyOverrides | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--pace') {
+      perCallMode = 'balanced';
+    } else if (a.startsWith('--pace=')) {
+      perCallMode = a.slice('--pace='.length) || 'balanced';
+    } else if (a.startsWith('--pace-max-concurrency=')) {
+      const n = parseInt(a.slice('--pace-max-concurrency='.length), 10);
+      if (Number.isFinite(n) && n >= 1) (perCall ??= {}).maxConcurrency = n;
+    } else if (a === '--pace-max-concurrency') {
+      const n = parseInt(args[i + 1] ?? '', 10);
+      if (Number.isFinite(n) && n >= 1) (perCall ??= {}).maxConcurrency = n;
+      i++; // consume the value token so positional parsing can't read it as a slug (Codex P2)
+    }
+  }
+  if (perCallMode === undefined && perCall === undefined) return undefined;
+  return { ...(perCallMode !== undefined && { perCallMode }), ...(perCall && { perCall }) };
+}
+
+/**
+ * Keyless brains: does this invocation qualify for the stale-mode CLEAN
+ * refusal (zero-failure result → exit 0)? The documented always-current chain
+ * for external agent schedulers is `gbrain sync ... && gbrain embed --stale`
+ * (docs/guides/live-sync.md, INSTALL_FOR_AGENTS.md Step 7) — a hard exit 1
+ * here broke that chain on every brain installed keyless (init's no-embedding
+ * mode), which docs/operations/headless-install.md calls a first-class
+ * supported end state whose embed paths "refuse cleanly". Same class as
+ * sync's resolveNoEmbed sentinel (sync.ts), same remedy. Deliberately NARROW:
+ * only the stale spelling (the chain's). An explicit slug, a slugs list, or
+ * the all flag is an explicit request for something impossible on a keyless
+ * brain and keeps exiting 1 via EmbeddingDisabledError. Note the slugs-list
+ * exclusion mirrors the dispatch precedence below: a slugs flag wins over
+ * stale, so a combined invocation is an explicit-slugs run, not a stale run.
+ */
+export function isKeylessStaleRefusal(args: string[], embeddingDisabled: boolean | undefined): boolean {
+  return args.includes('--stale')
+    && !args.includes('--all')
+    && !args.includes('--slugs')
+    && !args.includes('--dry-run')
+    && embeddingDisabled === true;
+}
+
 export async function runEmbed(engine: BrainEngine, args: string[]): Promise<EmbedResult | undefined> {
+  // Keyless clean refusal — see isKeylessStaleRefusal. Checked BEFORE the
+  // background block so we never queue a job that can only fail. stderr only;
+  // stdout stays empty like every other embed outcome (embed has no JSON
+  // result surface — do not invent one here).
+  if (isKeylessStaleRefusal(args, loadConfig()?.embedding_disabled)) {
+    process.stderr.write(
+      '[embed] Embeddings are disabled on this brain (keyless install). '
+      + 'Nothing to backfill; keyword search keeps working. '
+      + 'Enable later: set embedding_model via gbrain config, then re-run gbrain init with the force flag.\n',
+    );
+    return {
+      embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0,
+      pages_processed: 0, failures: 0, failure_samples: [], dryRun: false,
+    };
+  }
+
   // v0.36+ T7: --background submits via Minion queue, returns job_id to
   // stdout, exits. Same semantics in TTY and cron (D9).
   if (args.includes('--background')) {
@@ -239,6 +549,10 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
           dryRun: cleanArgs.includes('--dry-run'),
           slugs: slugsI >= 0 ? cleanArgs.slice(slugsI + 1).filter(a => !a.startsWith('--')) : undefined,
           sourceId: srcI >= 0 ? cleanArgs[srcI + 1] : undefined,
+          // CX1+CX5: carry explicit pace overrides into the `embed` job payload
+          // (the job name CLI --background actually submits). The handler
+          // re-resolves env > config > bundle at execution.
+          ...(parsePaceArgs(cleanArgs) && { pace: parsePaceArgs(cleanArgs) }),
         };
       },
       source: 'cli',
@@ -262,16 +576,20 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   const priorityRaw = priorityIdx >= 0 ? args[priorityIdx + 1] : undefined;
   const priority = priorityRaw === 'recent' ? 'recent' as const : undefined;
   const catchUp = args.includes('--catch-up');
+  // #3391: re-embed pages that predate the embedding_signature stamp too.
+  const includeNullSignature = args.includes('--include-null-signature');
+  const pace = parsePaceArgs(args);
 
   let opts: EmbedOpts;
   if (slugsIdx >= 0) {
     opts = { slugs: args.slice(slugsIdx + 1).filter(a => !a.startsWith('--')), dryRun, sourceId, batchSize, priority, catchUp };
   } else if (all || stale) {
-    opts = { all, stale, dryRun, sourceId, batchSize, priority, catchUp };
+    // E-2: CLI-only single-flight for stale runs (the minion path locks itself).
+    opts = { all, stale, dryRun, sourceId, batchSize, priority, catchUp, ...(pace && { pace }), ...(stale && { singleFlight: true }), ...(includeNullSignature && { includeNullSignature: true }) };
   } else {
     const slug = args.find(a => !a.startsWith('--'));
     if (!slug) {
-      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--dry-run] [--batch-size N] [--priority recent] [--catch-up]');
+      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--dry-run] [--batch-size N] [--priority recent] [--catch-up] [--include-null-signature]');
       process.exit(1);
     }
     opts = { slug, dryRun, sourceId, batchSize, priority, catchUp };
@@ -293,6 +611,12 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   try {
     const result = await runEmbedCore(engine, opts);
     if (progressStarted) progress.finish();
+    // #3037: loud end-of-run summary so failures are visible even when the
+    // per-page stderr lines scrolled away. cli.ts turns failures>0 into a
+    // non-zero exit verdict.
+    if (result.failures > 0) {
+      serr(`[embed] ${result.failures} chunk(s) failed to embed. First error: ${result.failure_samples[0] ?? 'unknown'}`);
+    }
     return result;
   } catch (e) {
     if (progressStarted) progress.finish();
@@ -321,6 +645,7 @@ async function embedPage(
   result: EmbedResult,
   sourceId?: string,
   signal?: AbortSignal,
+  quiet?: boolean,
 ) {
   const opts = sourceId ? { sourceId } : undefined;
   const page = await engine.getPage(slug, opts);
@@ -365,7 +690,7 @@ async function embedPage(
   result.skipped += chunks.length - toEmbed.length;
 
   if (toEmbed.length === 0) {
-    slog(`${slug}: all ${chunks.length} chunks already embedded`);
+    if (!quiet) slog(`${slug}: all ${chunks.length} chunks already embedded`);
     result.pages_processed++;
     return;
   }
@@ -376,12 +701,38 @@ async function embedPage(
     return;
   }
 
-  const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text), { abortSignal: signal });
+  // #3507: embed with the page's STORED wrapping convention (title-tier
+  // contextual prefix when the page was embedded wrapped), not raw
+  // chunk_text — otherwise a re-embed silently strips the contextual
+  // prefixes the sync path applied. fenced_code chunks stay unwrapped.
+  // #3037: per-chunk failure isolation — one bad chunk must not leave the
+  // page's sibling chunks NULL. The wrapped texts (computed once) feed the
+  // fan-out too, so an isolation retry never strips the prefixes. Total
+  // embed failure is recorded here (where the chunk count is known) and
+  // swallowed: the page stays NULL exactly as before, but the run now
+  // reports it (result.failures → non-zero exit) instead of pretending
+  // success. Abort (shutdown) still propagates.
+  let embeddings: (Float32Array | null)[];
+  let failed = 0;
+  let firstError: unknown;
+  try {
+    ({ embeddings, failed, firstError } = await embedPageTexts(
+      wrapChunkTextsForStoredMode(page, toEmbed),
+      signal ? { abortSignal: signal } : {},
+    ));
+  } catch (e: unknown) {
+    if (isAborted(signal)) throw e;
+    recordFailure(result, toEmbed.length, slug, e);
+    result.pages_processed++;
+    serr(`  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
+    return;
+  }
   const embeddingMap = new Map<number, Float32Array>();
   for (let j = 0; j < toEmbed.length; j++) {
-    embeddingMap.set(toEmbed[j].chunk_index, embeddings[j]);
+    const emb = embeddings[j];
+    if (emb) embeddingMap.set(toEmbed[j].chunk_index, emb);
   }
-  const updated: ChunkInput[] = chunks.map(c => ({
+  const updated: ChunkInput[] = chunks.map(c => preserveCodeMetadata(c, {
     chunk_index: c.chunk_index,
     chunk_text: c.chunk_text,
     chunk_source: c.chunk_source,
@@ -396,13 +747,46 @@ async function embedPage(
   // Guard: only stamp when EVERY chunk was (re)embedded this pass. If some
   // chunks were preserved from a prior embed (unknown/old provenance), the
   // page is mixed — don't claim it's current. `embed --all` fully re-embeds
-  // such a page and then stamps it.
-  if (toEmbed.length === chunks.length) {
+  // such a page and then stamps it. #3037: a partial failure leaves failed
+  // chunks NULL, so don't stamp then either.
+  if (failed === 0 && toEmbed.length === chunks.length) {
     await engine.setPageEmbeddingSignature(slug, { sourceId, signature: currentEmbeddingSignature() });
+    // #3507: a fully re-embedded per_chunk_synopsis page landed at the
+    // title tier — keep the stamped mode honest.
+    await restampIfDemotedToTitleTier(engine, page, slug, page.source_id);
   }
-  result.embedded += toEmbed.length;
+  result.embedded += toEmbed.length - failed;
+  if (failed > 0) {
+    recordFailure(result, failed, slug, firstError);
+    serr(`  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${toEmbed.length - failed}`);
+  }
   result.pages_processed++;
-  slog(`${slug}: embedded ${toEmbed.length} chunks`);
+  if (!quiet) slog(`${slug}: embedded ${toEmbed.length - failed} chunks`);
+}
+
+/**
+ * Carry code-chunk metadata (language, symbol_name, symbol_type, line range,
+ * parent scope, doc comment, qualified name) from a loaded Chunk back into a
+ * ChunkInput destined for upsertChunks.
+ *
+ * Issue #769: every re-embed used to strip these fields, and upsertChunks
+ * overwrites (does not COALESCE) the metadata columns from EXCLUDED, so
+ * each pass clobbered code-def's primary index to NULL. Pulling the
+ * preservation into one helper keeps the three re-embed call sites
+ * (embedPage, embedAll non-stale, embedAllStale) in lock-step.
+ */
+function preserveCodeMetadata(loaded: any, base: ChunkInput): ChunkInput {
+  return {
+    ...base,
+    language: loaded.language ?? undefined,
+    symbol_name: loaded.symbol_name ?? undefined,
+    symbol_type: loaded.symbol_type ?? undefined,
+    start_line: loaded.start_line ?? undefined,
+    end_line: loaded.end_line ?? undefined,
+    parent_symbol_path: loaded.parent_symbol_path ?? undefined,
+    doc_comment: loaded.doc_comment ?? undefined,
+    symbol_name_qualified: loaded.symbol_name_qualified ?? undefined,
+  };
 }
 
 async function embedAll(
@@ -416,6 +800,14 @@ async function embedAll(
     batchSize?: number;
     priority?: 'recent';
     catchUp?: boolean;
+    /** DB-contention pacer (paced-backfill); no-op when pacing is off. */
+    pacer?: DbPacer;
+    /** Resolved concurrency cap (E-1: the worker count, no separate permit). */
+    paceMaxConcurrency?: number;
+    /** #394: suppress human stdout summaries (structured-output callers). */
+    quiet?: boolean;
+    /** #3391: lift the NULL-signature grandfather clause (see EmbedOpts). */
+    includeNullSignature?: boolean;
   },
   signal?: AbortSignal,
 ) {
@@ -443,6 +835,10 @@ async function embedAll(
     return await embedAllStale(engine, sourceId, dryRun, result, onProgress, staleOpts, signature, signal);
   }
 
+  // --all path: pacer (no-op when off). E-1: lower the worker count to the
+  // resolved cap instead of adding a separate permit.
+  const pacer = staleOpts?.pacer ?? createNoopPacer();
+
   // v0.31.12: when sourceId is set, scope listPages to that source.
   // v0.41 (D8 + Codex r2 #11): apply embed-skip filter via the shared
   // helper so the `--all` path honors `frontmatter.embed_skip` the same
@@ -466,7 +862,13 @@ async function embedAll(
   // (3000+/min for tier 1 = 50+/sec, 20 parallel is safely below) and
   // avoids overwhelming postgres connection pools. Users can tune via
   // GBRAIN_EMBED_CONCURRENCY env var based on their tier/infra.
-  const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
+  // Paced runs lower this to the resolved cap (the real lever vs pooler-slot
+  // starvation); unpaced keeps the env/default 20. Codex P2: only ever LOWER —
+  // never raise above an operator's existing env cap.
+  const BASE_CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
+  const CONCURRENCY = staleOpts?.paceMaxConcurrency
+    ? Math.min(BASE_CONCURRENCY, staleOpts.paceMaxConcurrency)
+    : BASE_CONCURRENCY;
 
   async function embedOnePage(page: typeof pages[number]) {
     // #1737: bail before doing any work for this page if the run was aborted.
@@ -475,7 +877,7 @@ async function embedAll(
     // target the correct (source_id, slug) row, not the 'default' source.
     const pageSourceId = page.source_id;
     const pageOpts = pageSourceId ? { sourceId: pageSourceId } : undefined;
-    const chunks = await engine.getChunks(page.slug, pageOpts);
+    const chunks = await observed(pacer, () => engine.getChunks(page.slug, pageOpts));
     const toEmbed = chunks; // staleOnly path handled above via embedAllStale
 
     result.total_chunks += chunks.length;
@@ -497,32 +899,68 @@ async function embedAll(
     }
 
     try {
-      const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text));
+      // #3507: reproduce the page's stored wrapping convention (see embedPage).
+      // #3037: per-chunk failure isolation — one bad chunk costs one chunk,
+      // not the whole page's siblings. The wrapped texts feed the fan-out
+      // too, so an isolation retry never strips the contextual prefixes.
+      const { embeddings, failed, firstError } = await embedPageTexts(
+        wrapChunkTextsForStoredMode(page, toEmbed),
+        signal ? { abortSignal: signal } : {},
+      );
       // Build a map of new embeddings by chunk_index
       const embeddingMap = new Map<number, Float32Array>();
       for (let j = 0; j < toEmbed.length; j++) {
-        embeddingMap.set(toEmbed[j].chunk_index, embeddings[j]);
+        const emb = embeddings[j];
+        if (emb) embeddingMap.set(toEmbed[j].chunk_index, emb);
       }
-      // Preserve ALL chunks, only update embeddings for stale ones
-      const updated: ChunkInput[] = chunks.map(c => ({
+      // Preserve ALL chunks, only update embeddings for stale ones.
+      // preserveCodeMetadata threads code-chunk metadata (#769) so re-embed
+      // doesn't clobber language/symbol_name/symbol_type to NULL.
+      const updated: ChunkInput[] = chunks.map(c => preserveCodeMetadata(c, {
         chunk_index: c.chunk_index,
         chunk_text: c.chunk_text,
         chunk_source: c.chunk_source,
         embedding: embeddingMap.get(c.chunk_index) ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
-      await engine.upsertChunks(page.slug, updated, pageOpts);
+      await observed(pacer, () => engine.upsertChunks(page.slug, updated, pageOpts));
       // v0.41.31: stamp embedding provenance so a later model swap is
-      // detectable as stale.
-      await engine.setPageEmbeddingSignature(page.slug, { sourceId: pageSourceId, signature });
-      result.embedded += toEmbed.length;
+      // detectable as stale. #3037: not on partial failure — failed chunks
+      // stay NULL under unknown provenance.
+      if (failed === 0) {
+        await observed(pacer, () =>
+          engine.setPageEmbeddingSignature(page.slug, { sourceId: pageSourceId, signature }),
+        );
+        // #3507: --all fully re-embeds; a per_chunk_synopsis page landed at
+        // the title tier — keep the stamped mode honest. #3037: gated on
+        // failed === 0 — a partially-failed page was NOT fully re-embedded,
+        // so restamping would make contextual_retrieval_mode lie again
+        // (the exact #3461 bug).
+        await observed(pacer, () =>
+          restampIfDemotedToTitleTier(engine, page, page.slug, pageSourceId),
+        );
+      }
+      result.embedded += toEmbed.length - failed;
+      if (failed > 0) {
+        recordFailure(result, failed, page.slug, firstError);
+        serr(`\n  ${page.slug}: ${failed} chunk(s) failed to embed; embedded the other ${toEmbed.length - failed}`);
+      }
     } catch (e: unknown) {
+      // #3037: count the darkened page so the run can't exit 0 (abort is a
+      // shutdown, not a failure).
+      if (!isAborted(signal)) recordFailure(result, toEmbed.length, page.slug, e);
       serr(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
     }
 
     processed++;
     result.pages_processed++;
     onProgress?.(processed, pages.length, result.embedded);
+    // Cooperative DB-contention pace between pages (no-op when unpaced).
+    try {
+      await pacer.pace(signal);
+    } catch (e) {
+      if (!(e instanceof AbortError)) throw e;
+    }
   }
 
   // v0.41.15.0: sliding worker pool extracted into src/core/worker-pool.ts.
@@ -541,10 +979,12 @@ async function embedAll(
   });
 
   // Stdout summary preserved for scripts/tests that grep for counts.
-  if (dryRun) {
-    slog(`[dry-run] Would embed ${result.would_embed} chunks across ${pages.length} pages`);
-  } else {
-    slog(`Embedded ${result.embedded} chunks across ${pages.length} pages`);
+  if (!staleOpts?.quiet) {
+    if (dryRun) {
+      slog(`[dry-run] Would embed ${result.would_embed} chunks across ${pages.length} pages`);
+    } else {
+      slog(`Embedded ${result.embedded} chunks across ${pages.length} pages`);
+    }
   }
 }
 
@@ -576,6 +1016,14 @@ async function embedAllStale(
     batchSize?: number;
     priority?: 'recent';
     catchUp?: boolean;
+    /** DB-contention pacer (paced-backfill); no-op when pacing is off. */
+    pacer?: DbPacer;
+    /** Resolved concurrency cap (E-1: the worker count, no separate permit). */
+    paceMaxConcurrency?: number;
+    /** #394: suppress human stdout summaries (structured-output callers). */
+    quiet?: boolean;
+    /** #3391: lift the NULL-signature grandfather clause (see EmbedOpts). */
+    includeNullSignature?: boolean;
   },
   signature?: string,
   externalSignal?: AbortSignal,
@@ -583,6 +1031,7 @@ async function embedAllStale(
   // D7: thread sourceId so source-scoped runs only count + visit
   // that source's NULL embeddings.
   const sourceOpt = sourceId ? { sourceId } : undefined;
+  const includeNullSig = !!staleOpts?.includeNullSignature;
 
   // v0.41.31: re-embed pages whose embedding_signature drifted (model/dims
   // swap). dry-run must NOT mutate, so it counts signature-stale via the
@@ -592,22 +1041,54 @@ async function embedAllStale(
     const invalidated = await engine.invalidateStaleSignatureEmbeddings({
       signature,
       ...(sourceId && { sourceId }),
+      ...(includeNullSig && { includeNullSignature: true }),
     });
-    if (invalidated > 0) {
+    if (invalidated > 0 && !staleOpts?.quiet) {
       slog(`[embed] invalidated ${invalidated} chunk(s) embedded under a prior model signature`);
+    }
+    // #3391: the grandfather clause keeps NULL-signature pages on their OLD
+    // vectors — two embedding spaces mixed in one index. Loud stderr warning
+    // with the fix, instead of silent retrieval degradation.
+    //
+    // Deliberately NOT gated on `invalidated > 0`: the original bug report's
+    // shape is a brain where EVERY embedded page predates the signature stamp,
+    // so nothing drifts, nothing is invalidated — and pre-fix that brain got
+    // no warning AND no work, the exact silent case #3391 is about. The probe
+    // below computes the left-behind count directly, which is 0 on a healthy
+    // brain, so an unaffected run stays quiet.
+    if (!includeNullSig) {
+      try {
+        const wide = await engine.countStaleChunks({ ...sourceOpt, signature, includeNullSignature: true });
+        const narrow = await engine.countStaleChunks({ ...sourceOpt, signature });
+        const leftBehind = wide - narrow;
+        if (leftBehind > 0) {
+          serr(
+            `  [embed] WARNING: ${leftBehind} embedded chunk(s) sit on pages with no recorded ` +
+            `embedding signature and were NOT invalidated — they remain in the previous model's ` +
+            `embedding space. Re-run with --include-null-signature (or use ` +
+            `\`gbrain migrate embeddings\`) to re-embed them.`,
+          );
+        }
+      } catch {
+        // The warning probe is best-effort; never break the embed run.
+      }
     }
   }
 
   // Pre-flight: 0 stale chunks → nothing to do, no further DB reads.
   // dry-run includes signature-drift in the count without mutating.
   const staleCount = await engine.countStaleChunks(
-    dryRun && signature ? { ...sourceOpt, signature } : sourceOpt,
+    dryRun && signature
+      ? { ...sourceOpt, signature, ...(includeNullSig && { includeNullSignature: true }) }
+      : sourceOpt,
   );
   if (staleCount === 0) {
-    if (dryRun) {
-      slog('[dry-run] Would embed 0 chunks (0 stale found)');
-    } else {
-      slog('Embedded 0 chunks (0 stale found)');
+    if (!staleOpts?.quiet) {
+      if (dryRun) {
+        slog('[dry-run] Would embed 0 chunks (0 stale found)');
+      } else {
+        slog('Embedded 0 chunks (0 stale found)');
+      }
     }
     return;
   }
@@ -615,8 +1096,12 @@ async function embedAllStale(
   if (dryRun) {
     result.would_embed += staleCount;
     result.total_chunks += staleCount;
-    if (onProgress) onProgress(1, 1, 0);
-    slog(`[dry-run] Would embed ${staleCount} stale chunks`);
+    // No progress event: a dry run reads a count and processes zero pages, so
+    // there is no page total to report. The previous synthetic onProgress(1,1,0)
+    // made `embed.pages` claim total:1 next to a summary naming a much larger
+    // stale count. docs/progress-events.md allows omitting `total` when it is
+    // not known up front; it does not allow asserting a wrong one.
+    if (!staleOpts?.quiet) slog(`[dry-run] Would embed ${staleCount} stale chunks`);
     return;
   }
 
@@ -626,7 +1111,14 @@ async function embedAllStale(
   // (page_id, chunk_index). Each query finishes in <1s.
   // v0.41.18.0 (A13): --batch-size N CLI flag overrides hardcoded 2000 default.
   const PAGE_SIZE = staleOpts?.batchSize ?? 2000;
-  const CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
+  // Paced runs lower concurrency to the resolved cap (E-1: worker count IS the
+  // lever on this single pool, no separate permit). Codex P2: pacing only ever
+  // LOWERS concurrency — never raise above an operator's existing env cap.
+  const BASE_CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
+  const CONCURRENCY = staleOpts?.paceMaxConcurrency
+    ? Math.min(BASE_CONCURRENCY, staleOpts.paceMaxConcurrency)
+    : BASE_CONCURRENCY;
+  const pacer = staleOpts?.pacer ?? createNoopPacer();
 
   // D3 + D3a + D8: wall-clock budget. 30 min default; env override.
   // #1946: --catch-up removes the wall-clock cap. The prior code set BUDGET_MS =
@@ -640,9 +1132,22 @@ async function embedAllStale(
     ? null
     : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
   const budgetController = new AbortController();
-  const budgetTimer = BUDGET_MS != null
+  const budgetStart = Date.now();
+  let budgetTimer = BUDGET_MS != null
     ? setTimeout(() => budgetController.abort(), BUDGET_MS)
     : undefined;
+  // E-4 (paced-backfill): the budget measures WORK, not waiting. After each
+  // batch, re-arm the timer to fire at start + BUDGET + total-paced-sleep, so a
+  // contended DB that spends time in pace() sleeps converges instead of exiting
+  // having embedded little. No-op when unpaced (totalSleptMs stays 0) or in
+  // catch-up (no budget timer).
+  const rearmBudgetForPacing = (): void => {
+    if (BUDGET_MS == null) return;
+    const slept = pacer.snapshot().totalSleptMs;
+    if (budgetTimer) clearTimeout(budgetTimer);
+    const fireInMs = budgetStart + BUDGET_MS + slept - Date.now();
+    budgetTimer = setTimeout(() => budgetController.abort(), Math.max(0, fireInMs));
+  };
   const budgetSignal = budgetController.signal;
   // #1737: the effective signal fires when EITHER the internal wall-clock
   // budget OR the caller's abort (worker timeout / lock loss / SIGTERM) fires.
@@ -665,10 +1170,35 @@ async function embedAllStale(
   let afterUpdatedAt: string | null = null;
   let totalChunksLoaded = 0;
   let budgetExitNotified = false;
-  // #1946 (OV2a): track chunks that errored out so a catch-up pass that finishes
-  // with stale chunks still remaining (un-embeddable for a non-transient reason)
-  // surfaces that loudly instead of looking like a clean run.
-  let embedFailures = 0;
+  // #1946 (OV2a) + #3037: embed failures are tracked on result.failures so
+  // the catch-up warning below AND the CLI exit verdict both see them.
+
+  // E-3 (paced-backfill): bounded end-of-run re-entry. A longer paced run gives
+  // a live writer (sync / put_page) more time to insert NEW stale rows BEHIND
+  // the keyset cursor (TODOS:2301). When the cursor exhausts, re-scan from the
+  // start — capped at MAX_REENTRIES AND requiring forward progress (a pass that
+  // embeds 0 while count>0 stops) so a writer outrunning embed can't spin
+  // forever.
+  const MAX_REENTRIES = 3;
+  let reentries = 0;
+  let lastReentryEmbedded = 0;
+  const maybeReenter = async (): Promise<boolean> => {
+    // Scoped to PACED runs: pacing lengthens the run, which is what widens the
+    // behind-cursor window. Unpaced runs keep prior (single-pass) behavior.
+    if (!pacer.snapshot().enabled) return false;
+    if (effectiveSignal.aborted) return false;
+    if (reentries >= MAX_REENTRIES) return false;
+    const remaining = await engine.countStaleChunks(sourceOpt);
+    if (remaining === 0) return false;
+    if (result.embedded === lastReentryEmbedded) return false; // no forward progress
+    lastReentryEmbedded = result.embedded;
+    reentries++;
+    afterPageId = 0;
+    afterChunkIndex = -1;
+    afterUpdatedAt = null;
+    serr(`\n  [embed] re-entry ${reentries}/${MAX_REENTRIES}: ${remaining} stale chunk(s) appeared during the run; rescanning from start.`);
+    return true;
+  };
 
   try {
     // eslint-disable-next-line no-constant-condition
@@ -684,17 +1214,22 @@ async function embedAllStale(
         break;
       }
 
-      const batch = await engine.listStaleChunks({
-        batchSize: PAGE_SIZE,
-        afterPageId,
-        afterChunkIndex,
-        ...(orderBy === 'updated_desc' && {
-          orderBy,
-          afterUpdatedAt,
+      const batch = await observed(pacer, () =>
+        engine.listStaleChunks({
+          batchSize: PAGE_SIZE,
+          afterPageId,
+          afterChunkIndex,
+          ...(orderBy === 'updated_desc' && {
+            orderBy,
+            afterUpdatedAt,
+          }),
+          ...(sourceId && { sourceId }),
         }),
-        ...(sourceId && { sourceId }),
-      });
-      if (batch.length === 0) break;
+      );
+      if (batch.length === 0) {
+        if (await maybeReenter()) continue;
+        break;
+      }
       totalChunksLoaded += batch.length;
 
       // Advance cursor to last row in this batch.
@@ -727,35 +1262,69 @@ async function embedAllStale(
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
         try {
-          const embeddings = await embedBatchWithBackoff(stale.map(c => c.chunk_text), { abortSignal: effectiveSignal });
+          // #3507: fetch the page row for its title + stored CR mode so the
+          // re-embed reproduces the page's wrapping convention instead of
+          // silently stripping contextual prefixes — `embed --stale` is the
+          // NORMAL post-model-migration path, so raw-text embedding here
+          // quietly converted whole corpora to the unwrapped convention.
+          const pageRow = await observed(pacer, () => engine.getPage(slug, { sourceId: keySourceId }));
+          // #3037: per-chunk failure isolation — one bad chunk costs one
+          // chunk, not the whole page's siblings. The wrapped texts feed the
+          // fan-out too, so an isolation retry never strips the prefixes.
+          const { embeddings, failed, firstError } = await embedPageTexts(
+            wrapChunkTextsForStoredMode(pageRow, stale),
+            { abortSignal: effectiveSignal },
+          );
           // Re-fetch existing chunks and merge to avoid deleting non-stale chunks.
-          const existing = await engine.getChunks(slug, { sourceId: keySourceId });
+          const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
           const staleIdxToEmbedding = new Map<number, Float32Array>();
           for (let j = 0; j < stale.length; j++) {
-            staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
+            const emb = embeddings[j];
+            if (emb) staleIdxToEmbedding.set(stale[j].chunk_index, emb);
           }
-          const merged: ChunkInput[] = existing.map(c => ({
+          // preserveCodeMetadata threads code-chunk metadata (#769) so the
+          // autopilot --stale path doesn't clobber language/symbol_name/etc
+          // to NULL on every cycle.
+          const merged: ChunkInput[] = existing.map(c => preserveCodeMetadata(c, {
             chunk_index: c.chunk_index,
             chunk_text: c.chunk_text,
             chunk_source: c.chunk_source,
             embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
             token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
           }));
-          await engine.upsertChunks(slug, merged, { sourceId: keySourceId });
+          await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
           // v0.41.31: stamp provenance after the page's chunks are embedded —
           // but only when EVERY chunk was stale (fully re-embedded this pass).
           // A partially-stale page keeps preserved chunks of unknown/old
           // provenance, so don't claim it's current. (After invalidate, a
           // signature-drifted page IS fully stale → this stamps it.)
-          if (signature && stale.length === existing.length) {
-            await engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature });
+          // #3037: not on partial failure — failed chunks stay NULL.
+          if (signature && failed === 0 && stale.length === existing.length) {
+            await observed(pacer, () =>
+              engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
+            );
           }
-          result.embedded += stale.length;
+          // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
+          // title tier — keep the stamped mode honest. Partially-stale pages
+          // stay stamped as-is (mixed provenance; reindex sweeps fix them).
+          // #3037: `failed === 0` is part of "fully re-embedded" — if the
+          // per-chunk isolation left some chunks NULL, restamping would make
+          // contextual_retrieval_mode lie again (the exact #3461 bug).
+          if (failed === 0 && stale.length === existing.length) {
+            await observed(pacer, () =>
+              restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId),
+            );
+          }
+          result.embedded += stale.length - failed;
+          if (failed > 0) {
+            recordFailure(result, failed, slug, firstError);
+            serr(`\n  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${stale.length - failed}`);
+          }
         } catch (e: unknown) {
           // Budget/abort-fired cancellations are expected on the way out; don't
           // spam per-page "Error embedding" lines when we're shutting down.
           if (effectiveSignal.aborted) return;
-          embedFailures++;
+          recordFailure(result, stale.length, slug, e);
           serr(`\n  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
         }
         totalProcessedPages++;
@@ -763,6 +1332,17 @@ async function embedAllStale(
         // Use staleCount as the estimated total for progress (not exact after
         // pagination starts, but directionally correct).
         onProgress?.(totalProcessedPages, Math.ceil(staleCount / PAGE_SIZE) * keys.length, result.embedded);
+        // Cooperative DB-contention pace between keys (no-op when unpaced).
+        // E-4 (Codex P1): pace() is subject to the EXTERNAL abort only, NOT the
+        // wall-clock budget — a contended DB's sleep must not be cut by the
+        // budget timer before its time is credited. Re-arm the budget right
+        // after each sleep so accrued sleep never eats into work time.
+        try {
+          await pacer.pace(externalSignal);
+          rearmBudgetForPacing();
+        } catch (e) {
+          if (!(e instanceof AbortError)) throw e;
+        }
       }
 
       // v0.41.15.0: migrated to shared runSlidingPool. The pool checks
@@ -778,25 +1358,33 @@ async function embedAllStale(
         failureLabel: (key) => key,
       });
 
+      // E-4: extend the work budget by any paced-sleep time accrued this batch.
+      rearmBudgetForPacing();
+
       // If we got fewer rows than PAGE_SIZE, we've reached the end.
-      if (batch.length < PAGE_SIZE) break;
+      if (batch.length < PAGE_SIZE) {
+        if (await maybeReenter()) continue;
+        break;
+      }
     }
   } finally {
     if (budgetTimer) clearTimeout(budgetTimer);
   }
 
-  slog(`Embedded ${result.embedded} chunks across ${totalProcessedPages} pages`);
+  if (!staleOpts?.quiet) slog(`Embedded ${result.embedded} chunks across ${totalProcessedPages} pages`);
 
   // #1946 (OV2a): a catch-up pass that completed without being aborted but left
   // chunks unembedded means those chunks are stuck (a non-transient embed
   // failure), not that we ran out of time. Surface it loudly so it doesn't read
   // as a clean run — re-running won't help until the underlying failure is fixed.
-  if (staleOpts?.catchUp && !effectiveSignal.aborted && embedFailures > 0) {
+  if (staleOpts?.catchUp && !effectiveSignal.aborted && result.failures > 0) {
     const remaining = await engine.countStaleChunks(
-      signature ? { signature, ...(sourceId ? { sourceId } : {}) } : (sourceId ? { sourceId } : undefined),
+      signature
+        ? { signature, ...(sourceId ? { sourceId } : {}), ...(includeNullSig && { includeNullSignature: true }) }
+        : (sourceId ? { sourceId } : undefined),
     );
     if (remaining > 0) {
-      serr(`\n  [embed] catch-up finished but ${remaining} chunk(s) remain stale after ${embedFailures} embed failure(s). These are not embeddable as-is; re-running won't clear them until the underlying error is resolved.`);
+      serr(`\n  [embed] catch-up finished but ${remaining} chunk(s) remain stale after ${result.failures} embed failure(s). These are not embeddable as-is; re-running won't clear them until the underlying error is resolved.`);
     }
   }
 }
@@ -916,12 +1504,7 @@ export async function embedBatchWithBackoff(
       // If the budget fired we may have been aborted mid-fetch; bubble out.
       if (signal?.aborted) throw e;
       const msg = e instanceof Error ? e.message : String(e);
-      // D4: structured detection first (handles gateway-wrapped errors via
-      // cause chain); message-match as fallback for providers whose wrappers
-      // strip `cause.status`.
-      const isRateLimit = detect429FromCause(e)
-        || /rate.?limit|429/i.test(msg);
-      if (!isRateLimit || attempt === MAX_RATE_LIMIT_RETRIES) throw e;
+      if (!isRateLimitError(e) || attempt === MAX_RATE_LIMIT_RETRIES) throw e;
 
       const delayMs = parseRetryDelayMs(msg);
       serr(`  [rate-limit] attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}, waiting ${delayMs}ms...`);
@@ -930,4 +1513,87 @@ export async function embedBatchWithBackoff(
   }
   // Unreachable, but TypeScript needs it.
   return embedBatch(texts);
+}
+
+/**
+ * 429 judgment shared by embedBatchWithBackoff (retry decision) and
+ * embedPageTexts (fan-out decision). D4: structured detection first
+ * (gateway-wrapped errors via cause chain); message-match as fallback for
+ * providers whose wrappers strip `cause.status`.
+ */
+function isRateLimitError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return detect429FromCause(e) || /rate.?limit|429/i.test(msg);
+}
+
+/** Walk the cause chain (like detect429FromCause) for the first HTTP status. */
+function statusFromCause(e: unknown): number | undefined {
+  let cur: unknown = e;
+  for (let depth = 0; depth < 5 && cur !== undefined && cur !== null; depth++) {
+    const obj = cur as { status?: unknown; statusCode?: unknown; cause?: unknown };
+    if (typeof obj.status === 'number') return obj.status;
+    if (typeof obj.statusCode === 'number') return obj.statusCode;
+    cur = obj.cause;
+  }
+  return undefined;
+}
+
+/**
+ * #3037: embed one page's chunk texts with per-chunk failure isolation.
+ *
+ * All three embed paths used to send a page's chunks in ONE
+ * embedBatch call, so one bad chunk (e.g. an oversized chunk the provider
+ * 400s) left EVERY sibling chunk NULL — an ~8.6x blast radius. This wrapper
+ * tries the batch first (the cheap, common path), and only on a
+ * PERMANENT-looking batch failure retries once per chunk so one bad chunk
+ * costs one chunk.
+ *
+ * Cost bounding — when we do NOT fan out (rethrow instead):
+ *   - 429 / rate limit: embedBatchWithBackoff already retried with backoff;
+ *     fanning out N single-chunk calls would hammer the same limiter N-fold.
+ *   - AITransientError (5xx / network / unknown, per normalizeAIError): the
+ *     batch CONTENT isn't the problem, so isolation can't help — during an
+ *     outage it would just multiply failing calls per page.
+ *   - 401/403 (auth): nothing chunk-specific; every call would fail.
+ * When we DO fan out (permanent request-shaped 4xx like 400/413/422), the
+ * per-chunk pass happens at most ONCE per page per run and re-spends roughly
+ * the same tokens the failed batch would have — bounded, no recursion. A
+ * fresh 429 arising DURING the fan-out still gets the normal backoff (each
+ * single-chunk call goes through embedBatchWithBackoff).
+ *
+ * Throws when nothing could be embedded (total failure — same contract as
+ * the pre-#3037 single batch call). Returns `null` at the index of each
+ * failed chunk otherwise.
+ */
+async function embedPageTexts(
+  texts: string[],
+  opts: EmbedBatchWithBackoffOpts = {},
+): Promise<{ embeddings: (Float32Array | null)[]; failed: number; firstError?: unknown }> {
+  try {
+    return { embeddings: await embedBatchWithBackoff(texts, opts), failed: 0 };
+  } catch (e: unknown) {
+    if (opts.abortSignal?.aborted) throw e; // shutdown, not a chunk problem
+    if (texts.length <= 1) throw e; // nothing to isolate
+    if (isRateLimitError(e) || e instanceof AITransientError) throw e;
+    const status = statusFromCause(e);
+    if (status === 401 || status === 403) throw e;
+
+    const embeddings: (Float32Array | null)[] = [];
+    let failed = 0;
+    let firstError: unknown;
+    for (const t of texts) {
+      try {
+        const single = await embedBatchWithBackoff([t], opts);
+        embeddings.push(single[0] ?? null);
+        if (single[0] === undefined) { failed++; firstError ??= e; }
+      } catch (chunkErr: unknown) {
+        if (opts.abortSignal?.aborted) throw chunkErr;
+        embeddings.push(null);
+        failed++;
+        firstError ??= chunkErr;
+      }
+    }
+    if (failed === texts.length) throw firstError ?? e; // total failure: pre-#3037 contract
+    return { embeddings, failed, firstError };
+  }
 }

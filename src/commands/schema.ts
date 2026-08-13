@@ -23,9 +23,11 @@ import {
   addAliasToType,
   addLinkTypeToPack,
   addPrefixToType,
+  BUNDLED_PACK_NAMES,
   addTypeToPack,
   invalidatePackCache,
   loadActivePack,
+  loadActivePackForEngine,
   removeAliasFromType,
   removeLinkTypeFromPack,
   removePrefixFromType,
@@ -47,7 +49,7 @@ import {
 } from '../core/schema-pack/index.ts';
 import type { SchemaPackManifest, PackPrimitive } from '../core/schema-pack/manifest-v1.ts';
 import { PACK_PRIMITIVES } from '../core/schema-pack/manifest-v1.ts';
-import { gbrainPath, loadConfig, configPath } from '../core/config.ts';
+import { gbrainPath, loadConfig, configPath, toEngineConfig } from '../core/config.ts';
 
 export async function runSchema(args: string[]): Promise<void> {
   const sub = args[0];
@@ -163,10 +165,30 @@ Resolution chain (7-tier, tier 1 trust-gated):
 `);
 }
 
-async function runActive(_args: string[]): Promise<void> {
+async function runActive(args: string[]): Promise<void> {
+  const { json, source } = parseFlags(args);
   const cfg = loadConfig();
-  const resolution = resolveActivePackNameOnly({ cfg, remote: false });
-  const pack = await loadActivePack({ cfg, remote: false });
+  const { pack, resolution } = cfg?.database_url || cfg?.database_path
+    ? await withConnectedEngine((engine) =>
+        loadActivePackForEngine({ engine, cfg, remote: false, sourceId: source }),
+      )
+    : {
+        pack: await loadActivePack({ cfg, remote: false, sourceId: source }),
+        resolution: resolveActivePackNameOnly({ cfg, remote: false, sourceId: source }),
+      };
+  if (json) {
+    console.log(JSON.stringify({
+      schema_version: 1,
+      source_id: source ?? null,
+      pack_name: pack.manifest.name,
+      version: pack.manifest.version,
+      source_tier: resolution.source,
+      identity: pack.identity,
+      page_types_count: pack.manifest.page_types.length,
+      link_types_count: pack.manifest.link_types.length,
+    }, null, 2));
+    return;
+  }
   console.log(`Active pack: ${pack.manifest.name} v${pack.manifest.version}`);
   console.log(`Source: ${resolution.source}`);
   console.log(`Pack identity: ${pack.identity}`);
@@ -179,7 +201,7 @@ async function runActive(_args: string[]): Promise<void> {
 }
 
 function runList(_args: string[]): void {
-  const bundled = ['gbrain-base', 'gbrain-recommended'];
+  const bundled = [...BUNDLED_PACK_NAMES];
   const installedDir = gbrainPath('schema-packs');
   const installed: string[] = [];
   if (existsSync(installedDir)) {
@@ -366,12 +388,12 @@ function runUse(args: string[]): void {
 }
 
 function packPathByName(name: string): string | null {
-  if (name === 'gbrain-base') {
+  if (BUNDLED_PACK_NAMES.has(name)) {
     // Resolve bundled YAML — try a few locations.
     const here = dirname(new URL(import.meta.url).pathname);
     const candidates = [
-      join(here, '..', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
-      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
+      join(here, '..', 'core', 'schema-pack', 'base', `${name}.yaml`),
+      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
     ];
     for (const c of candidates) {
       if (existsSync(c)) return c;
@@ -433,16 +455,12 @@ function parseFlags(args: string[]): ParsedFlags {
 
 async function withConnectedEngine<T>(fn: (engine: import('../core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
   const { createEngine } = await import('../core/engine-factory.ts');
-  const cfg = loadConfig() ?? {};
-  const engineKind = (cfg as { engine?: string }).engine === 'postgres' ? 'postgres' : 'pglite';
+  const cfg = loadConfig() ?? { engine: 'pglite' as const };
   // PR #1321 (closed) defensive fix retained: build the EngineConfig once and
   // pass it to BOTH createEngine and engine.connect. The factory captures
   // config at construction; explicit re-pass at connect() is defense in depth
   // against future engine implementations that read URL from connect-time.
-  const connectConfig: import('../core/types.ts').EngineConfig = {
-    engine: engineKind,
-    database_url: (cfg as { database_url?: string }).database_url,
-  };
+  const connectConfig = toEngineConfig(cfg);
   const engine = await createEngine(connectConfig);
   await engine.connect(connectConfig);
   try {
@@ -678,9 +696,11 @@ async function runDiffCmd(args: string[]): Promise<void> {
 }
 
 async function runGraphCmd(args: string[]): Promise<void> {
-  const { json } = parseFlags(args);
+  const { json, source } = parseFlags(args);
   const cfg = loadConfig();
-  const pack = await loadActivePack({ cfg, remote: false });
+  const { pack } = await withConnectedEngine((engine) =>
+    loadActivePackForEngine({ engine, cfg, remote: false, sourceId: source }),
+  );
   if (json) {
     console.log(JSON.stringify({
       schema_version: 1,
@@ -699,7 +719,7 @@ async function runGraphCmd(args: string[]): Promise<void> {
 }
 
 async function runLintCmd(args: string[]): Promise<void> {
-  const { json, positional } = parseFlags(args);
+  const { json, source, positional } = parseFlags(args);
   const withDb = args.includes('--with-db');
   const name = positional[0];
   const cfg = loadConfig();
@@ -708,7 +728,9 @@ async function runLintCmd(args: string[]): Promise<void> {
     const p = packPathByName(name);
     try { pack = p ? loadPackFromFile(p) : null; } catch { pack = null; }
   } else {
-    pack = (await loadActivePack({ cfg, remote: false })).manifest;
+    pack = (await withConnectedEngine((engine) =>
+      loadActivePackForEngine({ engine, cfg, remote: false, sourceId: source }),
+    )).pack.manifest;
   }
   if (!pack) {
     console.error(`Pack not found: ${name}`);
@@ -744,14 +766,16 @@ async function runLintCmd(args: string[]): Promise<void> {
 }
 
 async function runExplainCmd(args: string[]): Promise<void> {
-  const { json, positional } = parseFlags(args);
+  const { json, source, positional } = parseFlags(args);
   const typeName = positional[0];
   if (!typeName) {
     console.error('Usage: gbrain schema explain <type-name>  (experimental)');
     process.exit(2);
   }
   const cfg = loadConfig();
-  const pack = await loadActivePack({ cfg, remote: false });
+  const { pack } = await withConnectedEngine((engine) =>
+    loadActivePackForEngine({ engine, cfg, remote: false, sourceId: source }),
+  );
   const found = pack.manifest.page_types.find((t) => t.name === typeName);
   if (!found) {
     console.error(`Type \`${typeName}\` not in active pack \`${pack.manifest.name}\`.`);

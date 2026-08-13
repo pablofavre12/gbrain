@@ -19,7 +19,10 @@
 
 import type { BrainEngine } from './engine.ts';
 import type { ChunkInput } from './types.ts';
-import { embedBatchWithBackoff } from '../commands/embed.ts';
+import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from '../commands/embed.ts';
+import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
+import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
+import { AbortError } from './abort-check.ts';
 
 /** Last visited (page_id, chunk_index) for keyset-resume across runs. */
 export interface StaleCursor {
@@ -59,6 +62,15 @@ export interface EmbedStaleOpts {
    * Omit to keep the legacy `embedding IS NULL`-only behavior.
    */
   embeddingSignature?: string;
+  /**
+   * DB-contention pacer (paced-backfill). When enabled it (a) supplies the
+   * worker count via the caller passing `concurrency = bundle.maxConcurrency`
+   * — E-1: no separate permit on this single-pool path — and (b) the loop
+   * `observe()`s its DB-op latency and `pace()`s between keys. Omit (or pass a
+   * disabled bundle) for a no-op. The pacer is NEVER used to acquire permits
+   * here; concurrency is the worker count.
+   */
+  pacer?: DbPacer;
 }
 
 export interface EmbedStaleResult {
@@ -105,6 +117,9 @@ export async function embedStaleForSource(
   const signal = opts.signal;
   const embedFn = opts.embedFn ?? ((texts, fnOpts) =>
     embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }));
+  // Defaulted no-op when pacing is off, so the observe()/pace() call sites
+  // below are unconditional and cost ~nothing on the unpaced path.
+  const pacer = opts.pacer ?? createNoopPacer();
 
   let afterPageId = opts.cursor?.afterPageId ?? 0;
   let afterChunkIndex = opts.cursor?.afterChunkIndex ?? -1;
@@ -136,12 +151,14 @@ export async function embedStaleForSource(
       return result;
     }
 
-    const batch = await engine.listStaleChunks({
-      batchSize,
-      afterPageId,
-      afterChunkIndex,
-      sourceId,
-    });
+    const batch = await observed(pacer, () =>
+      engine.listStaleChunks({
+        batchSize,
+        afterPageId,
+        afterChunkIndex,
+        sourceId,
+      }),
+    );
     if (batch.length === 0) {
       result.done = true;
       return result;
@@ -173,11 +190,20 @@ export async function embedStaleForSource(
       const keySourceId = stale[0]?.source_id ?? sourceId;
       const slug = stale[0].slug;
       try {
+        // #3507: fetch the page row for its title + stored CR mode so the
+        // re-embed reproduces the page's wrapping convention instead of
+        // silently stripping contextual prefixes (mirrors
+        // src/commands/embed.ts:embedAllStale).
+        const pageRow = await observed(pacer, () =>
+          engine.getPage(slug, { sourceId: keySourceId }),
+        );
         const embeddings = await embedFn(
-          stale.map((c) => c.chunk_text),
+          wrapChunkTextsForStoredMode(pageRow, stale),
           { abortSignal: signal },
         );
-        const existing = await engine.getChunks(slug, { sourceId: keySourceId });
+        const existing = await observed(pacer, () =>
+          engine.getChunks(slug, { sourceId: keySourceId }),
+        );
         const staleIdxToEmbedding = new Map<number, Float32Array>();
         for (let j = 0; j < stale.length; j++) {
           staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
@@ -188,14 +214,39 @@ export async function embedStaleForSource(
           chunk_source: c.chunk_source,
           embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
           token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
+          // Carry through per-chunk metadata. upsertChunks writes these as
+          // EXCLUDED.<col> (not COALESCE), so omitting them here resets image
+          // rows to modality='text' (breaking the image search arm's
+          // modality='image' filter) and wipes code-chunk symbol metadata on
+          // every embed-stale pass. embedding_image is deliberately NOT
+          // carried: the upsert COALESCEs it, and getChunks returns the
+          // pgvector as a string which upsertChunks would mis-serialize.
+          modality: c.modality ?? undefined,
+          language: c.language ?? undefined,
+          symbol_name: c.symbol_name ?? undefined,
+          symbol_type: c.symbol_type ?? undefined,
+          start_line: c.start_line ?? undefined,
+          end_line: c.end_line ?? undefined,
+          parent_symbol_path: c.parent_symbol_path ?? undefined,
+          doc_comment: c.doc_comment ?? undefined,
+          symbol_name_qualified: c.symbol_name_qualified ?? undefined,
         }));
-        await engine.upsertChunks(slug, merged, { sourceId: keySourceId });
+        await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
         // v0.41.31: stamp provenance only when EVERY chunk was stale (fully
         // re-embedded this pass) — a partially-stale page keeps preserved
         // chunks of unknown provenance, so don't claim current. After the
         // invalidate pass above, signature-drifted pages ARE fully stale.
         if (signature && stale.length === existing.length) {
-          await engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature });
+          await observed(pacer, () =>
+            engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
+          );
+        }
+        // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
+        // title tier — keep the stamped mode honest (mixed pages stay as-is).
+        if (stale.length === existing.length) {
+          await observed(pacer, () =>
+            restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId),
+          );
         }
         result.embedded += stale.length;
         result.pagesProcessed += 1;
@@ -215,6 +266,15 @@ export async function embedStaleForSource(
       while (nextIdx < keys.length && !signal?.aborted) {
         const idx = nextIdx++;
         await embedOneKey(keys[idx]);
+        // Cooperative DB-contention pace between keys (no-op when unpaced).
+        // pace() throws AbortError on cancel — treat as graceful worker exit;
+        // the for(;;) loop sees signal.aborted and returns aborted next tick.
+        try {
+          await pacer.pace(signal);
+        } catch (e) {
+          if (e instanceof AbortError) return;
+          throw e;
+        }
       }
     }
 
