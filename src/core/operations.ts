@@ -1641,7 +1641,12 @@ const put_page: Operation = {
     // enforceSubagentSlugFence for the fail-closed policy.
     enforceSubagentSlugFence(ctx, slug, 'put_page');
     enforceClientSlugFence(ctx, slug, 'put_page');
-    await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
+    // Local callers are trusted and importFromContent performs its own existing-page
+    // lookup. Avoid a redundant preflight read that would perturb write/read-back
+    // verification; remote callers still fail closed through the page ACL gate.
+    if (ctx.remote !== false) {
+      await loadAuthorizedPageWriteTarget(ctx, slug, writeSourceId);
+    }
 
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug, source: writeSourceId };
 
@@ -3885,7 +3890,10 @@ const get_versions: Operation = {
     // ACL gate before opening the historical body channel. Version rows do
     // not duplicate page ACLs; authorization is inherited from the current
     // stable page identity and checked server-side here.
-    const page = await ctx.engine.getPage(p.slug as string, sourceScopeOpts(ctx));
+    const page = await ctx.engine.getPage(p.slug as string, {
+      ...sourceScopeOpts(ctx),
+      ...pageAccessOpts(ctx),
+    });
     if (!page) return [];
     const versions = await ctx.engine.getVersions(p.slug as string, {
       sourceId: page.source_id,

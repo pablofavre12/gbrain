@@ -182,6 +182,7 @@ export async function loadActivePackForEngine(
   input: LoadActivePackForEngineInput,
 ): Promise<ActivePackForEngine> {
   const readConfig = async (key: string): Promise<string | undefined> => {
+    if (typeof (input.engine as Partial<SchemaPackConfigReader>).getConfig !== 'function') return undefined;
     try {
       return normalizeConfigValue(await input.engine.getConfig(key));
     } catch (error) {
