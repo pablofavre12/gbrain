@@ -7022,12 +7022,12 @@ export async function buildChecks(
     // Bug 11 — brain_score breakdown. When the total is < 100, show which
     // components contributed the deficit so users know what to fix.
     // Uses distinct *_score field names (not overloading link_coverage /
-    // timeline_coverage, which are entity-scoped).
+    // timeline_coverage, which is the entity-scoped fraction behind the score).
     if (health.brain_score < 100) {
       const parts = [
         `embed ${health.embed_coverage_score}/35`,
         `links ${health.link_density_score}/25`,
-        `timeline density (all pages) ${health.timeline_coverage_score}/15`,
+        `entity timeline coverage ${health.timeline_coverage_score}/15`,
         `orphans ${health.no_orphans_score}/15`,
         `dead-links ${health.no_dead_links_score}/10`,
       ];

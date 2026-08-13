@@ -1410,7 +1410,7 @@ export function formatResult(
         lines.push(`Timeline coverage (entity pages): ${(h.timeline_coverage * 100).toFixed(1)}%`);
       }
       if (h.timeline_coverage_score !== undefined) {
-        lines.push(`Timeline density (all pages): ${h.timeline_coverage_score}/15 (whole-brain brain-score component)`);
+        lines.push(`Timeline coverage score (entity pages): ${h.timeline_coverage_score}/15`);
       }
       if (Array.isArray(h.most_connected) && h.most_connected.length > 0) {
         lines.push('Most connected entities:');

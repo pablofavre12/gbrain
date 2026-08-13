@@ -5,20 +5,20 @@
  *   - Metric A `timeline_coverage` (entity-scoped, fraction 0–1):
  *       eligible entity pages WITH a timeline entry / eligible entity pages
  *     -> surfaced by `graph_coverage` check AND `get_health` CLI entity line.
- *   - Metric B `timeline_coverage_score` (whole-brain, 0–15 brain-score component):
- *       all pages WITH a timeline entry / all pages
+ *   - Metric B `timeline_coverage_score` (entity-scoped, 0–15 brain-score component):
+ *       rounded Metric A * 15
  *     -> surfaced by `brain_score` component breakdown AND (separately) CLI.
  *
- * The two have DIFFERENT numerators/denominators. This PR labels each
- * explicitly and keeps BOTH the entity CLI line and the whole-brain line.
+ * The two use the SAME entity denominator: one is a fraction and the other is
+ * its 15-point score. This keeps displayed coverage and scoring consistent.
  *
  * Tests (no private EriadorMu data, no production/home DB, no network):
- *   - numeric denominator assertions (Metric A = 50%, Metric B = 4/15)
+ *   - numeric denominator assertions (Metric A = 50%, Metric B = 8/15)
  *   - doctor rendered-message assertions (exact labels, no ambiguous old label)
  *   - CLI rendered-output assertions (exact lines, guard matrix)
  *   - red/green: same assertions FAIL on origin/master, PASS on this branch
  *
- * Scoring formula UNCHANGED. Canonical PGLite fixture via resetPgliteState.
+ * Canonical PGLite fixture via resetPgliteState.
  */
 
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
@@ -69,20 +69,19 @@ describe('issue #2298 — numeric denominator semantics', () => {
     expect(Math.round((health.timeline_coverage ?? 0) * 100)).toBe(50);
   });
 
-  test('whole-brain timeline density = 1/4 -> score 4/15 (4 total pages, 1 with timeline)', async () => {
+  test('entity timeline coverage = 1/2 -> rounded score 8/15', async () => {
     await seedFourPages(engine);
     const health = await engine.getHealth();
     expect(health.timeline_coverage_score).toBeDefined();
-    expect(health.timeline_coverage_score).toBe(4);
+    expect(health.timeline_coverage_score).toBe(8);
   });
 
-  test('the two metrics use independent denominators', async () => {
+  test('the displayed fraction and score use the same entity denominator', async () => {
     await seedFourPages(engine);
     const health = await engine.getHealth();
     expect(Math.round((health.timeline_coverage ?? 0) * 100)).toBe(50);
-    expect(health.timeline_coverage_score ?? 0).toBe(4);
-    // 50% (entity, /2) != 26.7% (whole-brain, /4). Provably distinct.
-    expect(Math.round(((health.timeline_coverage_score ?? 0) / 15) * 100)).not.toBe(50);
+    expect(health.timeline_coverage_score ?? 0).toBe(8);
+    expect(Math.round(((health.timeline_coverage_score ?? 0) / 15) * 100)).toBe(53);
   });
 });
 
@@ -98,18 +97,15 @@ describe('issue #2298 — doctor rendered-message contract', () => {
     expect(graph!.message).not.toMatch(/timeline \(entity, brain score\)/);
   });
 
-  test('brain_score renders whole-brain density label 4/15', async () => {
+  test('brain_score renders entity timeline coverage label 8/15', async () => {
     await seedFourPages(engine);
     const checks = await buildChecks(engine, [], null);
     const brain = checks.find((c) => c.name === 'brain_score');
     expect(brain, 'brain_score check must be present').toBeDefined();
-    expect(brain!.message).toContain('timeline density (all pages) 4/15');
+    expect(brain!.message).toContain('entity timeline coverage 8/15');
     // wrong labels must NOT be present
-    expect(brain!.message).not.toMatch(/timeline 4\/15/);
+    expect(brain!.message).not.toMatch(/timeline density \(all pages\)/);
     expect(brain!.message).not.toMatch(/timeline \(entity, brain score\)/);
-    // brain-score component must NOT carry the word "entity" (it is whole-brain)
-    const timelinePart = brain!.message.split('timeline density (all pages) 4/15')[0] + 'timeline density (all pages) 4/15';
-    expect(timelinePart).not.toMatch(/entity/);
   });
 });
 
@@ -117,31 +113,31 @@ describe('issue #2298 — CLI get_health rendered-output contract', () => {
   function fakeHealth(overrides: Record<string, unknown>): any {
     return {
       embed_coverage: 1, missing_embeddings: 0, stale_pages: 0, orphan_pages: 0,
-      link_coverage: 1, timeline_coverage: 0.5, timeline_coverage_score: 4,
+      link_coverage: 1, timeline_coverage: 0.5, timeline_coverage_score: 8,
       most_connected: [], ...overrides,
     };
   }
 
-  test('both entity and whole-brain lines render, no undefined/15', () => {
+  test('both entity fraction and score lines render, no undefined/15', () => {
     const out = formatResult('get_health', fakeHealth({}));
     expect(out).toContain('Timeline coverage (entity pages): 50.0%');
-    expect(out).toContain('Timeline density (all pages): 4/15');
+    expect(out).toContain('Timeline coverage score (entity pages): 8/15');
     expect(out).not.toContain('undefined/15');
     expect(out).not.toContain('Timeline coverage (entities)');
     expect(out).not.toMatch(/timeline \(entity, brain score\)/);
     expect(out).not.toMatch(/bare "timeline 4\/15"/);
   });
 
-  test('guard matrix: entity present, whole-brain absent -> only entity line', () => {
+  test('guard matrix: entity fraction present, score absent -> only fraction line', () => {
     const out = formatResult('get_health', fakeHealth({ timeline_coverage_score: undefined }));
     expect(out).toContain('Timeline coverage (entity pages): 50.0%');
-    expect(out).not.toContain('Timeline density (all pages)');
+    expect(out).not.toContain('Timeline coverage score (entity pages)');
     expect(out).not.toContain('undefined/15');
   });
 
-  test('guard matrix: whole-brain present, entity absent -> only whole-brain line', () => {
+  test('guard matrix: score present, entity fraction absent -> only score line', () => {
     const out = formatResult('get_health', fakeHealth({ timeline_coverage: undefined }));
-    expect(out).toContain('Timeline density (all pages): 4/15');
+    expect(out).toContain('Timeline coverage score (entity pages): 8/15');
     expect(out).not.toContain('Timeline coverage (entity pages)');
     expect(out).not.toContain('undefined/15');
   });
@@ -149,7 +145,7 @@ describe('issue #2298 — CLI get_health rendered-output contract', () => {
   test('guard matrix: both absent -> neither timeline line, never undefined/15', () => {
     const out = formatResult('get_health', fakeHealth({ timeline_coverage: undefined, timeline_coverage_score: undefined }));
     expect(out).not.toContain('Timeline coverage (entity pages)');
-    expect(out).not.toContain('Timeline density (all pages)');
+    expect(out).not.toContain('Timeline coverage score (entity pages)');
     expect(out).not.toContain('undefined/15');
   });
 });
