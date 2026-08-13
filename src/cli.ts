@@ -944,6 +944,14 @@ export function parseOpArgs(op: Operation, args: string[]): Record<string, unkno
         }
       }
       const key = arg.slice(2).replace(/-/g, '_');
+      // Platform document automation accepts a repeatable singular CLI flag
+      // and exposes the normalized list to the operation contract.
+      if (key === 'allowed_subject_id' && i + 1 < args.length) {
+        const values = String(args[++i]).split(',').map((value) => value.trim()).filter(Boolean);
+        const prior = Array.isArray(params.allowed_subject_ids) ? params.allowed_subject_ids as string[] : [];
+        params.allowed_subject_ids = [...prior, ...values];
+        continue;
+      }
       const paramDef = op.params[key];
       if (paramDef?.type === 'boolean') {
         params[key] = true;

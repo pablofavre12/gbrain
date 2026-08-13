@@ -6044,7 +6044,7 @@ export class PGLiteEngine implements BrainEngine {
     // who'd just successfully run init.
     const embedCoverageScore = pageCount === 0 ? 35 : Math.round(embedCoverage * 35);
     const linkDensityScore = pageCount === 0 ? 25 : Math.round(linkDensity * 25);
-    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverage * 15);
+    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverageDensity * 15);
     const noOrphansScore = pageCount === 0 ? 15 : Math.round(noOrphans * 15);
     const noDeadLinksScore = pageCount === 0 ? 10 : Math.round(noDeadLinks * 10);
     const brainScore = embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore;
@@ -6059,7 +6059,7 @@ export class PGLiteEngine implements BrainEngine {
       brain_score: brainScore,
       dead_links: deadLinks,
       link_coverage: Number(r.link_coverage),
-      timeline_coverage: timelineCoverage,
+      timeline_coverage: timelineCoverageDensity,
       most_connected: (connected as { slug: string; link_count: number }[]).map(c => ({
         slug: c.slug,
         link_count: Number(c.link_count),

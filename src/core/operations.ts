@@ -919,7 +919,7 @@ export function resolveRequestedScope(
 export function federatedSearchScope(
   ctx: OperationContext,
   sourceIdParam?: string,
-): { sourceId?: string; sourceIds?: string[] } {
+): { sourceId?: string; sourceIds?: string[]; aclSubjectIds?: string[] } {
   const scope = resolveRequestedScope(ctx, sourceIdParam);
   if (
     sourceIdParam === undefined &&
@@ -928,7 +928,10 @@ export function federatedSearchScope(
     ctx.localFederatedSourceIds !== undefined &&
     ctx.localFederatedSourceIds.length > 1
   ) {
-    return { sourceIds: ctx.localFederatedSourceIds };
+    return {
+      sourceIds: ctx.localFederatedSourceIds,
+      ...(scope.aclSubjectIds !== undefined ? { aclSubjectIds: scope.aclSubjectIds } : {}),
+    };
   }
   return scope;
 }
@@ -1197,7 +1200,7 @@ const get_page: Operation = {
       };
     };
 
-    const resolveRequestedReadScope = (): { sourceId?: string; sourceIds?: string[] } => {
+    const resolveRequestedReadScope = (): { sourceId?: string; sourceIds?: string[]; aclSubjectIds?: string[] } => {
       if (requestedSource === undefined) return sourceOpts;
       try {
         return resolveRequestedScope(ctx, requestedSource, false);

@@ -199,8 +199,20 @@ async function phaseBFenceFacts(
     const localPathById = new Map<string, string | null>();
     for (const s of sources) localPathById.set(s.id, s.local_path);
 
-    // Fail closed on missing paths, then enforce a clean tracked checkout.
-    for (const [id, localPath] of localPathById) {
+    // Determine the actual write set before checking checkouts. An unrelated
+    // dirty/missing source must not block a migration that will never touch it.
+    const legacy = await engine.executeRaw<LegacyFactRow>(
+      `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
+              context, valid_from, valid_until, source, confidence
+         FROM facts
+        WHERE row_num IS NULL
+        ORDER BY source_id, entity_slug, id`,
+    );
+    const targetedSourceIds = new Set(legacy.map((row) => row.source_id));
+
+    // Fail closed on missing paths, then enforce a clean targeted checkout.
+    for (const id of targetedSourceIds) {
+      const localPath = localPathById.get(id) ?? null;
       if (localPath) {
         const pathIssue = localPathIssue(localPath);
         if (pathIssue) {
@@ -219,16 +231,6 @@ async function phaseBFenceFacts(
         }
       }
     }
-
-    // Walk legacy rows in (source_id, entity_slug) groups for per-page
-    // atomic writes.
-    const legacy = await engine.executeRaw<LegacyFactRow>(
-      `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
-              context, valid_from, valid_until, source, confidence
-         FROM facts
-        WHERE row_num IS NULL
-        ORDER BY source_id, entity_slug, id`,
-    );
 
     const outcome: PhaseBOutcome = {
       scanned: legacy.length,

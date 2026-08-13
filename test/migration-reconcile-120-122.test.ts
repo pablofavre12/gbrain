@@ -59,10 +59,10 @@ describe('reconcile_forked_120_121_122 heals a brain stamped inside the fork ban
     );
     expect(JSON.stringify(preFn[0]?.proconfig ?? [])).not.toContain('search_path=');
 
-    // ── Run migrations: only the 9004 catch-up should be pending.
+    // ── Run migrations: all fork entries added after bookmark 9003 are pending.
     const res = await runMigrations(engine);
-    expect(res.applied).toBe(1);
-    expect(res.current).toBe(9004);
+    expect(res.applied).toBe(4);
+    expect(res.current).toBe(9007);
 
     // ── v121 restored: timeline_entries.event_page_id + its indexes.
     const postTimeline = await engine.executeRaw<{ n: number }>(

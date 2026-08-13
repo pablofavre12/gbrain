@@ -20,13 +20,13 @@ describe('gbrain put document automation flags', () => {
     expect(params).toEqual({
       slug: 'documents/report',
       source: 'perennia',
-      content: '',
       allowed_subject_ids: ['user:a', 'user:b', 'group:editors'],
       document_id: 'doc-123',
       document_version_sequence: 7,
       document_version_hash: 'a'.repeat(64),
+      json: true,
     });
-    // The generic parser always sources this field from fd 0, never argv.
-    expect(params.content).toBe('');
+    // Stdin hydration is a bounded post-parse step in the current CLI.
+    expect(params.content).toBeUndefined();
   });
 });

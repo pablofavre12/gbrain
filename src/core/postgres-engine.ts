@@ -5884,7 +5884,7 @@ export class PostgresEngine implements BrainEngine {
     // who'd just successfully run init. PGLite path has the same fix.
     const embedCoverageScore = pageCount === 0 ? 35 : Math.round(embedCoverage * 35);
     const linkDensityScore = pageCount === 0 ? 25 : Math.round(linkDensity * 25);
-    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverage * 15);
+    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverageWhole * 15);
     const noOrphansScore = pageCount === 0 ? 15 : Math.round(noOrphans * 15);
     const noDeadLinksScore = pageCount === 0 ? 10 : Math.round(noDeadLinks * 10);
     const brainScore = embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore;
@@ -5899,7 +5899,7 @@ export class PostgresEngine implements BrainEngine {
       brain_score: brainScore,
       dead_links: deadLinks,
       link_coverage: Number(h.link_coverage),
-      timeline_coverage: timelineCoverage,
+      timeline_coverage: timelineCoverageWhole,
       most_connected: (connected as unknown as { slug: string; link_count: number }[]).map(c => ({
         slug: c.slug,
         link_count: Number(c.link_count),

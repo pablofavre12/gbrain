@@ -31,6 +31,9 @@ const FORK_LOCAL_NAMES = new Set([
   'write_attribution_columns',
   'reconcile_forked_118_119',
   'reconcile_forked_120_121_122',
+  'page_acl_and_document_version_fence',
+  'governed_native_page_write_proposals',
+  'reconcile_upstream_123_124_125_126',
 ]);
 
 describe('fork-band migration convention', () => {
