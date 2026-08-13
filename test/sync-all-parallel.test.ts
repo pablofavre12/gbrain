@@ -48,7 +48,7 @@ import {
   buildSyncStatusReport,
 } from '../src/commands/sync.ts';
 import { SYNC_LOCK_ID, syncLockId } from '../src/core/db-lock.ts';
-import { withSourcePrefix, slog } from '../src/core/console-prefix.ts';
+import { getSourcePrefix, withSourcePrefix } from '../src/core/console-prefix.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 // ── resolveParallelism ──────────────────────────────────────────────
@@ -379,44 +379,17 @@ describe('buildSyncStatusReport', () => {
 // ── per-source console prefix (D6 + D13) ─────────────────────────────
 
 describe('per-source line prefix under withSourcePrefix', () => {
-  test('slog under wrap emits [source-id] prefix; outside wrap emits bare output', async () => {
-    // Captures both paths in one case. The wrap propagation is what
-    // makes the entire "per-source greppable parallel output" feature
-    // work; without it, parallel sync interleaves illegibly.
-    //
-    // Outside-wrap path routes through `console.log` (not
-    // `process.stdout.write` directly) so we patch both sinks.
-    // Inside-wrap path routes through `process.stdout.write` because
-    // slog needs raw stream control to emit prefixed lines.
-    const stdoutOrig = process.stdout.write.bind(process.stdout);
-    const consoleLogOrig = console.log;
-    const stdoutChunks: string[] = [];
-    const consoleLogChunks: unknown[][] = [];
-    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
-      stdoutChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
-      return true;
-    }) as typeof process.stdout.write;
-    // eslint-disable-next-line no-console
-    console.log = (...args: unknown[]) => { consoleLogChunks.push(args); };
-    try {
-      // Outside wrap: bare console.log fast path.
-      slog('outside-wrap');
-      // Inside wrap: prefixed line via process.stdout.write.
-      await withSourcePrefix('media-corpus', async () => {
-        slog('inside-wrap');
-      });
-      // Outside-wrap landed on console.log (no prefix, no [tag]).
-      const flatConsole = consoleLogChunks.flat().map(String).join(' ');
-      expect(flatConsole).toContain('outside-wrap');
-      expect(flatConsole).not.toMatch(/\[.*\]/);
-      // Inside-wrap landed on process.stdout.write WITH the source.id prefix.
-      const stdoutText = stdoutChunks.join('');
-      expect(stdoutText).toContain('[media-corpus] inside-wrap');
-    } finally {
-      process.stdout.write = stdoutOrig;
-      // eslint-disable-next-line no-console
-      console.log = consoleLogOrig;
-    }
+  test('wrap propagates source.id and restores the unprefixed outer context', async () => {
+    // Byte-level slog routing is pinned in console-prefix.test.ts. This
+    // integration guard stays concurrency-safe: unit shards run test files in
+    // parallel, so mutating process.stdout here would race unrelated tests.
+    expect(getSourcePrefix()).toBeNull();
+    const observed = await withSourcePrefix('media-corpus', async () => {
+      await Promise.resolve();
+      return getSourcePrefix();
+    });
+    expect(observed).toBe('media-corpus');
+    expect(getSourcePrefix()).toBeNull();
   });
 });
 
