@@ -281,8 +281,16 @@ export interface Recipe {
   tier: 'native' | 'openai-compat';
   /** Maps to the gateway's implementation switch. */
   implementation: Implementation;
-  /** For openai-compatible tier: default base URL. May be overridden by env or wizard. */
+  /** For openai-compatible tier: default base URL. May be overridden unless explicitly pinned below. */
   base_url_default?: string;
+  /**
+   * Security-sensitive opt-out from `provider_base_urls.<id>` overrides.
+   * Undefined preserves the existing override behavior. Set to `false` for
+   * providers whose credential must only be sent to the recipe's official
+   * endpoint; `applyOpenAICompatConfig` rejects any configured override before
+   * auth headers are resolved or a transport is called.
+   */
+  allow_base_url_override?: false;
   /** Env var name(s) for auth; first is required, rest are optional. */
   auth_env?: {
     required: string[];

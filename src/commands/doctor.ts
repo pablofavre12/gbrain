@@ -1752,10 +1752,39 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
 export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
   try {
     const { readRecentRerankFailures } = await import('../core/rerank-audit.ts');
+    const { getRecipe } = await import('../core/ai/recipes/index.ts');
     const cfg = await engine.getConfig('search.reranker.enabled');
     const rerankerEnabled = cfg === 'true' || cfg === '1';
 
     const failures = readRecentRerankFailures(7);
+    const providerGuidance = (selected: typeof failures): {
+      providers: string;
+      authAction: string;
+      setupSuffix: string;
+    } => {
+      const recipes = new Map<string, NonNullable<ReturnType<typeof getRecipe>>>();
+      for (const failure of selected) {
+        const providerId = String(failure.model ?? '').split(':', 1)[0]?.trim().toLowerCase();
+        if (!providerId || recipes.has(providerId)) continue;
+        const recipe = getRecipe(providerId);
+        if (recipe) recipes.set(providerId, recipe);
+      }
+      const resolved = [...recipes.values()];
+      const providerNames = [...new Set(resolved.map((r) => r.name))];
+      const envKeys = [...new Set(resolved.flatMap((r) => r.auth_env?.required ?? []))];
+      const setupUrls = [...new Set(resolved.flatMap((r) => r.auth_env?.setup_url ? [r.auth_env.setup_url] : []))];
+      return {
+        providers: providerNames.length > 0
+          ? providerNames.join(', ')
+          : 'the configured reranker provider',
+        authAction: envKeys.length > 0
+          ? `verify ${envKeys.join(' / ')}`
+          : 'verify reranker credentials',
+        setupSuffix: setupUrls.length > 0
+          ? ` Provider setup: ${setupUrls.join(', ')}.`
+          : '',
+      };
+    };
     if (failures.length === 0) {
       return {
         name: 'reranker_health',
@@ -1768,10 +1797,11 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
 
     const authFails = failures.filter((f) => f.reason === 'auth');
     if (authFails.length > 0) {
+      const guidance = providerGuidance(authFails);
       return {
         name: 'reranker_health',
         status: 'warn',
-        message: `${authFails.length} reranker auth failure(s) in last 7 days. Fix: verify ZEROENTROPY_API_KEY and run \`gbrain models doctor\`.`,
+        message: `${authFails.length} reranker auth failure(s) in last 7 days for ${guidance.providers}. Fix: ${guidance.authAction} and run \`gbrain models doctor\`.${guidance.setupSuffix}`,
       };
     }
 
@@ -1788,10 +1818,11 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       (f) => f.reason === 'network' || f.reason === 'timeout' || f.reason === 'rate_limit',
     );
     if (transientFails.length >= 5) {
+      const guidance = providerGuidance(transientFails);
       return {
         name: 'reranker_health',
         status: 'warn',
-        message: `${transientFails.length} transient reranker failure(s) in last 7 days. Search fails open to RRF order; check ZE status if persistent.`,
+        message: `${transientFails.length} transient reranker failure(s) in last 7 days for ${guidance.providers}. Search fails open to RRF order; check provider service status if persistent.${guidance.setupSuffix}`,
       };
     }
 
@@ -1800,16 +1831,11 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
     // reporting "ok" while every rerank fails open.
     const unknownFails = failures.filter((f) => f.reason === 'unknown');
     if (unknownFails.length >= 3) {
-      const setupHint = unknownFails.some((f) => {
-        const summary = String(f.error_summary ?? '');
-        return summary.includes('ZEROENTROPY_API_KEY') || summary.toLowerCase().includes('api key');
-      })
-        ? ' Fix: verify ZEROENTROPY_API_KEY and run `gbrain models doctor`.'
-        : '';
+      const guidance = providerGuidance(unknownFails);
       return {
         name: 'reranker_health',
         status: 'warn',
-        message: `${unknownFails.length} unknown reranker failure(s) in last 7 days.${setupHint}`,
+        message: `${unknownFails.length} unknown reranker failure(s) in last 7 days for ${guidance.providers}. Run \`gbrain models doctor\` for provider diagnostics.${guidance.setupSuffix}`,
       };
     }
 

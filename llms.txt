@@ -33,6 +33,7 @@ Repo: https://github.com/garrytan/gbrain
 
 - [docs/ai-providers/zeroentropy.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/ai-providers/zeroentropy.md): ZeroEntropy zembed-1 embedding + zerank-2 reranker (hosted): API key, embedding switch, reranker config.
 - [docs/ai-providers/llama-server-reranker.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/ai-providers/llama-server-reranker.md): Local reranker via llama.cpp --reranking: Qwen3-Reranker or self-hosted ZE weights, --alias setup, gbrain config keys, cold-start timeout, budget-cap interaction.
+- [docs/ai-providers/cohere.md](https://raw.githubusercontent.com/garrytan/gbrain/master/docs/ai-providers/cohere.md): Hosted Cohere reranking: supported rerank-v3.5/v4 models, COHERE_API_KEY setup, fail-open behavior, and search-unit budget limitation.
 
 ## Debugging
 

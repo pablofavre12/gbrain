@@ -198,7 +198,7 @@ describe('model-resolver', () => {
   });
 
   test('resolveRecipe throws AIConfigError for unknown provider', () => {
-    expect(() => resolveRecipe('cohere:embed-v3')).toThrow(AIConfigError);
+    expect(() => resolveRecipe('unknown-provider:embed-v3')).toThrow(AIConfigError);
   });
 });
 

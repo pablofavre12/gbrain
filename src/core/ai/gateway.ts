@@ -381,6 +381,15 @@ export function applyOpenAICompatConfig(
   recipe: Recipe,
   cfg: AIGatewayConfig,
 ): { baseURL: string; fetch?: typeof fetch } {
+  if (
+    recipe.allow_base_url_override === false &&
+    Object.hasOwn(cfg.base_urls ?? {}, recipe.id)
+  ) {
+    throw new AIConfigError(
+      `${recipe.name} does not allow provider base URL overrides.`,
+      `Remove provider_base_urls.${recipe.id}; this recipe is pinned to its official endpoint.`,
+    );
+  }
   if (recipe.resolveOpenAICompatConfig) {
     const resolved = recipe.resolveOpenAICompatConfig(cfg.env);
     return { ...resolved, fetch: resolved.fetch ?? recipe.compat?.fetch };
@@ -3991,13 +4000,11 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
       signal: ctrl.signal,
     });
     if (!resp.ok) {
-      let msg = `rerank HTTP ${resp.status}`;
-      try {
-        const txt = await resp.text();
-        if (txt) msg = `${msg}: ${txt.slice(0, 500)}`;
-      } catch {
-        // Body read failed — preserve status-only message.
-      }
+      // Never copy an upstream response body into the error. Providers can
+      // echo request fields (query, documents, even token-like strings) in
+      // diagnostics, and applyReranker persists this message to the failure
+      // audit. Status + the normalized reason are sufficient for remediation.
+      const msg = `rerank HTTP ${resp.status}`;
       const reason: RerankError['reason'] =
         resp.status === 401 || resp.status === 403
           ? 'auth'
