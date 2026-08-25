@@ -189,6 +189,13 @@ export const SECTIONS: DocSection[] = [
         path: "docs/ai-providers/llama-server-reranker.md",
         includeInFull: false,
       },
+      {
+        title: "docs/ai-providers/cohere.md",
+        description:
+          "Hosted Cohere reranking: supported rerank-v3.5/v4 models, COHERE_API_KEY setup, fail-open behavior, and search-unit budget limitation.",
+        path: "docs/ai-providers/cohere.md",
+        includeInFull: false,
+      },
     ],
   },
   {

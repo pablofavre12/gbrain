@@ -6,16 +6,16 @@
  */
 
 import { listRecipes, getRecipe } from '../core/ai/recipes/index.ts';
-import { configureGateway, embedOne, isAvailable as gwIsAvailable, chat as gwChat } from '../core/ai/gateway.ts';
+import { configureGateway, embedOne, isAvailable as gwIsAvailable, chat as gwChat, rerank as gwRerank } from '../core/ai/gateway.ts';
 import { buildGatewayConfig } from '../core/ai/build-gateway-config.ts';
 import { probeOllama, probeLMStudio } from '../core/ai/probes.ts';
 import { loadConfig } from '../core/config.ts';
 import { AIConfigError, AITransientError } from '../core/ai/errors.ts';
 import type { Recipe } from '../core/ai/types.ts';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
-type TouchpointFilter = 'embedding' | 'expansion' | 'chat';
+type TouchpointFilter = 'embedding' | 'expansion' | 'chat' | 'reranker';
 
 interface ProviderOption {
   id: string;
@@ -72,13 +72,14 @@ export function formatRecipeTable(recipes: Recipe[], env: NodeJS.ProcessEnv = pr
   // in test/providers.test.ts. Auto-widening keeps the contract — every row's
   // id is followed by at least one space — without per-recipe column tuning.
   const idCol = Math.max(14, ...recipes.map(r => r.id.length + 1));
-  const totalWidth = idCol + 18 + 8 + 8 + 8 + 16; // tier+embed+expand+chat+status
-  rows.push('PROVIDER'.padEnd(idCol) + 'TIER'.padEnd(18) + 'EMBED'.padEnd(8) + 'EXPAND'.padEnd(8) + 'CHAT'.padEnd(8) + 'STATUS');
+  const totalWidth = idCol + 18 + 8 + 8 + 8 + 9 + 16; // tier+embed+expand+chat+rerank+status
+  rows.push('PROVIDER'.padEnd(idCol) + 'TIER'.padEnd(18) + 'EMBED'.padEnd(8) + 'EXPAND'.padEnd(8) + 'CHAT'.padEnd(8) + 'RERANK'.padEnd(9) + 'STATUS');
   rows.push('-'.repeat(totalWidth));
   for (const r of recipes) {
     const hasEmbed = !!r.touchpoints.embedding && (r.touchpoints.embedding.models.length > 0);
     const hasExpand = !!r.touchpoints.expansion;
     const hasChat = !!r.touchpoints.chat && r.touchpoints.chat.models.length > 0;
+    const hasReranker = !!r.touchpoints.reranker;
     const ready = envReady(r, env);
     const status = ready ? '✓ ready' : `✗ missing ${r.auth_env?.required?.[0] ?? 'setup'}`;
     rows.push(
@@ -87,6 +88,7 @@ export function formatRecipeTable(recipes: Recipe[], env: NodeJS.ProcessEnv = pr
       (hasEmbed ? 'yes' : '—').padEnd(8) +
       (hasExpand ? 'yes' : '—').padEnd(8) +
       (hasChat ? 'yes' : '—').padEnd(8) +
+      (hasReranker ? 'yes' : '—').padEnd(9) +
       status,
     );
   }
@@ -129,12 +131,14 @@ USAGE
 TOUCHPOINTS
   --touchpoint embedding (default)  Probes embed_one("...")
   --touchpoint chat                 Probes chat({messages: [{role:'user', content:'ping'}]})
+  --touchpoint reranker             Probes rerank({query:'ping', documents:['pong']}); requires --model
 
 EXAMPLES
   gbrain providers list
   gbrain providers test --model openai:text-embedding-3-large
   gbrain providers test --touchpoint chat --model anthropic:claude-haiku-4-5
   gbrain providers test --touchpoint chat --model deepseek:deepseek-v4-flash
+  gbrain providers test --touchpoint reranker --model cohere:rerank-v3.5
   gbrain providers env ollama
   gbrain providers explain --json
 `);
@@ -156,8 +160,12 @@ async function runTest(args: string[]): Promise<void> {
   const tpIdx = args.indexOf('--touchpoint');
   const tpArg = (tpIdx >= 0 ? args[tpIdx + 1] : 'embedding') as TouchpointFilter;
 
-  if (tpArg !== 'embedding' && tpArg !== 'chat') {
-    console.error(`--touchpoint must be 'embedding' or 'chat' (got: ${tpArg}).`);
+  if (tpArg !== 'embedding' && tpArg !== 'chat' && tpArg !== 'reranker') {
+    console.error(`--touchpoint must be 'embedding', 'chat', or 'reranker' (got: ${tpArg}).`);
+    process.exit(1);
+  }
+  if (tpArg === 'reranker' && !modelArg) {
+    console.error('--touchpoint reranker requires --model provider:model.');
     process.exit(1);
   }
 
@@ -185,12 +193,17 @@ async function runTest(args: string[]): Promise<void> {
     let cfg: ReturnType<typeof loadConfig> | null = null;
     try {
       cfg = loadConfig();
-      const configuredModel = tpArg === 'embedding' ? cfg?.embedding_model : cfg?.chat_model;
+      const configuredModel = tpArg === 'embedding'
+        ? cfg?.embedding_model
+        : tpArg === 'chat'
+          ? cfg?.chat_model
+          : undefined;
       if (!configuredModel) {
+        const configKey = tpArg === 'reranker' ? 'search.reranker.model' : `${tpArg}_model`;
         console.error(
-          `Note: tested ${modelArg} in isolation; this brain has no configured ${tpArg}_model yet. ` +
+          `Note: tested ${modelArg} in isolation; this brain has no configured ${configKey} visible to this pre-connect command. ` +
           `\`providers test\` does NOT verify your brain's active path. ` +
-          `Set the active provider with \`gbrain config set ${tpArg}_model <id>\` after running init.`,
+          `Set the active provider with \`gbrain config set ${configKey} <id>\` after running init.`,
         );
       } else if (configuredModel !== modelArg) {
         console.error(
@@ -217,10 +230,15 @@ async function runTest(args: string[]): Promise<void> {
         embedding_model: modelArg,
         embedding_dimensions: dims,
       });
-    } else {
+    } else if (tpArg === 'chat') {
       configureGateway({
         ...baseGatewayConfig,
         chat_model: modelArg,
+      });
+    } else {
+      configureGateway({
+        ...baseGatewayConfig,
+        reranker_model: modelArg,
       });
     }
     void modelId; // intentionally unused but preserved for readability
@@ -238,7 +256,7 @@ async function runTest(args: string[]): Promise<void> {
       const v = await embedOne('gbrain smoke test');
       const ms = Date.now() - start;
       console.log(`  ✓ ${ms}ms, ${v.length} dims`);
-    } else {
+    } else if (tpArg === 'chat') {
       const result = await gwChat({
         messages: [{ role: 'user', content: 'Reply with just the word: pong' }],
         maxTokens: 16,
@@ -246,6 +264,15 @@ async function runTest(args: string[]): Promise<void> {
       const ms = Date.now() - start;
       const preview = (result.text || '<empty>').replace(/\s+/g, ' ').slice(0, 80);
       console.log(`  ✓ ${ms}ms · model=${result.model} · stop=${result.stopReason} · in=${result.usage.input_tokens}/out=${result.usage.output_tokens} · "${preview}"`);
+    } else {
+      const result = await gwRerank({
+        query: 'gbrain smoke test',
+        documents: ['gbrain smoke test'],
+        topN: 1,
+        model: modelArg,
+      });
+      const ms = Date.now() - start;
+      console.log(`  ✓ ${ms}ms · ${result.length} result(s)`);
     }
     console.log('\nAll probes green.');
   } catch (e) {
@@ -316,6 +343,7 @@ async function runExplain(args: string[]): Promise<void> {
     DEEPSEEK_API_KEY: !!process.env.DEEPSEEK_API_KEY,
     GROQ_API_KEY: !!process.env.GROQ_API_KEY,
     TOGETHER_API_KEY: !!process.env.TOGETHER_API_KEY,
+    COHERE_API_KEY: !!process.env.COHERE_API_KEY,
   };
 
   // Parallel probes for local providers (1s timeout each)
@@ -364,6 +392,20 @@ async function runExplain(args: string[]): Promise<void> {
         env_ready: envReady(r),
         tier: r.tier,
         pros: prosFor(r, 'chat'),
+        cons: consFor(r),
+      });
+    }
+    if (r.touchpoints.reranker) {
+      const m = r.touchpoints.reranker;
+      options.push({
+        id: `${r.id}:${m.default_model}`,
+        touchpoint: 'reranker',
+        model: m.default_model,
+        cost_per_1m_tokens_usd: m.cost_per_1m_tokens_usd,
+        price_last_verified: m.price_last_verified,
+        env_ready: envReady(r),
+        tier: r.tier,
+        pros: prosFor(r, 'reranker'),
         cons: consFor(r),
       });
     }
@@ -416,6 +458,12 @@ async function runExplain(args: string[]): Promise<void> {
     console.log(`  ${o.env_ready ? '✓' : '✗'} ${o.id.padEnd(44)} ${inCost.padEnd(12)} ${outCost.padEnd(12)} ${o.tier}`);
   }
   console.log('');
+  console.log('Reranker options:');
+  for (const o of options.filter(x => x.touchpoint === 'reranker')) {
+    const cost = o.cost_per_1m_tokens_usd !== undefined ? `$${o.cost_per_1m_tokens_usd}/1M` : '—';
+    console.log(`  ${o.env_ready ? '✓' : '✗'} ${o.id.padEnd(44)} ${cost.padEnd(10)} ${o.tier}`);
+  }
+  console.log('');
   console.log(`Recommended: ${matrix.recommended}`);
   console.log(`  ${matrix.recommended_reason}`);
   console.log('');
@@ -425,6 +473,12 @@ async function runExplain(args: string[]): Promise<void> {
 
 function prosFor(r: Recipe, touchpoint: TouchpointFilter): string[] {
   const out: string[] = [];
+  if (touchpoint === 'reranker') {
+    if (r.id === 'cohere') out.push('Hosted', 'Multilingual', 'ZeroEntropy migration target');
+    else if (r.id === 'zeroentropyai') out.push('Default reranker', 'Instruction-following');
+    else if (r.id === 'llama-server-reranker') out.push('Local', 'Private', 'No token billing');
+    return out;
+  }
   if (touchpoint === 'chat') {
     if (r.id === 'anthropic') out.push('Default subagent driver', 'Prompt-cache support', 'Strong tool calling');
     else if (r.id === 'openai') out.push('Strong tool calling', 'Wide adapter support');

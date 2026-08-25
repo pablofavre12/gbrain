@@ -48,9 +48,9 @@ export interface RerankFailureEvent {
   /** Number of documents that were being reranked when failure fired. */
   doc_count: number;
   /**
-   * Truncated upstream error message (first 200 chars). Useful for
-   * diagnosing flaky providers without leaking PII; query text is hashed
-   * separately so this string never carries it.
+   * Truncated sanitized gateway error message (first 200 chars). Upstream
+   * HTTP response bodies never enter this field because providers may echo
+   * request text or credentials in diagnostics.
    */
   error_summary: string;
   /** Always 'warn' — matches RerankError's "all failures degrade UX". */
@@ -63,8 +63,7 @@ export function computeRerankAuditFilename(now: Date = new Date()): string {
 }
 
 /**
- * Truncate a string for audit logging. Plain length cut — error messages
- * from the gateway are already free of caller-controlled prefixes.
+ * Truncate a sanitized gateway error string for audit logging.
  */
 function truncateErrorSummary(msg: string, max = 200): string {
   if (msg.length <= max) return msg;

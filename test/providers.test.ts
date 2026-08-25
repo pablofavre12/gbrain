@@ -1,14 +1,25 @@
 /**
  * `gbrain providers` — pure formatter + envReady tests.
  *
- * `runTest` and `runExplain` aren't covered here because they touch the
- * gateway / loadConfig; E2E exercises those.
+ * `runTest` is covered through a transport stub; `runExplain` remains in E2E.
  */
 
-import { describe, test, expect } from 'bun:test';
-import { formatRecipeTable, envReady } from '../src/commands/providers.ts';
+import { afterEach, describe, test, expect } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { formatRecipeTable, envReady, runProviders } from '../src/commands/providers.ts';
 import { listRecipes, getRecipe } from '../src/core/ai/recipes/index.ts';
-import type { Recipe } from '../src/core/ai/types.ts';
+import {
+  __setRerankTransportForTests,
+  resetGateway,
+} from '../src/core/ai/gateway.ts';
+import { withEnv } from './helpers/with-env.ts';
+
+afterEach(() => {
+  __setRerankTransportForTests(null);
+  resetGateway();
+});
 
 describe('envReady', () => {
   test('true when all required env vars set', () => {
@@ -43,6 +54,7 @@ describe('formatRecipeTable', () => {
     expect(out).toContain('EMBED');
     expect(out).toContain('EXPAND');
     expect(out).toContain('CHAT');
+    expect(out).toContain('RERANK');
     expect(out).toContain('STATUS');
   });
 
@@ -71,13 +83,22 @@ describe('formatRecipeTable', () => {
     }
   });
 
-  test('embedding-only recipe (zeroentropyai) shows yes/—/— for tiers', () => {
+  test('dual embedding/reranker recipe (zeroentropyai) shows both capabilities', () => {
     const out = formatRecipeTable(listRecipes(), {});
     const zeLine = out.split('\n').find(line => line.startsWith('zeroentropyai'));
     expect(zeLine).toBeDefined();
-    // ZE has embedding but no expansion or chat
-    expect(zeLine).toContain('yes');
-    expect(zeLine).toContain('—');
+    expect((zeLine!.match(/yes/g) ?? [])).toHaveLength(2);
+  });
+
+  test('Cohere and user-provided llama-server recipes show reranker capability', () => {
+    const out = formatRecipeTable(listRecipes(), {});
+    for (const id of ['cohere', 'llama-server-reranker']) {
+      const line = out.split('\n').find(row => row.startsWith(id));
+      expect(line).toBeDefined();
+      const header = out.split('\n')[0]!;
+      const rerankColumn = header.indexOf('RERANK');
+      expect(line!.slice(rerankColumn, rerankColumn + 9).trim()).toBe('yes');
+    }
   });
 
   test('isolated subset renders correctly (picker reuses this)', () => {
@@ -92,5 +113,75 @@ describe('formatRecipeTable', () => {
     expect(lines[2]).toContain('✓ ready');
     expect(lines[3]).toContain('zeroentropyai');
     expect(lines[3]).toContain('✗ missing ZEROENTROPY_API_KEY');
+  });
+});
+
+describe('providers test --touchpoint reranker', () => {
+  test('accepts a Cohere model and exercises the stubbed reranker contract', async () => {
+    const tempHome = mkdtempSync(join(tmpdir(), 'gbrain-providers-reranker-'));
+    const output: string[] = [];
+    const originalLog = console.log;
+    let capturedUrl = '';
+    try {
+      console.log = (...args: unknown[]) => output.push(args.map(String).join(' '));
+      __setRerankTransportForTests(async (url) => {
+        capturedUrl = url;
+        return new Response(JSON.stringify({
+          results: [{ index: 0, relevance_score: 0.99 }],
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+      await withEnv({
+        GBRAIN_HOME: tempHome,
+        COHERE_API_KEY: 'cohere-test-key',
+      }, async () => {
+        await runProviders('test', [
+          '--touchpoint', 'reranker',
+          '--model', 'cohere:rerank-v3.5',
+        ]);
+      });
+      expect(capturedUrl).toBe('https://api.cohere.com/v2/rerank');
+      expect(output.join('\n')).toContain('Probing reranker provider');
+      expect(output.join('\n')).toContain('All probes green');
+    } finally {
+      console.log = originalLog;
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('providers explain --json', () => {
+  test('publishes reranker options and detects Cohere auth without exposing its value', async () => {
+    const tempHome = mkdtempSync(join(tmpdir(), 'gbrain-providers-explain-'));
+    const output: string[] = [];
+    const originalLog = console.log;
+    try {
+      console.log = (...args: unknown[]) => output.push(args.map(String).join(' '));
+      await withEnv({
+        GBRAIN_HOME: tempHome,
+        COHERE_API_KEY: 'cohere-secret-must-not-appear',
+      }, async () => {
+        await runProviders('explain', ['--json']);
+      });
+
+      const payload = JSON.parse(output.join('\n')) as {
+        schema_version: number;
+        env_detected: Record<string, boolean>;
+        options: Array<{ id: string; touchpoint: string; env_ready: boolean }>;
+      };
+      expect(payload.schema_version).toBe(2);
+      expect(payload.env_detected.COHERE_API_KEY).toBe(true);
+      expect(payload.options).toContainEqual(expect.objectContaining({
+        id: 'cohere:rerank-v3.5',
+        touchpoint: 'reranker',
+        env_ready: true,
+      }));
+      expect(output.join('\n')).not.toContain('cohere-secret-must-not-appear');
+    } finally {
+      console.log = originalLog;
+      rmSync(tempHome, { recursive: true, force: true });
+    }
   });
 });

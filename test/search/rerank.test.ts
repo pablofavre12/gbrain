@@ -195,6 +195,54 @@ describe('applyReranker — fail-open on every RerankError reason', () => {
     }
   });
 
+  test('upstream error bodies cannot leak query, document, or token into RerankError audit', async () => {
+    const {
+      __setRerankTransportForTests,
+      configureGateway,
+    } = await import('../../src/core/ai/gateway.ts');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-rerank-redaction-'));
+    const sensitiveQuery = 'private-query-sentinel';
+    const sensitiveDocument = 'private-document-sentinel';
+    const sensitiveToken = 'cohere-secret-token-sentinel';
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: tmpDir }, async () => {
+        configureGateway({
+          reranker_model: 'cohere:rerank-v3.5',
+          env: { COHERE_API_KEY: 'cohere-test-key' },
+        });
+        __setRerankTransportForTests(async () => new Response(JSON.stringify({
+          message: `invalid request query=${sensitiveQuery} document=${sensitiveDocument}`,
+          token: sensitiveToken,
+        }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+        }));
+
+        const results = [makeResult('private', 1.0, sensitiveDocument)];
+        const out = await applyReranker(sensitiveQuery, results, {
+          enabled: true,
+          topNIn: 1,
+          topNOut: null,
+          model: 'cohere:rerank-v3.5',
+        });
+
+        expect(out).toEqual(results);
+        const failures = readRecentRerankFailures(1);
+        expect(failures).toHaveLength(1);
+        expect(failures[0]!.reason).toBe('auth');
+        expect(failures[0]!.error_summary).toBe('rerank HTTP 401');
+        const serialized = JSON.stringify(failures[0]);
+        expect(serialized).not.toContain(sensitiveQuery);
+        expect(serialized).not.toContain(sensitiveDocument);
+        expect(serialized).not.toContain(sensitiveToken);
+      });
+    } finally {
+      __setRerankTransportForTests(null);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      configureGateway({ env: { ZEROENTROPY_API_KEY: 'test-key' } });
+    }
+  });
+
   test('fail-open on non-RerankError throw too', async () => {
     const results = [makeResult('a', 1.0, 'a')];
     const opts: RerankerOpts = {
