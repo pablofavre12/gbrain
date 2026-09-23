@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { logStdoutFully } from '../src/core/write-stdout-fully.ts';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const SIZE = 450_000;
@@ -31,5 +32,19 @@ describe('writeStdoutFully', () => {
   // a Bun bug rather than our behavior.
   test('delivers a large payload through a stalled pipe before a timed exit', async () => {
     expect(await bytesThroughStalledPipe('fully')).toBe(SIZE + 1);
+  });
+});
+
+describe('logStdoutFully', () => {
+  test('small output goes through console.log (keeps log capture working)', () => {
+    const realLog = console.log;
+    const lines: string[] = [];
+    console.log = (...a: unknown[]) => { lines.push(a.join(' ')); };
+    try {
+      logStdoutFully('{"ok":true}');
+    } finally {
+      console.log = realLog;
+    }
+    expect(lines).toEqual(['{"ok":true}']);
   });
 });

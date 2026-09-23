@@ -1,5 +1,9 @@
 import { writeSync } from 'node:fs';
 
+// Linux pipe buffer. Anything that fits is delivered by the kernel even if the
+// process exits right away; only the overflow sits in Bun's async writer.
+const PIPE_BUFFER_BYTES = 65_536;
+
 /**
  * Write `text` to fd 1 synchronously, retrying on EAGAIN, so large payloads
  * survive the CLI's timed exit. Bun's async stdout writer drops whatever is
@@ -20,4 +24,16 @@ export function writeStdoutFully(text: string, timeoutMs = 10_000): void {
       Bun.sleepSync(1);
     }
   }
+}
+
+/**
+ * `console.log` for output that fits in a pipe buffer (keeps the usual path,
+ * including console.log capture in tests); synchronous write above that.
+ */
+export function logStdoutFully(text: string): void {
+  if (Buffer.byteLength(text) < PIPE_BUFFER_BYTES) {
+    console.log(text);
+    return;
+  }
+  writeStdoutFully(text + '\n');
 }
