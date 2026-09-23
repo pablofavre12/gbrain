@@ -137,10 +137,10 @@ export interface GBrainConfig {
    */
   storage?: unknown;
   /**
-   * v0.25.0 — session capture settings. Read via file-plane `loadConfig()`
-   * at process boot (NOT `gbrain config set` which writes the DB plane —
-   * those are different stores). Edit `~/.gbrain/config.json` directly.
-   * All fields default to ON — capture and scrubbing both opt-out.
+   * v0.25.0 — session capture settings. `capture` resolves file/env first,
+   * then the DB plane (`gbrain config set eval.capture true`, read by
+   * `resolveEvalCaptureEnabled` with a 60s cache), then CONTRIBUTOR_MODE.
+   * `scrub_pii` is file-plane only, so scrubbing can't be disabled remotely.
    */
   /**
    * v0.41 — autopilot daemon configuration. Currently houses the nightly

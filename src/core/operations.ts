@@ -16,7 +16,7 @@ import { hybridSearch, hybridSearchCached, stampContentFlags, stampUnverifiedExt
 import { writeTimelineFromContradictions } from './eval-contradictions/timeline-writer.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
-import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
+import { captureEvalCandidateIfEnabled, isEvalScrubEnabled } from './eval-capture.ts';
 import type { HybridSearchMeta } from './types.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
 import { isFactsBackstopEligible } from './facts/eligibility.ts';
@@ -1049,9 +1049,9 @@ function maybeCaptureSearch(
   vectorEnabled: boolean,
   meta?: HybridSearchMeta | null,
 ): void {
-  if (!isEvalCaptureEnabled(ctx.config)) return;
-  void captureEvalCandidate(
+  void captureEvalCandidateIfEnabled(
     ctx.engine,
+    ctx.config,
     {
       tool_name: 'search',
       query: queryText,
@@ -2933,27 +2933,26 @@ const query: Operation = {
     // what hybridSearch *actually* did so replay can distinguish "with API
     // key" from "keyword-only fallback" and "expansion fired" from
     // "expansion requested + silently fell back."
-    if (isEvalCaptureEnabled(ctx.config)) {
-      const meta: HybridSearchMeta = capturedMeta ?? {
-        vector_enabled: false, detail_resolved: detail ?? null, expansion_applied: false,
-      };
-      void captureEvalCandidate(
-        ctx.engine,
-        {
-          tool_name: 'query',
-          query: queryText,
-          results,
-          meta,
-          latency_ms,
-          remote: ctx.remote ?? false,
-          expand_enabled: expand,
-          detail: detail ?? null,
-          job_id: ctx.jobId ?? null,
-          subagent_id: ctx.subagentId ?? null,
-        },
-        { scrub_pii: isEvalScrubEnabled(ctx.config) },
-      );
-    }
+    const captureMeta: HybridSearchMeta = capturedMeta ?? {
+      vector_enabled: false, detail_resolved: detail ?? null, expansion_applied: false,
+    };
+    void captureEvalCandidateIfEnabled(
+      ctx.engine,
+      ctx.config,
+      {
+        tool_name: 'query',
+        query: queryText,
+        results,
+        meta: captureMeta,
+        latency_ms,
+        remote: ctx.remote ?? false,
+        expand_enabled: expand,
+        detail: detail ?? null,
+        job_id: ctx.jobId ?? null,
+        subagent_id: ctx.subagentId ?? null,
+      },
+      { scrub_pii: isEvalScrubEnabled(ctx.config) },
+    );
 
     return results;
   },

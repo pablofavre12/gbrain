@@ -254,6 +254,68 @@ export function isEvalCaptureEnabled(config: GBrainConfig | null | undefined): b
   return process.env.GBRAIN_CONTRIBUTOR_MODE === '1';
 }
 
+// `gbrain config set eval.capture true` writes the DB plane, but the op layer
+// only ever received the file/env config — so on a DB-first server the flag
+// read `true` and capture stayed off. Cached per engine so the hot path pays
+// one config read per TTL, not one per query.
+const DB_PLANE_CAPTURE_TTL_MS = 60_000;
+let dbPlaneCaptureCache = new WeakMap<object, { at: number; value: boolean | undefined }>();
+
+/** Test seam — forgets cached DB-plane capture values. */
+export function _resetEvalCaptureDbPlaneCacheForTests(): void {
+  dbPlaneCaptureCache = new WeakMap();
+}
+
+async function readDbPlaneCapture(engine: BrainEngine): Promise<boolean | undefined> {
+  const now = Date.now();
+  const cached = dbPlaneCaptureCache.get(engine);
+  if (cached && now - cached.at < DB_PLANE_CAPTURE_TTL_MS) return cached.value;
+  let value: boolean | undefined;
+  try {
+    const raw = typeof engine.getConfig === 'function' ? await engine.getConfig('eval.capture') : null;
+    value = raw === undefined || raw === null || raw === '' ? undefined : raw === 'true';
+  } catch {
+    value = undefined;
+  }
+  dbPlaneCaptureCache.set(engine, { at: now, value });
+  return value;
+}
+
+/**
+ * Same resolution as `isEvalCaptureEnabled`, with the DB plane between the
+ * file/env config and CONTRIBUTOR_MODE: file/env → DB plane → env opt-in → off.
+ * Never throws.
+ */
+export async function resolveEvalCaptureEnabled(
+  engine: BrainEngine,
+  config: GBrainConfig | null | undefined,
+): Promise<boolean> {
+  const fileValue = config?.eval?.capture;
+  if (fileValue === true || fileValue === false) return fileValue;
+  const dbValue = await readDbPlaneCapture(engine);
+  if (dbValue !== undefined) return dbValue;
+  return process.env.GBRAIN_CONTRIBUTOR_MODE === '1';
+}
+
+/**
+ * Op-layer entry point: resolves the gate (including the DB plane) and
+ * captures inside one tracked fire-and-forget promise, so response latency is
+ * unaffected and the background-work drain still sees the write.
+ */
+export function captureEvalCandidateIfEnabled(
+  engine: BrainEngine,
+  config: GBrainConfig | null | undefined,
+  ctx: CaptureContext,
+  opts: { scrub_pii?: boolean } = {},
+): Promise<void> {
+  const p = (async () => {
+    if (!(await resolveEvalCaptureEnabled(engine, config))) return;
+    await doCaptureEvalCandidate(engine, ctx, opts);
+  })();
+  trackEvalCapture(p);
+  return p;
+}
+
 /**
  * PII scrubbing enabled? Defaults to true; explicit `false` opts out.
  *

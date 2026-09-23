@@ -18,6 +18,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operations } from '../src/core/operations.ts';
+import { _resetEvalCaptureDbPlaneCacheForTests, awaitPendingEvalCaptures } from '../src/core/eval-capture.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 import type { PageInput } from '../src/core/types.ts';
@@ -219,6 +220,49 @@ describe('op-layer capture — search', () => {
     });
     await searchOp.handler(ctx, { query: 'alice' });
     await waitForCapture();
+    expect(await engine.listEvalCandidates()).toHaveLength(0);
+  });
+});
+
+describe('op-layer capture — DB plane (`gbrain config set eval.capture`)', () => {
+  const searchOp = operations.find(o => o.name === 'search')!;
+  const queryOp = operations.find(o => o.name === 'query')!;
+  const origMode = process.env.GBRAIN_CONTRIBUTOR_MODE;
+  // What a DB-first server builds: file/env config with no eval block.
+  const silentConfig: GBrainConfig = { engine: 'pglite' };
+
+  beforeEach(() => _resetEvalCaptureDbPlaneCacheForTests());
+  afterAll(async () => {
+    await engine.unsetConfig('eval.capture');
+    _resetEvalCaptureDbPlaneCacheForTests();
+    if (origMode === undefined) delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    else process.env.GBRAIN_CONTRIBUTOR_MODE = origMode;
+  });
+
+  test('DB plane eval.capture=true captures search and query with a silent file config', async () => {
+    delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    await engine.setConfig('eval.capture', 'true');
+    await searchOp.handler(makeCtx({ config: silentConfig }), { query: 'alice' });
+    await queryOp.handler(makeCtx({ config: silentConfig }), { query: 'alice' });
+    await awaitPendingEvalCaptures(5_000);
+
+    const rows = await engine.listEvalCandidates();
+    expect(rows.map(r => r.tool_name).sort()).toEqual(['query', 'search']);
+  });
+
+  test('DB plane eval.capture=false keeps capture off even with CONTRIBUTOR_MODE=1', async () => {
+    process.env.GBRAIN_CONTRIBUTOR_MODE = '1';
+    await engine.setConfig('eval.capture', 'false');
+    await searchOp.handler(makeCtx({ config: silentConfig }), { query: 'alice' });
+    await awaitPendingEvalCaptures(5_000);
+    expect(await engine.listEvalCandidates()).toHaveLength(0);
+  });
+
+  test('file config eval.capture=false still wins over DB plane true', async () => {
+    delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    await engine.setConfig('eval.capture', 'true');
+    await searchOp.handler(makeCtx({ config: makeConfig({ capture: false }) }), { query: 'alice' });
+    await awaitPendingEvalCaptures(5_000);
     expect(await engine.listEvalCandidates()).toHaveLength(0);
   });
 });
