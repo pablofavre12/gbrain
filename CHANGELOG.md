@@ -10,6 +10,55 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.238.0] - 2026-10-15
+
+**The fork moves to the pinned upstream release while keeping each reader's private knowledge separate.**
+
+People reading the same relationship can see different histories because they have access to different evidence. A restricted note must not change a public reader's dates, relationship status, suggested pages or counts. This port preserves that separation across graph reads, entity cards and context summaries, including after permissions change or a source is archived.
+
+Legacy bearer grants are checked against live source membership on each authentication. Archiving a federated room removes its access; archiving the primary room suspends the bound grant until that room returns.
+
+Writes retain the fork's exact page identities, document versions, writer attribution and confirmation requirements. An old proposal cannot overwrite a newer page. Inferred timeline updates must still match the original evidence and dates when they are saved. References written in a page remain available for later resolution even when a target is temporarily hidden or absent.
+
+### How to use it
+
+This fork release integrates upstream `v0.60.237.0` at `a05fa516dcaadff57da975652c8f4b3c16cbd25e` and requires Bun 1.4.0 or later. Existing upstream release entries below retain their feature history. Deployment wrappers must pin the reviewed fork commit and validate their own authentication and runtime patches before promotion.
+
+| Situation | Result |
+|---|---|
+| An unreadable note ends a relationship | The reader's visible history is unchanged |
+| An endpoint or an independent origin becomes unavailable | Scoped graph results and counts exclude its contribution |
+| Evidence changes after a timeline proposal is prepared | Publication refuses the stale proposal |
+| Authored-reference extraction is incomplete | Scoped readers report `projection_pending` |
+
+### Things to watch
+
+Database upgrades and binary rollback are separate operations. Stop writers and rehearse against an approved isolated backup before a production cutover. The synthetic rehearsal does not replace that approval. Existing take vectors with incompatible dimensions stop migration rather than being silently cleared. A previously accepted public timeline entry is not automatically withdrawn when its original evidence later becomes restricted.
+
+### To take advantage of v0.60.238.0
+
+On an authorized upgrade target, use the normal migration workflow, then rebuild references with the intended source scope:
+
+```bash
+gbrain apply-migrations --yes --no-autopilot-install
+gbrain extract --stale --include-frontmatter
+gbrain doctor --json
+```
+
+**Say to your agent:** *"Check the fork upgrade and rebuild authored references for the approved sources before resuming writers."*
+
+Both migration cursors and extraction readiness must be checked. The fork bookmark is `9010`; the upstream cursor is `245`. Follow the [release migration guide](skills/migrations/v0.60.238.0.md), then check [the fork upgrade contract](FORK.md) for preservation and publication boundaries. A migration failure must be investigated before writers resume.
+
+### For contributors
+
+- Preserve federated grants, stable page references, page ACLs, versioned-document fences, content compare-and-swap, attributed writes and durable actor-bound proposals across upstream's persistence and operation refactors.
+- Separate upstream migration progress from the fork's high-numbered bookmark, preserve vector data on incompatible dimensional changes, and recover interrupted schema changes without renumbering fork migrations.
+- Derive scoped temporal state in `src/core/link-temporal-read-sql.ts`; apply endpoint, origin, source and ACL policy before metadata, backlink and relationship-note aggregation.
+- Add migration `v9010-authored-link-inventories.ts` and revision-bound authored-reference publication, including denied or unresolved targets and incomplete graph extraction.
+- Revalidate canonical evidence dates, content and provenance in `timeline-publication-guard.ts` and the timeline writer immediately before publication.
+- Preserve per-source schema packs, configured extraction models, domain mention types and atom provenance. Keep the optional contradiction probe disabled by default.
+- Regenerate administration assets from their source and verify that embedded HTML references return JavaScript and CSS rather than the HTML fallback.
+
 ## [0.60.237.0] - 2026-10-15
 
 **Sync, reconcile and repair loops that used to go round forever now end, or tell you exactly what ends them (#6696).** A sync handed to a running `gbrain serve` refused to resume an unfinished run unless you retyped its options, and flags a managed source can't honor failed late with an unrelated error. A run that had finished could still report itself blocked. A wedged migration printed "WEDGED" and then "All migrations up to date". Writes to a page whose file is gone were told to retry a sync that can never import that file. Hundreds of derived pages that disagreed with their files could only be reconciled one at a time. Each of these now finishes, or names the one command that finishes it. And `gbrain doctor --tier ops` now shows what is wrong in seconds on a brain of any size, with anything it could not finish reported as unknown instead of clear.
