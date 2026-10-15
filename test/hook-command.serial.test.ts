@@ -24,6 +24,7 @@ import {
   DIGEST_MEMORY_CAP_BYTES,
   memoryDigest,
   PUSH_ANNOUNCE_REFIRE_MS,
+  HOOK_EVENTS,
   type HookHeartbeatEntry,
 } from '../src/commands/hook.ts';
 import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
@@ -34,8 +35,11 @@ import {
   type TurnContextRequest,
 } from '../src/core/context/resolve-ipc.ts';
 import { CLAUDE_HOOK_OUTPUT_CAP_CHARS } from '../src/core/bootstrap/host-specs.ts';
+import { TRANSCRIPT_HARD_CAP_BYTES } from '../src/core/transcripts/claude-code-jsonl.ts';
 import { writeReceipt } from '../src/core/bootstrap/format.ts';
 import type { RepoReceipt } from '../src/core/bootstrap/repo.ts';
+import { surfaceFileSource } from './helpers/source-surface.ts';
+import { STARTUP_HOOK_SKIP_COMMANDS } from '../src/cli/command-table.ts';
 
 const FIXTURE = join(import.meta.dir, 'fixtures', 'conversation-formats', 'claude-code.jsonl');
 const ENV_KEYS = [
@@ -43,6 +47,8 @@ const ENV_KEYS = [
   // stop-push [D3/D17/D20] + banner [D5] + cloud detection knobs
   'GBRAIN_STOP_PUSH', 'GBRAIN_STOP_PUSH_DEBOUNCE_MIN', 'CLAUDE_CODE_REMOTE',
   'CLAUDE_CODE_REMOTE_SESSION_ID', 'GH_TOKEN', 'GITHUB_TOKEN',
+  // optional Memorable integration: config gate + env kill switch
+  'GBRAIN_MEMORABLE',
 ] as const;
 
 let tmp: string;
@@ -72,6 +78,8 @@ afterEach(() => {
 });
 
 const home = () => join(tmp, '.gbrain');
+/** #6268: where the hook writes a session file (the spool; no GBRAIN_SOURCE or serve here, so the stamp is unresolved). */
+const spooled = (name: string): string => join(home(), 'transcripts', 'corpus', 'sourced', name.replace(/\.txt(?=$|\.)/, '.src-_unresolved.txt'));
 
 function writePgliteConfig(dataDir: string): void {
   mkdirSync(home(), { recursive: true });
@@ -134,6 +142,103 @@ describe('dispatch', () => {
     const out = collectStdout();
     expect(await runHook(['--help'], out.io)).toBe(0);
     expect(out.get()).toContain('session-start');
+  });
+
+  test('harness lane yields to a workspace bootstrap install: exit 0, no output, no heartbeat (#4043 C6)', async () => {
+    // Claude Code merges user- and project-scope hook settings; a harness
+    // (user-scope) entry plus a workspace bootstrap-v1 entry would fire the
+    // same event twice. The workspace install wins — the harness lane must
+    // yield SILENTLY on every event.
+    process.env.GBRAIN_HOOK_LANE = 'harness';
+    try {
+      const ws = mkdtempSync(join(tmpdir(), 'gb-lane-ws-'));
+      mkdirSync(join(ws, '.claude'), { recursive: true });
+      // A real workspace install wires all five events — the guard is now
+      // PER-EVENT (an event the workspace does not wire must run normally),
+      // so the fixture mirrors the full install.
+      const entry = (sub: string) => [
+        { hooks: [{ type: 'command', command: `env GBRAIN_SOURCE=ws /opt/g hook ${sub}`, _gbrain: 'bootstrap-v1' }] },
+      ];
+      writeFileSync(
+        join(ws, '.claude', 'settings.local.json'),
+        JSON.stringify({
+          hooks: {
+            SessionStart: entry('session-start'),
+            UserPromptSubmit: entry('user-prompt'),
+            Stop: entry('stop'),
+            SessionEnd: entry('session-end'),
+            PreCompact: entry('compact'),
+          },
+        }),
+      );
+      for (const event of ['session-start', 'user-prompt', 'stop', 'session-end', 'compact']) {
+        const out = collectStdout();
+        expect(await runHook([event], { ...out.io, stdin: '{}', cwd: ws })).toBe(0);
+        expect(out.get()).toBe('');
+      }
+      expect(existsSync(join(home(), 'integrations', 'hooks', 'heartbeat.jsonl'))).toBe(false);
+    } finally {
+      delete process.env.GBRAIN_HOOK_LANE;
+    }
+  });
+
+  test('harness lane runs normally when the cwd has no workspace install (fail-open both ways)', async () => {
+    process.env.GBRAIN_HOOK_LANE = 'harness';
+    try {
+      // plain dir: no .claude/settings.local.json at all
+      const plain = mkdtempSync(join(tmpdir(), 'gb-lane-plain-'));
+      const out = collectStdout();
+      // session-start in a plain dir runs the normal handler (exit 0, and it
+      // WRITES a heartbeat — proof the guard did not swallow the event).
+      expect(await runHook(['session-start'], { ...out.io, stdin: '', cwd: plain })).toBe(0);
+      expect(existsSync(join(home(), 'integrations', 'hooks', 'heartbeat.jsonl'))).toBe(true);
+
+      // harness-marker-only settings (its OWN entries) must NOT trigger the
+      // yield — only the workspace bootstrap-v1 marker does.
+      const harnessOnly = mkdtempSync(join(tmpdir(), 'gb-lane-harness-'));
+      mkdirSync(join(harnessOnly, '.claude'), { recursive: true });
+      writeFileSync(
+        join(harnessOnly, '.claude', 'settings.local.json'),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [{ hooks: [{ type: 'command', command: 'env GBRAIN_SOURCE=default /opt/g hook session-start', _gbrain: 'bootstrap-harness-v1' }] }],
+          },
+        }),
+      );
+      const out2 = collectStdout();
+      expect(await runHook(['session-start'], { ...out2.io, stdin: '', cwd: harnessOnly })).toBe(0);
+      // still ran: a fresh heartbeat line was appended for this invocation
+      const hb = readFileSync(join(home(), 'integrations', 'hooks', 'heartbeat.jsonl'), 'utf8').trim().split('\n');
+      expect(hb.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      delete process.env.GBRAIN_HOOK_LANE;
+    }
+  });
+
+  test('harness lane yields to the COMMITTED settings.json carrier too ([D12] — local strips carried events)', async () => {
+    // A D12 workspace can carry its bootstrap-v1 hooks ONLY in the committed
+    // .claude/settings.json (the local writer skips carried events). Checking
+    // settings.local.json alone would double-fire those events against the
+    // user-scope harness wiring.
+    process.env.GBRAIN_HOOK_LANE = 'harness';
+    try {
+      const ws = mkdtempSync(join(tmpdir(), 'gb-lane-committed-'));
+      mkdirSync(join(ws, '.claude'), { recursive: true });
+      writeFileSync(
+        join(ws, '.claude', 'settings.json'),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [{ hooks: [{ type: 'command', command: 'gbrain hook session-start', _gbrain: 'bootstrap-v1' }] }],
+          },
+        }),
+      );
+      const out = collectStdout();
+      expect(await runHook(['session-start'], { ...out.io, stdin: '{}', cwd: ws })).toBe(0);
+      expect(out.get()).toBe('');
+      expect(existsSync(join(home(), 'integrations', 'hooks', 'heartbeat.jsonl'))).toBe(false);
+    } finally {
+      delete process.env.GBRAIN_HOOK_LANE;
+    }
   });
 });
 
@@ -217,6 +322,37 @@ describe('user-prompt', () => {
     expect((await lastHeartbeat())?.turns).toBe(5);
   });
 
+  // #5701: a >50MiB Claude session used to be refused at confinement, so the
+  // bounded tail read never ran and automatic capture stopped for the rest of
+  // the session. The newest turns still have to reach the window.
+  test('a transcript past TRANSCRIPT_HARD_CAP_BYTES still reaches the bounded tail read', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    let seen: TurnContextRequest | null = null;
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen = r; } });
+    const projRoot = join(tmp, 'projects');
+    mkdirSync(join(projRoot, 'p1'), { recursive: true });
+    const transcript = join(projRoot, 'p1', 'long.jsonl');
+    // Oldest-first: bulk padding (not JSON — a whole-file parse would count it
+    // as skipped lines), then the newest real turns the tail read must find.
+    const fixture = readFileSync(FIXTURE, 'utf8').trimEnd();
+    writeFileSync(transcript, `${'x'.repeat(TRANSCRIPT_HARD_CAP_BYTES + 4096)}\n${fixture}\n`);
+    expect(statSync(transcript).size).toBeGreaterThan(TRANSCRIPT_HARD_CAP_BYTES);
+
+    const out = collectStdout();
+    await runHook(['user-prompt'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'still capturing?', transcript_path: transcript, session_id: 's-5701' }),
+      transcriptRoot: projRoot,
+    });
+
+    const hb = await lastHeartbeat();
+    expect(hb?.outcome).not.toBe('degraded');
+    expect(hb?.reason).not.toBe('transcript_too_large');
+    expect(seen).not.toBeNull();
+    expect(seen!.window.map(t => t.text).join(' ')).not.toContain('SIDECHAIN-ONLY-TEXT');
+  });
+
   test('cross-turn dedupe: previously-injected blocks ride priorContextText; channel defaults to claude-code', async () => {
     const dataDir = join(tmp, 'data');
     writePgliteConfig(dataDir);
@@ -279,7 +415,7 @@ describe('user-prompt', () => {
     expect(prior.split('pages/dup').length - 1).toBeLessThanOrEqual(1);
   });
 
-  test('--harness codex flags the channel; unknown values fall back to the default', async () => {
+  test('--harness codex/opencode flags the channel; unknown values fall back to the default', async () => {
     const dataDir = join(tmp, 'data');
     writePgliteConfig(dataDir);
     const seen: TurnContextRequest[] = [];
@@ -289,22 +425,57 @@ describe('user-prompt', () => {
       ...out.io,
       stdin: JSON.stringify({ prompt: 'hello Acme' }),
     });
+    // opencode widening (v0.45.x): pins the hook.ts flag parse — a regression
+    // there silently rebadges opencode deliveries as claude-code (the wire
+    // guard half is pinned in volunteer-events-delivery.test.ts).
+    await runHook(['user-prompt', '--harness', 'opencode'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'hello Acme' }),
+    });
     await runHook(['user-prompt', '--harness', 'vim'], {
       ...out.io,
       stdin: JSON.stringify({ prompt: 'hello Acme' }),
     });
-    expect(seen).toHaveLength(2);
+    expect(seen).toHaveLength(3);
     expect(seen[0].channel).toBe('codex');
-    expect(seen[1].channel).toBe('claude-code'); // fail-open to the default
+    expect(seen[1].channel).toBe('opencode');
+    expect(seen[2].channel).toBe('claude-code'); // fail-open to the default
   });
 
   test('hook ∈ STARTUP_HOOK_SKIP_COMMANDS (source grep — maybeEmitUpdateMarker no-ops under NODE_ENV=test, so no runtime test can pin this)', () => {
-    const cliSrc = readFileSync(join(import.meta.dir, '..', 'src', 'cli.ts'), 'utf8');
-    const m = cliSrc.match(/const STARTUP_HOOK_SKIP_COMMANDS = new Set\(\[[\s\S]*?\]\);/);
+    // Refactor wave 1 (W4 cli): STARTUP_HOOK_SKIP_COMMANDS is derived from the
+    // command table; the hook record carries the membership.
+    const tableSrc = surfaceFileSource('cli', 'src/cli/command-table.ts');
+    const m = tableSrc.match(/\{ name: 'hook', [^\n]*\},/);
     expect(m).not.toBeNull();
     // user-prompt fires once per user PROMPT: a stale update cache would
     // otherwise spawn a detached check-update child per prompt.
-    expect(m![0]).toContain("'hook'");
+    expect(m![0]).toContain('skipStartupHooks: true');
+    expect(STARTUP_HOOK_SKIP_COMMANDS.has('hook')).toBe(true);
+  });
+
+  test('--harness codex confines the transcript to the Codex rollout store and parses it as a rollout (#5941)', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    const seen: TurnContextRequest[] = [];
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen.push(r); } });
+    const savedCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = join(tmp, 'codex');
+    try {
+      const day = join(tmp, 'codex', 'sessions', '2026', '10', '12');
+      mkdirSync(day, { recursive: true });
+      const rollout = join(day, 'rollout-2026-10-12T00-00-00-s-codex.jsonl');
+      writeFileSync(rollout, `${JSON.stringify({ timestamp: 't1', type: 'event_msg', payload: { type: 'user_message', message: 'earlier question about Acme' } })}\n`);
+      const out = collectStdout();
+      expect(await runHook(['user-prompt', '--harness', 'codex'], { ...out.io, stdin: JSON.stringify({ prompt: 'and now?', transcript_path: rollout, session_id: 's-codex' }) })).toBe(0);
+      expect((await lastHeartbeat())?.reason).not.toBe('transcript_outside_projects_dir');
+      expect(seen).toHaveLength(1);
+      expect(seen[0].window.map((t) => t.text)).toEqual(['earlier question about Acme', 'and now?']);
+      expect(JSON.parse(out.get()).hookSpecificOutput.additionalContext).toContain('ok');
+    } finally {
+      if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = savedCodexHome;
+    }
   });
 
   test('confinement rejection aborts: heartbeat + exit 0 empty [S3#8]', async () => {
@@ -322,6 +493,35 @@ describe('user-prompt', () => {
     ).toBe(0);
     expect(out.get()).toBe('');
     expect((await lastHeartbeat())?.reason).toBe('transcript_outside_projects_dir');
+  });
+
+  // #5465: Claude Code writes transcripts asynchronously, so turn 1 of a
+  // fresh session (or the only turn of `claude -p`) can hand the hook a
+  // path that does not exist yet. A CONFINED absent path has nothing to
+  // read — the same trust as no transcript_path at all — so the event
+  // proceeds prompt-only instead of aborting with transcript_unreadable.
+  test('#5465: an absent transcript inside the root still delivers prompt-only context', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'CTX: first-turn context' });
+    const projectsRoot = join(tmp, 'projects-root-5465');
+    // The project DIRECTORY exists (Claude Code creates it); only the
+    // session file is not written yet — the shape the issue observed.
+    mkdirSync(join(projectsRoot, 'proj-slug'), { recursive: true });
+    const absent = join(projectsRoot, 'proj-slug', 'fresh-session.jsonl');
+    const out = collectStdout();
+    expect(
+      await runHook(['user-prompt'], {
+        ...out.io,
+        stdin: JSON.stringify({ prompt: 'first turn of a fresh session', transcript_path: absent }),
+        transcriptRoot: projectsRoot,
+      }),
+    ).toBe(0);
+    const parsed = JSON.parse(out.get().trim());
+    expect(parsed.hookSpecificOutput.additionalContext).toBe('CTX: first-turn context');
+    const hb = await lastHeartbeat();
+    expect(hb?.outcome).toBe('ok');
+    expect(hb?.turns).toBe(1);
   });
 
   test('unauthorized (server holds a different secret) degrades cleanly', async () => {
@@ -455,7 +655,7 @@ describe('session-start', () => {
     expect(out.get()).not.toContain('run gbrain doctor');
   });
 
-  test('last-session line + stale push-status surfaced [B4]', async () => {
+  test('stale push-status surfaced; no buffered session text at session start [B4, #5558]', async () => {
     const liveDir = join(home(), 'transcripts', 'live');
     mkdirSync(liveDir, { recursive: true });
     writeFileSync(join(liveDir, 'prev.txt'), JSON.stringify({ ts: '2026-08-07T09:00:00Z', session_id: 'prev', exchange: 'wrapped up the acme-example memo' }) + '\n');
@@ -465,11 +665,29 @@ describe('session-start', () => {
     const ws = join(tmp, 'ws');
     mkdirSync(ws, { recursive: true });
     const out = collectStdout();
-    await runHook(['session-start'], { ...out.io, stdin: '', cwd: ws });
+    await runHook(['session-start'], { ...out.io, stdin: JSON.stringify({ session_id: 'prev', cwd: ws }), cwd: ws });
     const text = out.get();
-    expect(text).toContain('Last session activity');
-    expect(text).toContain('acme-example memo');
+    expect(text).not.toContain('Last session activity');
+    expect(text).not.toContain('acme-example memo');
     expect(text).toContain('>48h ago');
+  });
+
+  test('#5558: no hook event surfaces another session\'s text (every event, every buffer shape)', async () => {
+    const liveDir = join(home(), 'transcripts', 'live');
+    mkdirSync(liveDir, { recursive: true });
+    const secrets = ['private-json-exchange-marker', 'private-raw-line-marker', 'private-own-session-marker'];
+    writeFileSync(join(liveDir, 'other-agent.txt'), JSON.stringify({ ts: '2026-09-30T09:00:00Z', session_id: 'other-agent', exchange: secrets[0] }) + '\n');
+    writeFileSync(join(liveDir, 'unknown.txt'), secrets[1] + '\n');
+    writeFileSync(join(liveDir, 'me.txt'), JSON.stringify({ ts: '2026-09-30T09:01:00Z', session_id: 'me', exchange: secrets[2] }) + '\n');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    for (const event of HOOK_EVENTS) {
+      for (const stdin of ['', JSON.stringify({ session_id: 'me', cwd: ws, source: 'compact' })]) {
+        const out = collectStdout();
+        await runHook([event], { ...out.io, stdin, cwd: ws, spawnPush: () => {}, transcriptRoot: join(tmp, 'projects') });
+        for (const secret of secrets) expect(out.get()).not.toContain(secret);
+      }
+    }
   });
 
   test('parser-drift status file surfaced at session start [G3]', async () => {
@@ -486,7 +704,7 @@ describe('session-start', () => {
 // ── stop [G15] ──────────────────────────────────────────────────────────────
 
 describe('stop', () => {
-  test('appends to the per-session buffer (sanitized id) and GCs stale buffers', async () => {
+  test('writes no session buffer and GCs stale buffers left by older binaries [#5558]', async () => {
     const liveDir = join(home(), 'transcripts', 'live');
     mkdirSync(liveDir, { recursive: true });
     const stale = join(liveDir, 'stale.txt');
@@ -494,16 +712,14 @@ describe('stop', () => {
     const old = (Date.now() - 8 * 24 * 3600 * 1000) / 1000;
     utimesSync(stale, old, old);
 
-    expect(
-      await runHook(['stop'], {
-        stdin: JSON.stringify({ session_id: 'abc/../def', last_assistant_message: 'the widget-co answer' }),
-      }),
-    ).toBe(0);
-    const files = readdirSync(liveDir);
-    expect(files).toContain('abc-..-def.txt'); // '/' sanitized, no traversal possible
-    expect(files).not.toContain('stale.txt');
-    const body = readFileSync(join(liveDir, 'abc-..-def.txt'), 'utf8');
-    expect(body).toContain('the widget-co answer');
+    for (const session_id of ['abc/../def', undefined]) {
+      expect(
+        await runHook(['stop'], {
+          stdin: JSON.stringify({ session_id, last_assistant_message: 'the widget-co answer' }),
+        }),
+      ).toBe(0);
+    }
+    expect(readdirSync(liveDir)).toEqual([]);
     expect((await lastHeartbeat())?.outcome).toBe('ok');
   });
 });
@@ -538,7 +754,7 @@ describe('session-end', () => {
         transcriptRoot: projRoot,
       }),
     ).toBe(0);
-    const corpus = join(home(), 'transcripts', 'corpus', 'sess-red.txt');
+    const corpus = spooled('sess-red.txt');
     expect(existsSync(corpus)).toBe(true);
     const body = readFileSync(corpus, 'utf8');
     expect(body).not.toContain(planted);
@@ -566,10 +782,49 @@ describe('session-end', () => {
       stdin: JSON.stringify({ session_id: 'sess-dup', transcript_path: t2, cwd: ws }),
       transcriptRoot: projRoot,
     });
-    const corpusDir = join(home(), 'transcripts', 'corpus');
-    const files = readdirSync(corpusDir).filter((f) => f.startsWith('sess-dup'));
-    expect(files).toEqual(['sess-dup.txt']);
-    expect(readFileSync(join(corpusDir, 'sess-dup.txt'), 'utf8')).toContain('resumed pass content');
+    const corpusDir = join(home(), 'transcripts', 'corpus', 'sourced');
+    const files = readdirSync(corpusDir).filter((f) => f.startsWith('sess-dup')).sort();
+    // One corpus file plus the session's one seat sidecar (#4618) and its source record (#6268).
+    expect(files).toEqual(['sess-dup.seat.json', 'sess-dup.source.json', 'sess-dup.src-_unresolved.txt']);
+    expect(readFileSync(spooled('sess-dup.txt'), 'utf8')).toContain('resumed pass content');
+  });
+
+  // #5413: a claude-cli scratch session (gbrain's own LLM call) must never
+  // reach the dream corpus — path fingerprint OR payload cwd both refuse.
+  test('claude-cli self-transcript is skipped, not written to the corpus (#5413)', async () => {
+    const projRoot = join(tmp, 'projects');
+    const scratch = join(tmp, 'gbrain-claude-cli-cwd-4242');
+    mkdirSync(scratch, { recursive: true });
+    // The scratch session's rollout lives under the slugified scratch cwd.
+    const transcript = seedTranscript(join(projRoot, '-tmp-gbrain-claude-cli-cwd-4242'), 's.jsonl', [
+      userLine('extract facts from this page'),
+      assistantLine('{"facts": []}'),
+    ]);
+    expect(
+      await runHook(['session-end'], {
+        stdin: JSON.stringify({ session_id: 'sess-self', transcript_path: transcript, cwd: scratch }),
+        transcriptRoot: projRoot,
+      }),
+    ).toBe(0);
+    expect(existsSync(spooled('sess-self.txt'))).toBe(false);
+    const hb = await lastHeartbeat();
+    expect(hb?.outcome).toBe('ok');
+    expect(hb?.segment).toBe('self_transcript');
+  });
+
+  test('claude-cli scratch cwd alone refuses the corpus write even with a clean path (#5413)', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 's.jsonl', [userLine('ordinary looking turn')]);
+    const scratch = join(tmp, 'gbrain-claude-cli-cwd-7777');
+    mkdirSync(scratch, { recursive: true });
+    expect(
+      await runHook(['session-end'], {
+        stdin: JSON.stringify({ session_id: 'sess-self2', transcript_path: transcript, cwd: scratch }),
+        transcriptRoot: projRoot,
+      }),
+    ).toBe(0);
+    expect(existsSync(spooled('sess-self2.txt'))).toBe(false);
+    expect((await lastHeartbeat())?.segment).toBe('self_transcript');
   });
 
   test('resumed session rewrite drops the stale .ingested/.in-progress sidecars so the sweep re-ingests', async () => {
@@ -583,8 +838,8 @@ describe('session-end', () => {
       stdin: JSON.stringify({ session_id: 'sess-resume', transcript_path: t1, cwd: ws }),
       transcriptRoot: projRoot,
     });
-    const corpusDir = join(home(), 'transcripts', 'corpus');
-    const corpusFile = join(corpusDir, 'sess-resume.txt');
+    const corpusDir = join(home(), 'transcripts', 'corpus', 'sourced');
+    const corpusFile = spooled('sess-resume.txt');
     expect(existsSync(corpusFile)).toBe(true);
 
     // Simulate the sweep having ingested it (completion sidecar) and a stale
@@ -612,11 +867,14 @@ describe('session-end', () => {
     expect(readdirSync(corpusDir).filter((f) => f.includes('.tmp-'))).toEqual([]);
   });
 
-  test('retention prune: corpus files past the default 30d window are removed [G15]', async () => {
+  test('retention prune: extracted corpus files past the default 30d window are removed [G15]', async () => {
     const corpusDir = join(home(), 'transcripts', 'corpus');
     mkdirSync(corpusDir, { recursive: true });
     const oldFile = join(corpusDir, 'ancient.txt');
     writeFileSync(oldFile, 'old corpus\n');
+    // E-N1 (D16): only an extracted file goes at plain retention; an
+    // unextracted one is kept to 3x (test/corpus-retention-uningested.serial.test.ts).
+    writeFileSync(oldFile + '.ingested', '{}\n');
     const old = (Date.now() - 40 * 24 * 3600 * 1000) / 1000;
     utimesSync(oldFile, old, old);
     const freshFile = join(corpusDir, 'fresh.txt');
@@ -654,7 +912,7 @@ describe('session-end', () => {
     const status = JSON.parse(readFileSync(await hookStatusPath(), 'utf8'));
     expect(status.error).toBe('parser_drift');
     // No corpus file for a drift session.
-    expect(existsSync(join(home(), 'transcripts', 'corpus', 'sess-drift.txt'))).toBe(false);
+    expect(existsSync(spooled('sess-drift.txt'))).toBe(false);
   });
 
   test('confinement rejection: degraded heartbeat, no corpus write [S3#8]', async () => {
@@ -667,7 +925,7 @@ describe('session-end', () => {
       transcriptRoot: join(tmp, 'projects'),
     });
     expect((await lastHeartbeat())?.reason).toBe('transcript_outside_projects_dir');
-    expect(existsSync(join(home(), 'transcripts', 'corpus', 'sess-out.txt'))).toBe(false);
+    expect(existsSync(spooled('sess-out.txt'))).toBe(false);
   });
 
   test('GCs this session\'s stop buffer [G15]', async () => {
@@ -1027,9 +1285,40 @@ describe('stop-hook per-turn push [D3]', () => {
     await runHook(['stop'], stopIo(repo, spawned));
     expect(spawned).toEqual([]);
     expect((await lastHeartbeat())?.reason).toBe('push_clean');
-    // the live-buffer append still happened (stop's original contract)
-    const bufDir = join(home(), 'transcripts', 'live');
-    expect(readdirSync(bufDir).some((n) => n.includes('sess-stop-push'))).toBe(true);
+    // #5558: stop no longer writes a live buffer
+    expect(existsSync(join(home(), 'transcripts', 'live', 'sess-stop-push.txt'))).toBe(false);
+  });
+
+  test('#5371: tree whose only change is the managed ownership stamp: push_clean, no spawn', async () => {
+    const repo = bootRepo('stop-stamp-only', { clean: true });
+    writeFileSync(join(repo, '.gbrain-owner.json'), '{}');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_clean');
+  });
+
+  test('#5371: a real change beside the ownership stamp is still unpushed work (#6083: its persistence owner pushes it, so no detached push)', async () => {
+    const repo = bootRepo('stop-stamp-dirty', { clean: true });
+    writeFileSync(join(repo, '.gbrain-owner.json'), '{}');
+    writeFileSync(join(repo, 'note.md'), 'unpushed\n');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_managed_coordinator');
+  });
+
+  test('#6083: no hook spawns the refused sources push on a managed canonical worktree', async () => {
+    const repo = bootRepo('managed-all-hooks');
+    writeFileSync(join(repo, '.gbrain-owner.json'), '{}');
+    const spawned: string[] = [];
+    await runHook(['session-start'], { write: () => {}, spawnPush: (root: string) => { spawned.push(root); }, stdin: '', cwd: repo });
+    expect((await lastHeartbeat())?.reason).toBe('push_managed_coordinator');
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect((await lastHeartbeat())?.reason).toBe('push_managed_coordinator');
+    expect(spawned).toEqual([]);
+    await runHook(['session-end'], { write: () => {}, spawnPush: (root: string) => { spawned.push(root); }, stdin: JSON.stringify({ session_id: 'sess-managed-end', cwd: repo }) });
+    expect(spawned).toEqual([]);
   });
 
   test('corrupt per-root state file is treated as due (fail-open)', async () => {
@@ -1211,5 +1500,221 @@ describe('user-prompt deadline', () => {
     expect(hb?.event).toBe('user-prompt');
     expect(hb?.outcome).toBe('degraded');
     expect(hb?.reason).toBe('deadline');
+  });
+});
+
+// ── compact segment lane + session-end remainder [cathedral 5] ──────────────
+
+const boundaryLine = () =>
+  JSON.stringify({ type: 'system', subtype: 'compact_boundary', content: 'conversation compacted' });
+
+describe('compact segment lane (cathedral 5)', () => {
+  const corpus = () => join(home(), 'transcripts', 'corpus', 'sourced');
+
+  test('banks a content-addressed since-last-boundary segment + ledger; heartbeat carries the code', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'c.jsonl', [
+      userLine('OLD-WINDOW-TEXT before the prior boundary'),
+      boundaryLine(),
+      userLine('NEW-WINDOW-TEXT after the prior boundary'),
+      assistantLine('assistant reply in the new window'),
+    ]);
+    expect(
+      await runHook(['compact'], {
+        stdin: JSON.stringify({ session_id: 'sess-seg', transcript_path: transcript }),
+        transcriptRoot: projRoot,
+      }),
+    ).toBe(0);
+    const files = readdirSync(corpus()).filter((f) => f.startsWith('sess-seg.seg-') && f.endsWith('.txt'));
+    expect(files).toHaveLength(1);
+    const body = readFileSync(join(corpus(), files[0]), 'utf8');
+    expect(body).toContain('NEW-WINDOW-TEXT');
+    expect(body).not.toContain('OLD-WINDOW-TEXT');
+    const ledger = JSON.parse(readFileSync(join(corpus(), 'sess-seg.ledger.json'), 'utf8')) as Array<{ hash: string }>;
+    expect(ledger).toHaveLength(1);
+    expect(files[0]).toContain(ledger[0].hash);
+    const hb = await lastHeartbeat();
+    expect(hb?.event).toBe('compact');
+    expect(hb?.segment).toBe('segment_banked');
+    // No serve configured in this test home — the banking IPC degrades AFTER
+    // the segment was durably written (durability-first ordering).
+    expect(hb?.outcome).toBe('degraded');
+    expect(hb?.reason).toBe('no_pglite_path');
+  });
+
+  test('identical retry is idempotent: same file, segment_dup, single ledger entry', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'd.jsonl', [
+      userLine('window content that will retry'),
+    ]);
+    const io = {
+      stdin: JSON.stringify({ session_id: 'sess-dup2', transcript_path: transcript }),
+      transcriptRoot: projRoot,
+    };
+    await runHook(['compact'], io);
+    await runHook(['compact'], { ...io });
+    const files = readdirSync(corpus()).filter((f) => f.startsWith('sess-dup2.seg-'));
+    expect(files).toHaveLength(1);
+    const ledger = JSON.parse(readFileSync(join(corpus(), 'sess-dup2.ledger.json'), 'utf8')) as unknown[];
+    expect(ledger).toHaveLength(1);
+    expect((await lastHeartbeat())?.segment).toBe('segment_dup');
+  });
+
+  test('transcript ending AT a boundary ⇒ empty_window, no segment written', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'e.jsonl', [
+      userLine('everything is before the boundary'),
+      boundaryLine(),
+    ]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-empty', transcript_path: transcript }),
+      transcriptRoot: projRoot,
+    });
+    expect(readdirSync(corpus()).filter((f) => f.startsWith('sess-empty.seg-'))).toEqual([]);
+    expect((await lastHeartbeat())?.segment).toBe('empty_window');
+  });
+
+  test('deadline below the scan budget ⇒ deadline_scan, nothing written (never unscanned)', async () => {
+    const projRoot = join(tmp, 'projects');
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'f.jsonl', [userLine('some window text')]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-dl', transcript_path: transcript }),
+      transcriptRoot: projRoot,
+      compactDeadlineMs: 500, // < SEGMENT_MIN_BUDGET_MS(600) ⇒ deterministic deadline_scan
+    });
+    expect(existsSync(join(corpus(), 'sess-dl.ledger.json'))).toBe(false);
+    expect(readdirSync(existsSync(corpus()) ? corpus() : tmp).filter((f) => f.startsWith('sess-dl.seg-'))).toEqual([]);
+    expect((await lastHeartbeat())?.segment).toBe('deadline_scan');
+  });
+
+  test('segment content is secret-scanned at write time', async () => {
+    const projRoot = join(tmp, 'projects');
+    const planted = 'sk-' + 'FAKEfakeFAKEfake1234567890';
+    const transcript = seedTranscript(join(projRoot, 'p1'), 'g.jsonl', [
+      userLine(`the key is ${planted} in the compact window`),
+    ]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-red2', transcript_path: transcript }),
+      transcriptRoot: projRoot,
+    });
+    const files = readdirSync(corpus()).filter((f) => f.startsWith('sess-red2.seg-'));
+    expect(files).toHaveLength(1);
+    const body = readFileSync(join(corpus(), files[0]), 'utf8');
+    expect(body).not.toContain(planted);
+    expect(body).toContain('<REDACTED:openai>');
+  });
+});
+
+describe('session-end remainder (cathedral 5 dedup contract)', () => {
+  const corpus = () => join(home(), 'transcripts', 'corpus', 'sourced');
+
+  test('remainder-only when the compact-banked segment covers the boundary window', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    // 1. Compact fires BEFORE the boundary is written: window = w1.
+    const preCompact = seedTranscript(join(projRoot, 'p1'), 'r1.jsonl', [
+      userLine('W1-ONLY-TEXT first window'),
+    ]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-rem', transcript_path: preCompact }),
+      transcriptRoot: projRoot,
+    });
+    expect((await lastHeartbeat())?.segment).toBe('segment_banked');
+    // 2. The harness appends the boundary + the post-compaction turns.
+    const full = seedTranscript(join(projRoot, 'p1'), 'r1.jsonl', [
+      userLine('W1-ONLY-TEXT first window'),
+      boundaryLine(),
+      userLine('REMAINDER-TEXT second window'),
+    ]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-rem', transcript_path: full, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const body = readFileSync(spooled('sess-rem.txt'), 'utf8');
+    expect(body).toContain('REMAINDER-TEXT');
+    expect(body).not.toContain('W1-ONLY-TEXT'); // already segment-banked — not re-written
+    expect((await lastHeartbeat())?.segment).toBe('remainder');
+  });
+
+  test('no ledger coverage ⇒ full-transcript fallback exactly as before', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    const full = seedTranscript(join(projRoot, 'p1'), 'r2.jsonl', [
+      userLine('W1-TEXT'),
+      boundaryLine(),
+      userLine('W2-TEXT'),
+    ]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-fb', transcript_path: full, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const body = readFileSync(spooled('sess-fb.txt'), 'utf8');
+    expect(body).toContain('W1-TEXT');
+    expect(body).toContain('W2-TEXT');
+    expect((await lastHeartbeat())?.segment).toBe('full_fallback');
+  });
+
+  test('covered with empty remainder ⇒ skip_covered, no session corpus file written', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    const preCompact = seedTranscript(join(projRoot, 'p1'), 'r3.jsonl', [
+      userLine('ALL-BANKED-TEXT'),
+    ]);
+    await runHook(['compact'], {
+      stdin: JSON.stringify({ session_id: 'sess-skip', transcript_path: preCompact }),
+      transcriptRoot: projRoot,
+    });
+    const full = seedTranscript(join(projRoot, 'p1'), 'r3.jsonl', [
+      userLine('ALL-BANKED-TEXT'),
+      boundaryLine(),
+    ]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-skip', transcript_path: full, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    expect(existsSync(spooled('sess-skip.txt'))).toBe(false);
+    expect((await lastHeartbeat())?.segment).toBe('skip_covered');
+  });
+
+  test('orphaned sidecars are GC-ed at session-end; live pairs kept', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(corpus(), { recursive: true });
+    writeFileSync(join(corpus(), 'gone.txt.ingested'), '');
+    writeFileSync(join(corpus(), 'live.txt'), 'x');
+    writeFileSync(join(corpus(), 'live.txt.in-progress'), '');
+    const t1 = seedTranscript(join(projRoot, 'p1'), 'r4.jsonl', [userLine('gc trigger content')]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-gc', transcript_path: t1, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const names = readdirSync(corpus());
+    expect(names).not.toContain('gone.txt.ingested');
+    expect(names).toContain('live.txt');
+    expect(names).toContain('live.txt.in-progress');
+  });
+
+  test('#5887: session-end reaps orphaned .progress sidecars and keeps a resumed session\'s live .progress', async () => {
+    const projRoot = join(tmp, 'projects');
+    const ws = join(tmp, 'ws');
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(corpus(), { recursive: true });
+    writeFileSync(join(corpus(), 'gone.txt.progress'), '{}');
+    writeFileSync(join(corpus(), 'gone.txt.progress.lock'), '');
+    writeFileSync(spooled('sess-prog.txt.progress'), '{"generation":1}');
+    const t1 = seedTranscript(join(projRoot, 'p1'), 'r5.jsonl', [userLine('resumed session content')]);
+    await runHook(['session-end'], {
+      stdin: JSON.stringify({ session_id: 'sess-prog', transcript_path: t1, cwd: ws }),
+      transcriptRoot: projRoot,
+    });
+    const names = readdirSync(corpus());
+    expect(names).not.toContain('gone.txt.progress');
+    expect(names).not.toContain('gone.txt.progress.lock');
+    expect(names).toContain('sess-prog.src-_unresolved.txt');
+    expect(readFileSync(spooled('sess-prog.txt.progress'), 'utf8')).toBe('{"generation":1}');
   });
 });

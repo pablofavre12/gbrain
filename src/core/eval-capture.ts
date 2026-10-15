@@ -64,7 +64,7 @@ export interface CaptureContext {
   latency_ms: number;
   /** OperationContext.remote — true for MCP callers, false for local CLI. */
   remote: boolean;
-  /** The `expand` flag as requested by the caller (query-only; null for search). */
+  /** The raw `expand` param the caller passed (query-only): null when unset (the mode decided) and for search. What ran is `meta.expansion_applied`. */
   expand_enabled: boolean | null;
   /** The `detail` flag as requested (query-only). */
   detail: 'low' | 'medium' | 'high' | null;
@@ -254,10 +254,11 @@ export function isEvalCaptureEnabled(config: GBrainConfig | null | undefined): b
   return process.env.GBRAIN_CONTRIBUTOR_MODE === '1';
 }
 
-// `gbrain config set eval.capture true` writes the DB plane, but the op layer
-// only ever received the file/env config — so on a DB-first server the flag
-// read `true` and capture stayed off. Cached per engine so the hot path pays
-// one config read per TTL, not one per query.
+// `gbrain config set eval.capture true` writes the DB plane. #1475 merged it
+// for CLI contexts (loadConfigWithEngine), but the MCP HTTP dispatch still
+// builds ctx.config from loadConfig() — so on a DB-first server capture stayed
+// off. Read it here, cached per engine (one config read per TTL), with the
+// same strict parse as #1475: only 'true'/'false' count, anything else is unset.
 const DB_PLANE_CAPTURE_TTL_MS = 60_000;
 let dbPlaneCaptureCache = new WeakMap<object, { at: number; value: boolean | undefined }>();
 
@@ -273,7 +274,7 @@ async function readDbPlaneCapture(engine: BrainEngine): Promise<boolean | undefi
   let value: boolean | undefined;
   try {
     const raw = typeof engine.getConfig === 'function' ? await engine.getConfig('eval.capture') : null;
-    value = raw === undefined || raw === null || raw === '' ? undefined : raw === 'true';
+    value = raw === 'true' ? true : raw === 'false' ? false : undefined;
   } catch {
     value = undefined;
   }

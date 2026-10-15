@@ -23,6 +23,11 @@ export const voyage: Recipe = {
   name: 'Voyage AI',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'voyage-4-nano',
+  ],
   base_url_default: 'https://api.voyageai.com/v1',
   auth_env: {
     required: ['VOYAGE_API_KEY'],
@@ -32,10 +37,16 @@ export const voyage: Recipe = {
     embedding: {
       models: [
         'voyage-4-large', 'voyage-4', 'voyage-4-lite', 'voyage-4-nano',
+        'voyage-code-4',
         'voyage-3.5', 'voyage-3-large', 'voyage-3', 'voyage-3-lite',
         'voyage-code-3', 'voyage-finance-2', 'voyage-law-2',
         'voyage-multimodal-3',
       ],
+      // v0.46.3: canonical pick for every "choose a model for the user" surface.
+      // models[0] is voyage-4-large (quality order); the new-install default is
+      // voyage-4 (price/quality balance, shared v4 embedding space) — see
+      // NEW_INSTALL_DEFAULT_EMBEDDING_MODEL in ai/defaults.ts.
+      default_model: 'voyage-4',
       default_dims: 1024,
       // Display hint for `gbrain providers` only (billing math goes through
       // src/core/embedding-pricing.ts). Rate for the default voyage-4-large.
@@ -58,6 +69,27 @@ export const voyage: Recipe = {
       // which gateway.ts:626 misclassifies as transient (TODO: reclassify
       // 4xx).
       multimodal_models: ['voyage-multimodal-3'],
+    },
+    reranker: {
+      // rerank-3 / rerank-3-lite are Voyage's current generation (generally
+      // available; Voyage lists the 2.5 pair as older models, docs verified
+      // 2026-10-14) on the same /rerank wire (path + top_param unchanged).
+      // rerank-3-lite is the default since gbrain-evals #148 (v0.10.93): 60%
+      // cheaper than rerank-2.5 at 50 candidates x 1,400 tokens, quality
+      // within noise. A brain with an explicit `search.reranker.model` keeps
+      // it; roll back with `gbrain config set search.reranker.model voyage:rerank-2.5`.
+      models: ['rerank-2.5', 'rerank-2.5-lite', 'rerank-3', 'rerank-3-lite'],
+      default_model: 'rerank-3-lite',
+      path: '/rerank',
+      top_param: 'top_k',
+      // https://docs.voyageai.com/docs/pricing (verified 2026-10-14):
+      // rerank-2.5 / rerank-3 $0.05/M, rerank-2.5-lite / rerank-3-lite
+      // $0.02/M. Per-model billing math goes through
+      // src/core/embedding-pricing.ts; this scalar is a display hint for the
+      // default model.
+      cost_per_1m_tokens_usd: 0.02,
+      price_last_verified: '2026-10-14',
+      max_payload_bytes: 5_000_000,
     },
   },
   setup_hint: 'Get an API key at https://dash.voyageai.com/api-keys, then `export VOYAGE_API_KEY=...`',

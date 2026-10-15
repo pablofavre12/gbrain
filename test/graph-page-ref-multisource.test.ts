@@ -25,7 +25,7 @@ function ctx(allowedSources: string[]): OperationContext {
 
 async function put(sourceId: string, slug: string, title = slug) {
   await engine.putPage(slug, {
-    type: 'note', title, compiled_truth: '', timeline: '', frontmatter: {},
+    type: slug.startsWith('people/') ? 'person' : slug.startsWith('companies/') ? 'company' : 'note', title, compiled_truth: '', timeline: '', frontmatter: {},
   }, { sourceId });
   return (await engine.getPage(slug, { sourceId }))!;
 }
@@ -111,7 +111,6 @@ describe('source-aware graph references', () => {
 
     const nodes = await traverse.handler(ctx(['default', 'src-b']), {
       page_id: root.id,
-      source_id: 'default',
       depth: 1,
     }) as any[];
     const sameSlug = nodes.filter((node) => node.slug === 'people/alice');
@@ -119,10 +118,44 @@ describe('source-aware graph references', () => {
       expect.objectContaining({ source_id: 'default', page_id: sharedDefault.id }),
       expect.objectContaining({ source_id: 'src-b', page_id: sharedB.id }),
     ]));
+    const narrowed = await traverse.handler(ctx(['default', 'src-b']), {page_id: root.id, source_id: 'default', depth: 1}) as any[];
+    expect(narrowed.every(node => node.source_id === 'default')).toBe(true);
     const rootNode = nodes.find((node) => node.page_id === root.id);
     expect(rootNode.links).toEqual(expect.arrayContaining([
       expect.objectContaining({ to: { source_id: 'default', page_id: sharedDefault.id, slug: sharedDefault.slug } }),
       expect.objectContaining({ to: { source_id: 'src-b', page_id: sharedB.id, slug: sharedB.slug } }),
     ]));
   });
+});
+
+test('typed hops start only at the requested page identity across homonymous rooms', async () => {
+  const a = await put('default', 'people/same'); const b = await put('src-b', 'people/same');
+  await put('default', 'companies/a'); await put('src-b', 'companies/b');
+  await engine.addLinksBatch([
+    {from_slug:a.slug, to_slug:'companies/a', from_source_id:'default', to_source_id:'default', link_type:'founded'},
+    {from_slug:b.slug, to_slug:'companies/b', from_source_id:'src-b', to_source_id:'src-b', link_type:'founded'},
+  ]);
+  for (const [page, expected] of [[a, 'companies/a'], [b, 'companies/b']] as const) {
+    const result = await traverse.handler(ctx(['default','src-b']), {page_id:page.id, hops:[{link_type:'founded',toward:'object'}]}) as any;
+    expect(result.answers.map((answer: any) => answer.slug)).toEqual([expected]);
+  }
+});
+
+
+test('typed backlinks preserve page_id and source-qualified homonymous roots', async () => {
+  const targetA = await put('default', 'people/typed-target');
+  const targetB = await put('src-b', 'people/typed-target');
+  for (const [sourceId, target] of [['default', targetA], ['src-b', targetB]] as const) {
+    await put(sourceId, `notes/ref-${sourceId}`);
+    await engine.addLinksBatch([{from_slug:`notes/ref-${sourceId}`, to_slug:target.slug,
+      from_source_id:sourceId, to_source_id:sourceId, link_type:'mentions'}]);
+  }
+  for (const target of [targetA, targetB]) {
+    for (const identity of [{page_id:target.id}, {slug:target.slug, source_id:target.source_id}]) {
+      const result = await backlinks.handler(ctx(['default','src-b']), {...identity, type:'note'}) as any[];
+      expect(result).toHaveLength(1);
+      expect(result[0].to_page_id).toBe(target.id);
+      expect(result[0].from_source_id).toBe(target.source_id);
+    }
+  }
 });

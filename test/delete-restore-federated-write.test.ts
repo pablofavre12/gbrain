@@ -62,7 +62,7 @@ function directorioCtx(overrides: Partial<OperationContext> = {}): OperationCont
 describe('delete_page honors federated_write (delete tracks write)', () => {
   test('(a) no source → targets ctx.sourceId', async () => {
     const result = await delete_page.handler(directorioCtx(), { slug: 'wiki/x' });
-    expect(result).toMatchObject({ dry_run: true, action: 'soft_delete_page', slug: 'wiki/x', source: 'directorio' });
+    expect(result).toMatchObject({ dry_run: true, action: 'delete_page', slug: 'wiki/x', source: 'directorio' });
   });
 
   test('(b) source in federated_write set → targets there', async () => {

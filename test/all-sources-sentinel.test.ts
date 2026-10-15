@@ -142,6 +142,58 @@ describe('__all__ is never narrower than an unqualified read', () => {
     // …and __all__ must be a superset of that: the whole brain ({}).
     const all = ctxOf({ remote: false, sourceId: '__all__' });
     expect(federatedSearchScope(all)).toEqual({});
+
+    // An explicit sentinel keeps trusted-local whole-brain semantics too.
+    expect(federatedSearchScope(unqualified, '__all__')).toEqual({});
+  });
+
+  test('grantless stdio treats explicit __all__ like an omitted source', () => {
+    const ctx = ctxOf({
+      remote: true,
+      sourceId: 'default',
+      localFederatedSourceIds: ['default', 'src-a', 'src-b'],
+    });
+
+    expect(federatedSearchScope(ctx)).toEqual({
+      aclSubjectIds: [],
+      sourceIds: ['default', 'src-a', 'src-b'],
+    });
+    expect(federatedSearchScope(ctx, '__all__')).toEqual({
+      aclSubjectIds: [],
+      sourceIds: ['default', 'src-a', 'src-b'],
+    });
+    // #5081 (CEO-A12): an explicit source inside the transport's federated
+    // set is admitted (never wider than the unqualified read above); any
+    // other explicit source is still refused.
+    expect(federatedSearchScope(ctx, 'src-a')).toEqual({ sourceId: 'src-a', aclSubjectIds: [] });
+    expect(() => federatedSearchScope(ctx, 'src-z')).toThrow('outside your granted sources');
+  });
+
+  test('remote scalar scope stays pinned when no transport federation exists', () => {
+    const ctx = ctxOf({ remote: true, sourceId: 'src-b' });
+    expect(federatedSearchScope(ctx, '__all__')).toEqual({ sourceId: 'src-b', aclSubjectIds: [] });
+  });
+
+  test('OAuth grants, including empty grants, stay authoritative over local federation', () => {
+    const localFederatedSourceIds = ['default', 'src-a', 'src-b'];
+    const granted = ctxOf({
+      remote: true,
+      sourceId: 'default',
+      localFederatedSourceIds,
+      auth: { token: 't', clientId: 'c', scopes: [], allowedSources: ['tenant-a', 'tenant-b'] } as any,
+    });
+    expect(federatedSearchScope(granted, '__all__')).toEqual({
+      aclSubjectIds: ['client:c'],
+      sourceIds: ['tenant-a', 'tenant-b'],
+    });
+
+    const emptyGrant = ctxOf({
+      remote: true,
+      sourceId: 'default',
+      localFederatedSourceIds,
+      auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any,
+    });
+    expect(federatedSearchScope(emptyGrant, '__all__')).toEqual({ sourceId: 'default', aclSubjectIds: ['client:c'] });
   });
 });
 
@@ -149,14 +201,14 @@ describe('__all__ is never narrower than an unqualified read', () => {
 
 describe('cli makeContext — no silent default fallback for explicit --source', () => {
   test('--source __all__ produces ctx.sourceId __all__ (was: silent default)', async () => {
-    const { makeContext } = await import('../src/cli.ts');
+    const { makeContext } = await import('../src/cli/main.ts');
     const ctx = await makeContext(makeStub(['default']), { source: '__all__' });
     expect(ctx.sourceId).toBe('__all__');
     expect(ctx.remote).toBe(false);
   });
 
   test('an explicit --source that fails to resolve throws instead of becoming default', async () => {
-    const { makeContext } = await import('../src/cli.ts');
+    const { makeContext } = await import('../src/cli/main.ts');
     await expect(makeContext(makeStub(['default']), { source: 'ghost' }))
       .rejects.toThrow(/not found/);
     await expect(makeContext(makeStub(['default']), { source: 'my_source' }))
@@ -164,7 +216,7 @@ describe('cli makeContext — no silent default fallback for explicit --source',
   });
 
   test('ambient resolution failure still falls back silently (pre-init brains)', async () => {
-    const { makeContext } = await import('../src/cli.ts');
+    const { makeContext } = await import('../src/cli/main.ts');
     const broken = {
       kind: 'pglite',
       executeRaw: async () => { throw new Error('relation "sources" does not exist'); },

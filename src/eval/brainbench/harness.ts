@@ -33,7 +33,10 @@ import { scorePush } from './metrics/push.ts';
 import { runWriteBack, type WriteBackScore } from './metrics/write-back.ts';
 import { scoreContinuityPair } from './metrics/continuity.ts';
 import { SeedError, seedBrain, type SeedOutcome } from './seed.ts';
+import { assembleTrustCell, runTrustSuites } from './trust-suites.ts';
+import { configureDecideBrain, decideRowReceipt, decideSpendTotals, spendDelta, type DecideEvalRun } from '../decide-eval-flags.ts';
 import {
+  isTrustSuite,
   round4,
   toPublicTurn,
   type AdapterFixtureView,
@@ -56,6 +59,8 @@ export interface RunBrainBenchOpts {
   budgetUsd?: number;
   /** Progress note sink (CLI wires the shared stderr reporter). */
   onProgress?: (note: string) => void;
+  /** System One arm (`--decide`, src/eval/decide-eval-flags.ts): configures the benchmark brain and adds per-turn receipts. */
+  decide?: DecideEvalRun | null;
 }
 
 export interface RunBrainBenchOutput {
@@ -78,9 +83,18 @@ function makeAdapter(name: HarnessName): HarnessAdapter {
 
 const SEAM: Record<HarnessName, 'production' | 'contract'> = {
   openclaw: 'production',
-  'claude-code': 'contract',
+  // v0.46.15 (TODOS:556 P1): the claude-code row now drives the REAL
+  // UserPromptSubmit hook over the real IPC socket — see the adapter header.
+  'claude-code': 'production',
   codex: 'contract',
 };
+
+/** The SEAM map and the adapters' own seam fields must agree — pinned by
+ * test/brainbench-adapters.test.ts (outside-voice F4: the scoreboard reads
+ * THIS map, so a flipped adapter field alone changes nothing). */
+export function seamFor(name: HarnessName): 'production' | 'contract' {
+  return SEAM[name];
+}
 
 function adapterView(lf: LoadedFixture): AdapterFixtureView {
   return {
@@ -113,6 +127,7 @@ async function replayFixture(
   lf: LoadedFixture,
   seed: SeedOutcome,
   rowSuites: BrainBenchSuite[],
+  decide?: DecideEvalRun | null,
 ): Promise<TurnRow[]> {
   const view = adapterView(lf);
   const activeSource = view.active_source;
@@ -125,7 +140,9 @@ async function replayFixture(
         priorContext += `\n${turn.text}`;
         continue;
       }
+      const spendBefore = decide ? await decideSpendTotals(engine) : null;
       const result = await adapter.replayTurn(turn, priorContext);
+      const decideReceipt = decide && spendBefore ? decideRowReceipt(decide, result.decide, spendDelta(spendBefore, await decideSpendTotals(engine))) : null;
       const gold = lf.gold.turns[String(turn.turn_id)] ?? null;
       for (const suite of rowSuites) {
         rows.push({
@@ -138,6 +155,7 @@ async function replayFixture(
           gold,
           cross_source_slugs: crossSourceSlugs(result.injectedSlugs, seed.slugSource, activeSource),
           latency_ms: Math.round(result.latencyMs * 1000) / 1000,
+          ...(decideReceipt ? { decide: decideReceipt } : {}),
         });
       }
       priorContext += `\n${turn.text}`;
@@ -175,6 +193,28 @@ export async function runBrainBench(
   const turnRows: TurnRow[] = [];
   const seedFailures: Array<{ fixture_id: string; error: string }> = [];
 
+  // v0.46.15 (F4/R2-5): ONE adapter per harness per RUN, torn down in the
+  // finally — a production seam owns long-lived infrastructure (the
+  // claude-code IPC server) across fixtures instead of paying per-fixture
+  // setup (the ~15s gate stays fast). setupRun is LAZY on first replay
+  // (codex ship-review): a `--suite write-back` run replays nothing, so it
+  // must not require the IPC substrate; and a setup that only happens inside
+  // the try below can never leak a live socket server past the finally.
+  // Input dedupe: a duplicated harness name would construct two instances
+  // and orphan the first (Map overwrite).
+  const harnessList = [...new Set(opts.harnesses)];
+  const adapters = new Map<HarnessName, HarnessAdapter>();
+  for (const h of harnessList) adapters.set(h, makeAdapter(h));
+  const setUp = new Set<HarnessName>();
+  const adapterFor = async (h: HarnessName): Promise<HarnessAdapter> => {
+    const a = adapters.get(h)!;
+    if (!setUp.has(h)) {
+      setUp.add(h); // before the await — teardown must cover a FAILED setup too
+      await a.setupRun?.();
+    }
+    return a;
+  };
+
   const wantedSuites = new Set(opts.suites);
   const eligible = corpus.fixtures.filter((lf) => {
     if (lf.fixture.holdout && !opts.includeHoldout) return false;
@@ -184,7 +224,13 @@ export async function runBrainBench(
   // Continuity pairs are orchestrated separately from regular fixtures.
   const pairFixtures = new Map<string, { writer?: LoadedFixture; reader?: LoadedFixture }>();
   const regular: LoadedFixture[] = [];
+  // Memory-trust fixtures run on their own persistence-enabled brain after everything else (trust-scenario.ts).
+  const trustFixtures: LoadedFixture[] = [];
   for (const lf of eligible) {
+    if (lf.fixture.suites.some(isTrustSuite)) {
+      trustFixtures.push(lf);
+      continue;
+    }
     const cont = lf.fixture.continuity;
     if (cont && wantedSuites.has('continuity')) {
       const p = pairFixtures.get(cont.pair_id) ?? {};
@@ -205,6 +251,7 @@ export async function runBrainBench(
     stored_rows: 0, matched_any_gold: 0, fixtures: [], failed_items: [],
   };
   const continuityByReader = new Map<HarnessName, ContinuityAgg>();
+  let trustAgg: Awaited<ReturnType<typeof runTrustSuites>> | null = null;
 
   // RUN-scoped --llm budget (review finding: a per-invocation cap would
   // multiply by fixture count — ~$550 worst case on the committed corpus).
@@ -215,6 +262,7 @@ export async function runBrainBench(
   const engine = await createBenchmarkBrain();
   let fixturesRun = 0;
   try {
+    if (opts.decide) await configureDecideBrain(engine, opts.decide, { includeSearchPins: true });
     // ---- regular fixtures: seed once, replay all adapters, then mutate ----
     for (const lf of regular) {
       const id = lf.fixture.fixture_id;
@@ -236,9 +284,9 @@ export async function runBrainBench(
         (s): s is BrainBenchSuite => (s === 'know-to-ask' || s === 'push') && wantedSuites.has(s),
       );
       if (retrievalSuites.length > 0) {
-        for (const harness of opts.harnesses) {
-          const adapter = makeAdapter(harness);
-          const rows = await replayFixture(engine, adapter, lf, seed, retrievalSuites);
+        for (const harness of harnessList) {
+          const adapter = await adapterFor(harness);
+          const rows = await replayFixture(engine, adapter, lf, seed, retrievalSuites, opts.decide);
           turnRows.push(...rows);
         }
       }
@@ -315,9 +363,9 @@ export async function runBrainBench(
       }
 
       // Every requested harness reads the SAME persisted state (read-only).
-      for (const readerHarness of opts.harnesses) {
-        const readerAdapter = makeAdapter(readerHarness);
-        const readerRows = await replayFixture(engine, readerAdapter, reader, mergedSeed, ['continuity']);
+      for (const readerHarness of harnessList) {
+        const readerAdapter = await adapterFor(readerHarness);
+        const readerRows = await replayFixture(engine, readerAdapter, reader, mergedSeed, ['continuity'], opts.decide);
         turnRows.push(...readerRows);
 
         const activeSource = reader.fixture.active_source ?? 'default';
@@ -333,15 +381,31 @@ export async function runBrainBench(
         continuityByReader.set(readerHarness, agg);
       }
     }
+
+    // ---- memory-trust suites: real tiered writes, one source per fixture (trust-suites.ts) ----
+    if (trustFixtures.length > 0) {
+      trustAgg = await runTrustSuites(trustFixtures, { harnesses: harnessList, adapterFor, progress });
+      turnRows.push(...trustAgg.turnRows);
+      fixturesRun += trustFixtures.length;
+    }
   } finally {
+    for (const a of adapters.values()) {
+      try {
+        await a.teardownRun?.();
+      } catch {
+        /* teardown is best-effort — a leaked temp dir must not fail the run */
+      }
+    }
     await engine.disconnect();
   }
 
   // ---- assemble cells ----
   const cells: SuiteMetrics[] = [];
-  for (const harness of opts.harnesses) {
+  for (const harness of harnessList) {
     for (const suite of opts.suites) {
-      const cell = assembleCell(harness, suite, turnRows, writeBackAgg, continuityByReader, opts.llm);
+      const cell = isTrustSuite(suite)
+        ? (trustAgg ? assembleTrustCell(harness, suite, trustAgg, SEAM[harness]) : null)
+        : assembleCell(harness, suite, turnRows, writeBackAgg, continuityByReader, opts.llm);
       if (cell) cells.push(cell);
     }
   }

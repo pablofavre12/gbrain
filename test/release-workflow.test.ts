@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { expectedAssetName } from '../src/core/binary-self-update.ts';
+import { EXPECTED_BUILDER_IDS, expectedAssetName } from '../src/core/binary-self-update.ts';
 
 const ROOT = join(import.meta.dir, '..');
 const WORKFLOW = readFileSync(join(ROOT, '.github/workflows/release.yml'), 'utf8');
@@ -26,6 +26,25 @@ const EXPECTED_ASSETS = (
 ).map(([p, a]) => expectedAssetName(p, a) as string);
 
 describe('release.yml ↔ binary-self-update asset contract', () => {
+  test('release compiler is covered by the required native runtime matrix', () => {
+    const build = WORKFLOW.slice(WORKFLOW.indexOf('  build:'), WORKFLOW.indexOf('  release:'));
+    const compiler = build.match(/bun-version:\s*(\S+)/)?.[1];
+    expect(compiler).toBe('1.4.3');
+    const native = readFileSync(join(ROOT, '.github/workflows/native-locks.yml'), 'utf8');
+    const matrices = [...native.matchAll(/bun:\s*\[([^\]]+)\]/g)];
+    expect(matrices).toHaveLength(4);
+    for (const matrix of matrices) {
+      expect(matrix[1]).toContain(`'${compiler}'`);
+    }
+    expect(native).toContain('scripts/native/cli-persistence-smoke.ts');
+    expect(native).toContain('GBRAIN_TEST_OPENCLAW_BIN:');
+    expect(native).toContain("job.services.postgres.ports['5432']");
+    expect(native).toContain('openclaw@2026.9.4');
+    expect(native).toContain('bun test --timeout=60000 test/openclaw-context-engine-native.serial.test.ts');
+    expect(build).toContain('codesign --verify --strict --verbose=2');
+    expect(build.indexOf('codesign --verify')).toBeLessThan(build.indexOf('Smoke-test the compiled binary'));
+  });
+
   test('workflow build matrix produces exactly the assets the updater requests', () => {
     const artifacts = [...WORKFLOW.matchAll(/artifact:\s*(\S+)/g)].map((m) => m[1]).sort();
     expect(artifacts).toEqual([...EXPECTED_ASSETS].sort());
@@ -57,6 +76,43 @@ describe('release.yml ↔ binary-self-update asset contract', () => {
     const topLevel = WORKFLOW.slice(0, WORKFLOW.indexOf('jobs:'));
     expect(topLevel).toContain('contents: read');
     expect(topLevel).not.toContain('contents: write');
+  });
+
+  test('build attests provenance for the compiled binary (self-update integrity depends on it)', () => {
+    // binary-self-update verifies the downloaded asset against this attestation
+    // (verifyIntegrity). Removing the attest step would fail-close every fleet
+    // self-update (integrity_unavailable) with CI still green — this is the pin.
+    expect(WORKFLOW).toContain('attest-build-provenance');
+    expect(WORKFLOW).toMatch(/subject-path:\s*bin\/\$\{\{ matrix\.artifact \}\}/);
+  });
+
+  test('expected builder ids name this workflow file on a trusted ref', () => {
+    // verifyIntegrity accepts only attestations whose builder id is exactly
+    // release.yml@<trusted ref>. If the workflow file is renamed or the ref
+    // scheme changes, this test forces the constant to move in lockstep.
+    for (const id of EXPECTED_BUILDER_IDS) {
+      expect(id).toContain('/.github/workflows/release.yml@');
+      const ref = id.split('@')[1]!;
+      expect(ref.startsWith('refs/')).toBe(true);
+    }
+    // The workflow this repo actually ships from is the one the ids name.
+    expect(EXPECTED_BUILDER_IDS.some((id) => id.endsWith('@refs/heads/master'))).toBe(true);
+  });
+
+  test('release builds the admin UI fresh from source before compiling', () => {
+    // Supply-chain pin: the distributed binary's admin bundle must come from
+    // admin/src (built in the release job), never from committed admin/dist
+    // bytes. Deleting this step would silently re-trust the committed bundle.
+    expect(WORKFLOW).toContain('bun run build:admin');
+    expect(WORKFLOW).toMatch(/cd admin && bun install --frozen-lockfile/);
+    // Cache key covers the admin lockfile so the fresh build is reproducible.
+    expect(WORKFLOW).toContain("hashFiles('bun.lock', 'admin/bun.lock')");
+    // Ordering: the admin build must run BEFORE the compile that embeds it.
+    const adminIdx = WORKFLOW.indexOf('bun run build:admin');
+    const compileIdx = WORKFLOW.indexOf('bun build --compile');
+    expect(adminIdx).toBeGreaterThan(-1);
+    expect(compileIdx).toBeGreaterThan(-1);
+    expect(adminIdx).toBeLessThan(compileIdx);
   });
 
   test('template-repo push keeps the PAT out of argv (askpass, not URL-embedded)', () => {
@@ -125,5 +181,30 @@ Release summary line.
   test('a version that is a string prefix of another does not false-match', () => {
     // "0.42.67" is a prefix of "0.42.67.0" but has no entry of its own.
     expect(run('0.42.67').code).not.toBe(0);
+  });
+});
+
+describe('release.yml publish-template skip is visible (D-10)', () => {
+  test('an empty TEMPLATE_REPO_PAT warns with the owner-only fix and writes a step summary', async () => {
+    const { load } = await import('js-yaml');
+    const wf = load(WORKFLOW) as { jobs: Record<string, { steps: Array<{ id?: string; run?: string }> }> };
+    const gate = wf.jobs['publish-template']!.steps.find(s => s.id === 'gate')!.run!;
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-publish-template-gate-'));
+    try {
+      const output = join(dir, 'output');
+      const summary = join(dir, 'summary');
+      writeFileSync(output, '');
+      const stdout = execFileSync('bash', ['-euo', 'pipefail', '-c', gate], {
+        cwd: ROOT, encoding: 'utf8',
+        env: { PATH: process.env.PATH, TEMPLATE_REPO_PAT: '', TEMPLATE_REPO: 'owner/template-example', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+      });
+      expect(readFileSync(output, 'utf8')).toContain('publish=false');
+      expect(stdout).toContain('::warning::Agent template NOT published to owner/template-example');
+      expect(stdout).toContain('Fix (owner-only): gh secret set TEMPLATE_REPO_PAT');
+      expect(readFileSync(summary, 'utf8')).toContain('## Agent template not published');
+      expect(stdout).not.toContain('SKIP:');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

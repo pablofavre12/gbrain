@@ -14,6 +14,9 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionWorker } from '../src/core/minions/worker.ts';
 import { registerBuiltinHandlers } from '../src/commands/jobs.ts';
 import { configureGateway, getChatModel, resetGateway } from '../src/core/ai/gateway.ts';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 let engine: PGLiteEngine;
 let worker: MinionWorker;
@@ -248,21 +251,20 @@ describe('autopilot-cycle handler — phase passthrough', () => {
     }
   }, 30_000);
 
-  test('empty phases array falls back to all phases (same as no phases)', async () => {
+  test('empty phases array is an explicit no-op, never an implicit full run (#4250)', async () => {
     const handler = (worker as any).handlers.get('autopilot-cycle');
-    // Empty array should fall through to ALL_PHASES (same as omitting phases)
+    // Pre-#4250 an explicitly-empty list silently fell through to ALL_PHASES —
+    // the "silently convert an empty payload into a full run" footgun. It is
+    // now an honest skip.
     const result = await handler({
       data: { repoPath: '/definitely-does-not-exist-for-phase-test', phases: [] },
       signal: { aborted: false } as any,
       job: { id: 12, name: 'autopilot-cycle' } as any,
     });
 
-    const report = (result as any).report;
-    // With all phases, filesystem phases fail on missing dir
-    const phaseNames = report.phases.map((p: any) => p.phase);
-    expect(phaseNames).toContain('lint');
-    expect(phaseNames).toContain('backlinks');
-    expect(phaseNames).toContain('sync');
+    expect(result.status).toBe('skipped');
+    expect(result.report.reason).toBe('empty_phase_list');
+    expect(result.report.phases_rejected_by_normalization).toEqual([]);
   }, 30_000);
 
   test('non-array phases value is ignored (falls back to all)', async () => {
@@ -281,4 +283,46 @@ describe('autopilot-cycle handler — phase passthrough', () => {
     expect(phaseNames).toContain('sync');
     expect(phaseNames).toContain('embed');
   }, 30_000);
+});
+
+describe('backlinks handler — empty payload checks, never rewrites pages', () => {
+  // Post-ingestion sync→embed→backlinks chains submit backlinks jobs with an
+  // empty payload. Those must report gaps without writing generated
+  // "Referenced in" bullets into tracked brain pages; 'fix' is opt-in.
+  function makeBrainWithGap(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-backlinks-handler-'));
+    mkdirSync(join(dir, 'people'));
+    mkdirSync(join(dir, 'companies'));
+    writeFileSync(join(dir, 'people/alice-example.md'), '# Alice\n\nWorks at [Acme](../companies/acme-example.md).\n');
+    writeFileSync(join(dir, 'companies/acme-example.md'), '# Acme\n\nNo links back.\n');
+    return dir;
+  }
+
+  test('no action in job.data → check: gap reported, target page untouched', async () => {
+    const dir = makeBrainWithGap();
+    try {
+      const before = readFileSync(join(dir, 'companies/acme-example.md'), 'utf8');
+      const handler = (worker as any).handlers.get('backlinks');
+      const result = await handler({ data: { dir }, signal: { aborted: false } as any, job: { id: 20, name: 'backlinks' } as any });
+      expect(result.action).toBe('check');
+      expect(result.gaps_found).toBe(1);
+      expect(result.fixed).toBe(0);
+      expect(readFileSync(join(dir, 'companies/acme-example.md'), 'utf8')).toBe(before);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("explicit action 'fix' still rewrites the gap (the fixture is fixable)", async () => {
+    const dir = makeBrainWithGap();
+    try {
+      const handler = (worker as any).handlers.get('backlinks');
+      const result = await handler({ data: { dir, action: 'fix' }, signal: { aborted: false } as any, job: { id: 21, name: 'backlinks' } as any });
+      expect(result.action).toBe('fix');
+      expect(result.fixed).toBe(1);
+      expect(readFileSync(join(dir, 'companies/acme-example.md'), 'utf8')).toContain('alice-example');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

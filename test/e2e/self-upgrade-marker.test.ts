@@ -7,8 +7,11 @@
  * agent (Claude Code / Codex / OpenClaw) keys off to run the gbrain-upgrade skill.
  *
  * Carrier command: `config get self_upgrade.mode` — runs the startup hook, needs
- * no DB and no network, exits fast. The cache is pre-written fresh so the hook
- * emits from cache and never spawns the detached network refresh (hermetic).
+ * no DB and no network, exits fast. Every case that reaches the cache check
+ * pre-writes a fresh cache, so the hook emits from cache and never spawns the
+ * detached `check-update --refresh-cache` network refresh (hermetic). A case
+ * without a cache leaks that refresh into the runner's HOME (scripts/run-e2e.sh
+ * then cannot remove the file's home).
  *
  * The child is spawned with NODE_ENV unset (the production code gates the hook
  * off under NODE_ENV=test to keep the unit suite from spawning refreshers).
@@ -77,6 +80,21 @@ describe('self-upgrade marker on a real invocation', () => {
     expect(stderr).not.toContain('UPGRADE_AVAILABLE');
   });
 
+  test('cache latest == running version → suppressed (no marker, no human sentence)', () => {
+    writeCache(`UPGRADE_AVAILABLE ${VERSION} ${VERSION}`);
+    const { stderr } = runGbrain('notify');
+    expect(stderr).not.toContain('UPGRADE_AVAILABLE');
+    expect(stderr).not.toContain('Run: gbrain self-upgrade');
+  });
+
+  test('foreign-writer cache → marker prints the RUNNING version, not the writer\'s', () => {
+    // An older gbrain on PATH wrote the cache: marker.current is 0.0.1, not us.
+    writeCache('UPGRADE_AVAILABLE 0.0.1 0.99.0');
+    const { stderr } = runGbrain('notify');
+    expect(stderr).toContain(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
+    expect(stderr).not.toContain('UPGRADE_AVAILABLE 0.0.1');
+  });
+
   test('active snooze for the version → no marker (notify mode honors snooze)', () => {
     writeCache(`UPGRADE_AVAILABLE ${VERSION} 0.99.0`);
     // snooze record: "<version> <level> <epoch-ms>" — fresh ts so it's active.
@@ -86,6 +104,7 @@ describe('self-upgrade marker on a real invocation', () => {
   });
 
   test('JUST_UPGRADED breadcrumb → one-time confirmation on stderr, then cleared', () => {
+    writeCache(`UP_TO_DATE ${VERSION}`);
     const breadcrumb = join(gbrainDir, 'just-upgraded-from');
     writeFileSync(breadcrumb, '0.42.0\n');
     const { stderr } = runGbrain('notify');

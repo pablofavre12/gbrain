@@ -5,10 +5,12 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { PageInput, ChunkInput } from '../src/core/types.ts';
+import { surfaceFileSource } from './helpers/source-surface.ts';
 
 let engine: PGLiteEngine;
 
@@ -18,7 +20,7 @@ let engine: PGLiteEngine;
 // the gateway is configured (potentially leaked from another shard-6 test
 // file in the same bun process) and falls back to DEFAULT_EMBEDDING_DIMENSIONS
 // (currently 1280) otherwise. Hard-coding 1536 here would explode under any
-// gateway config, including the new ZE default.
+// gateway config, including the configured default.
 let CHUNK_EMBED_DIM = 0;
 
 beforeAll(async () => {
@@ -92,12 +94,13 @@ describe('PGLiteEngine: Pages', () => {
   test('putPage restores a soft-deleted page', async () => {
     const slug = 'notes/restore-on-put';
     await engine.putPage(slug, testPage);
-    await engine.upsertChunks(slug, [{
+    await installFixtureChunks(engine, slug, [{
       chunk_index: 0,
       chunk_text: 'restored visibility marker',
       chunk_source: 'compiled_truth',
       token_count: 3,
     }]);
+    expect((await engine.searchKeyword('restored visibility marker')).map(result => result.slug)).toContain(slug);
     await engine.softDeletePage(slug, { sourceId: 'default' });
     expect(await engine.getPage(slug)).toBeNull();
     expect((await engine.searchKeyword('restored visibility marker')).map(result => result.slug)).not.toContain(slug);
@@ -108,6 +111,8 @@ describe('PGLiteEngine: Pages', () => {
       compiled_truth: 'restored visibility marker',
     });
 
+    // Restoring canonical content invalidates the old derived projection.
+    await installFixtureChunks(engine, slug, [{ chunk_index: 0, chunk_text: 'restored visibility marker', chunk_source: 'compiled_truth', token_count: 3 }]);
     expect(restored.title).toBe('Restored Title');
     expect((await engine.getPage(slug))?.title).toBe('Restored Title');
     expect((await engine.searchKeyword('restored visibility marker')).map(result => result.slug)).toContain(slug);
@@ -308,14 +313,14 @@ describe('PGLiteEngine: Search', () => {
       type: 'company', title: 'NovaMind',
       compiled_truth: 'NovaMind builds AI agents for enterprise automation.',
     });
-    await engine.upsertChunks('companies/novamind', [
+    await installFixtureChunks(engine, 'companies/novamind', [
       { chunk_index: 0, chunk_text: 'NovaMind builds AI agents for enterprise', chunk_source: 'compiled_truth' },
     ]);
     await engine.putPage('concepts/rag', {
       type: 'concept', title: 'Retrieval-Augmented Generation',
       compiled_truth: 'RAG combines retrieval with generation for better answers.',
     });
-    await engine.upsertChunks('concepts/rag', [
+    await installFixtureChunks(engine, 'concepts/rag', [
       { chunk_index: 0, chunk_text: 'RAG combines retrieval with generation', chunk_source: 'compiled_truth' },
     ]);
     await engine.putPage('mail/example', {
@@ -327,7 +332,7 @@ describe('PGLiteEngine: Search', () => {
         subject: 'Example launch subject',
       },
     });
-    await engine.upsertChunks('mail/example', [
+    await installFixtureChunks(engine, 'mail/example', [
       { chunk_index: 0, chunk_text: 'Launch evidence for citation metadata', chunk_source: 'compiled_truth' },
     ]);
     await engine.putPage('notes/generated-title', {
@@ -338,7 +343,7 @@ describe('PGLiteEngine: Search', () => {
         thread_id: 'standalone-thread-id',
       },
     });
-    await engine.upsertChunks('notes/generated-title', [
+    await installFixtureChunks(engine, 'notes/generated-title', [
       { chunk_index: 0, chunk_text: 'Non-email evidence for subject gating', chunk_source: 'compiled_truth' },
     ]);
     await engine.putPage('mail/whitespace-message-id', {
@@ -350,7 +355,7 @@ describe('PGLiteEngine: Search', () => {
         subject: 'Subject must remain gated',
       },
     });
-    await engine.upsertChunks('mail/whitespace-message-id', [
+    await installFixtureChunks(engine, 'mail/whitespace-message-id', [
       { chunk_index: 0, chunk_text: 'Whitespace-only email identity evidence', chunk_source: 'compiled_truth' },
     ]);
   });
@@ -407,7 +412,7 @@ describe('PGLiteEngine: Search', () => {
   test('searchVector carries email citation metadata through the outer CTE', async () => {
     const embedding = new Float32Array(CHUNK_EMBED_DIM);
     embedding[0] = 1;
-    await engine.upsertChunks('mail/example', [
+    await installFixtureChunks(engine, 'mail/example', [
       {
         chunk_index: 0,
         chunk_text: 'Launch evidence for citation metadata',
@@ -425,7 +430,7 @@ describe('PGLiteEngine: Search', () => {
   test('searchVector treats whitespace-only message_id as absent', async () => {
     const embedding = new Float32Array(CHUNK_EMBED_DIM);
     embedding[1] = 1;
-    await engine.upsertChunks('mail/whitespace-message-id', [
+    await installFixtureChunks(engine, 'mail/whitespace-message-id', [
       {
         chunk_index: 0,
         chunk_text: 'Whitespace-only email identity evidence',
@@ -454,7 +459,7 @@ describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
       type: 'concept', title: 'Chinese essay',
       compiled_truth: '测试 内容 测试 测试 多次',
     });
-    await engine.upsertChunks('originals/chinese-essay', [
+    await installFixtureChunks(engine, 'originals/chinese-essay', [
       { chunk_index: 0, chunk_text: '测试 内容 测试 测试 多次', chunk_source: 'compiled_truth' },
     ]);
 
@@ -462,7 +467,7 @@ describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
       type: 'concept', title: 'Japanese essay',
       compiled_truth: '今日は晴れです。明日は雨です。',
     });
-    await engine.upsertChunks('originals/japanese-essay', [
+    await installFixtureChunks(engine, 'originals/japanese-essay', [
       { chunk_index: 0, chunk_text: '今日は晴れです。明日は雨です。', chunk_source: 'compiled_truth' },
     ]);
 
@@ -470,7 +475,7 @@ describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
       type: 'concept', title: 'Korean essay',
       compiled_truth: '한글 테스트 문서 입니다',
     });
-    await engine.upsertChunks('originals/korean-essay', [
+    await installFixtureChunks(engine, 'originals/korean-essay', [
       { chunk_index: 0, chunk_text: '한글 테스트 문서 입니다', chunk_source: 'compiled_truth' },
     ]);
 
@@ -479,7 +484,7 @@ describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
       type: 'concept', title: 'English essay',
       compiled_truth: 'NovaMind builds AI agents for enterprise automation.',
     });
-    await engine.upsertChunks('originals/english-essay', [
+    await installFixtureChunks(engine, 'originals/english-essay', [
       { chunk_index: 0, chunk_text: 'NovaMind builds AI agents for enterprise', chunk_source: 'compiled_truth' },
     ]);
 
@@ -492,7 +497,7 @@ describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
         subject: 'Example CJK email subject',
       },
     });
-    await engine.upsertChunks('mail/cjk-example', [
+    await installFixtureChunks(engine, 'mail/cjk-example', [
       { chunk_index: 0, chunk_text: '郵件引用識別', chunk_source: 'compiled_truth' },
     ]);
   });
@@ -532,7 +537,7 @@ describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
       type: 'concept', title: 'One-hit',
       compiled_truth: '只有一个 测试 in this page',
     });
-    await engine.upsertChunks('originals/chinese-one-hit', [
+    await installFixtureChunks(engine, 'originals/chinese-one-hit', [
       { chunk_index: 0, chunk_text: '只有一个 测试 in this page', chunk_source: 'compiled_truth' },
     ]);
 
@@ -589,7 +594,7 @@ describe('PGLiteEngine: Chunks', () => {
       { chunk_index: 0, chunk_text: 'Chunk zero', chunk_source: 'compiled_truth' },
       { chunk_index: 1, chunk_text: 'Chunk one', chunk_source: 'compiled_truth' },
     ]);
-    const chunks = await engine.getChunks('test/chunks');
+    const chunks = await engine.getChunks('test/chunks', { includeUnsealed: true });
     expect(chunks.length).toBe(2);
     expect(chunks[0].chunk_text).toBe('Chunk zero');
     expect(chunks[1].chunk_text).toBe('Chunk one');
@@ -601,7 +606,7 @@ describe('PGLiteEngine: Chunks', () => {
       { chunk_index: 0, chunk_text: 'Mixed-case chunk', chunk_source: 'compiled_truth' },
     ]);
 
-    const chunks = await engine.getChunks('test/chunkcase');
+    const chunks = await engine.getChunks('test/chunkcase', { includeUnsealed: true });
     expect(chunks.length).toBe(1);
     expect(chunks[0].chunk_text).toBe('Mixed-case chunk');
   });
@@ -616,7 +621,7 @@ describe('PGLiteEngine: Chunks', () => {
     await engine.upsertChunks('test/orphan', [
       { chunk_index: 0, chunk_text: 'Updated', chunk_source: 'compiled_truth' },
     ]);
-    const chunks = await engine.getChunks('test/orphan');
+    const chunks = await engine.getChunks('test/orphan', { includeUnsealed: true });
     expect(chunks.length).toBe(1);
     expect(chunks[0].chunk_text).toBe('Updated');
   });
@@ -635,14 +640,14 @@ describe('PGLiteEngine: Chunks', () => {
       { chunk_index: 0, chunk_text: 'Gone', chunk_source: 'compiled_truth' },
     ]);
     await engine.deleteChunks('test/delete-chunks');
-    const chunks = await engine.getChunks('test/delete-chunks');
+    const chunks = await engine.getChunks('test/delete-chunks', { includeUnsealed: true });
     expect(chunks.length).toBe(0);
   });
 
   test('getChunksWithEmbeddings returns embedding data', async () => {
     await engine.putPage('test/embed', testPage);
     const embedding = new Float32Array(CHUNK_EMBED_DIM).fill(0.1);
-    await engine.upsertChunks('test/embed', [
+    await installFixtureChunks(engine, 'test/embed', [
       { chunk_index: 0, chunk_text: 'With embedding', chunk_source: 'compiled_truth', embedding },
     ]);
     const chunks = await engine.getChunksWithEmbeddings('test/embed');
@@ -1395,19 +1400,22 @@ describe('PGLiteEngine: Timeline dedup constraint (v6 migration)', () => {
 });
 
 describe('PGLiteEngine: getBacklinkCounts', () => {
+  let aliceId: number;
+  let acmeId: number;
+
   beforeEach(async () => {
     await truncateAll();
-    await engine.putPage('people/alice', { ...testPage, type: 'person', title: 'Alice' });
+    aliceId = (await engine.putPage('people/alice', { ...testPage, type: 'person', title: 'Alice' })).id;
     await engine.putPage('people/bob', { ...testPage, type: 'person', title: 'Bob' });
-    await engine.putPage('companies/acme', { ...testPage, type: 'company', title: 'Acme' });
+    acmeId = (await engine.putPage('companies/acme', { ...testPage, type: 'company', title: 'Acme' })).id;
   });
 
-  test('returns Map<slug, count> for given slugs', async () => {
+  test('returns Map<page_id, count> for given page ids', async () => {
     await engine.addLink('people/alice', 'companies/acme', '', 'works_at');
     await engine.addLink('people/bob', 'companies/acme', '', 'invested_in');
-    const counts = await engine.getBacklinkCounts(['companies/acme', 'people/alice']);
-    expect(counts.get('companies/acme')).toBe(2);
-    expect(counts.get('people/alice')).toBe(0);
+    const counts = await engine.getBacklinkCounts([acmeId, aliceId]);
+    expect(counts.get(acmeId)).toBe(2);
+    expect(counts.get(aliceId)).toBe(0);
   });
 
   test('empty input -> empty Map', async () => {
@@ -1415,9 +1423,9 @@ describe('PGLiteEngine: getBacklinkCounts', () => {
     expect(counts.size).toBe(0);
   });
 
-  test('slugs with zero links: present in Map with 0', async () => {
-    const counts = await engine.getBacklinkCounts(['people/alice']);
-    expect(counts.get('people/alice')).toBe(0);
+  test('page ids with zero links: present in Map with 0', async () => {
+    const counts = await engine.getBacklinkCounts([aliceId]);
+    expect(counts.get(aliceId)).toBe(0);
   });
 });
 
@@ -1503,29 +1511,42 @@ describe('PGLiteEngine: traverseGraph cycle prevention', () => {
 describe('PGLiteEngine: getHealth graph metrics', () => {
   beforeEach(async () => {
     await truncateAll();
+    // Five entity pages — at MIN_ENTITY_PAGES_FOR_COVERAGE (gbrain#4147), so
+    // the ratio tests below exercise real percentages, not the small-N null.
     await engine.putPage('people/alice', { ...testPage, type: 'person', title: 'Alice' });
     await engine.putPage('people/bob', { ...testPage, type: 'person', title: 'Bob' });
+    await engine.putPage('people/carol', { ...testPage, type: 'person', title: 'Carol' });
     await engine.putPage('companies/acme', { ...testPage, type: 'company', title: 'Acme' });
     await engine.putPage('entities/project-x', { ...testPage, type: 'entity', title: 'Project X' });
   });
 
-  test('link_coverage = 0 when no links exist', async () => {
+  test('link_coverage = 0 when no links exist (at/above the small-N floor)', async () => {
     const h = await engine.getHealth();
+    expect(h.entity_page_count).toBe(5);
     expect(h.link_coverage).toBe(0);
   });
 
   test('link_coverage = % of entity pages with >= 1 inbound link', async () => {
-    // Acme gets 1 inbound link (from Alice); Alice/Bob/Project X get 0 inbound.
-    // 1 of 4 entity pages has inbound links -> 25%.
+    // Acme gets 1 inbound link (from Alice); the other 4 get 0 inbound.
+    // 1 of 5 entity pages has inbound links -> 20%.
     await engine.addLink('people/alice', 'companies/acme', '', 'works_at');
     const h = await engine.getHealth();
-    expect(h.link_coverage).toBeCloseTo(1 / 4, 2);
+    expect(h.link_coverage).toBeCloseTo(1 / 5, 2);
   });
 
   test('timeline_coverage = % with >= 1 timeline entry', async () => {
     await engine.addTimelineEntry('people/alice', { date: '2026-01-15', summary: 'Joined' });
     const h = await engine.getHealth();
-    expect(h.timeline_coverage).toBeCloseTo(1 / 4, 2);
+    expect(h.timeline_coverage).toBeCloseTo(1 / 5, 2);
+  });
+
+  test('below the small-N floor the ratios are null, never a hard 0% (gbrain#4147)', async () => {
+    await truncateAll();
+    await engine.putPage('people/solo', { ...testPage, type: 'person', title: 'Solo' });
+    const h = await engine.getHealth();
+    expect(h.entity_page_count).toBe(1);
+    expect(h.link_coverage).toBeNull();
+    expect(h.timeline_coverage).toBeNull();
   });
 
   test('most_connected lists top entities by link count', async () => {
@@ -1538,16 +1559,17 @@ describe('PGLiteEngine: getHealth graph metrics', () => {
   });
 
   test('orphan_pages: pages with neither inbound nor outbound links', async () => {
-    // All 4 pages start with no links, but entities/project-x is excluded
+    // All 5 pages start with no links, but entities/project-x is excluded
     // from orphan reporting by the shared orphan policy ('entities' is a
-    // first-segment exclusion in orphan-policy.ts). Expect 3 orphans.
+    // first-segment exclusion in orphan-policy.ts). Expect 4 orphans.
     const h = await engine.getHealth();
-    expect(h.orphan_pages).toBe(3);
+    expect(h.orphan_pages).toBe(4);
 
-    // Add alice -> acme. Alice has outbound, acme has inbound, only Bob is orphan.
+    // Add alice -> acme. Alice has outbound, acme has inbound; Bob and Carol
+    // stay orphaned.
     await engine.addLink('people/alice', 'companies/acme', '', 'works_at');
     const h2 = await engine.getHealth();
-    expect(h2.orphan_pages).toBe(1);
+    expect(h2.orphan_pages).toBe(2);
   });
 });
 
@@ -1556,8 +1578,7 @@ describe('PGLiteEngine: getHealth graph metrics', () => {
 // ─────────────────────────────────────────────────────────────────
 describe('PGLiteEngine: v0.13.1 error-wrap on connect() (#223)', () => {
   test('pglite-engine.ts source contains the wrap with #223 hint and nested original error', async () => {
-    const { readFileSync } = await import('fs');
-    const src = readFileSync('src/core/pglite-engine.ts', 'utf-8');
+    const src = surfaceFileSource('pglite-engine', 'src/core/pglite-engine.ts');
     // Structural: the try/catch block must wrap PGlite.create() (the actual
     // abort site, NOT engine-factory.ts). The error message must name the
     // issue and suggest gbrain doctor. Must NOT suggest "missing migrations"
@@ -1565,7 +1586,7 @@ describe('PGLiteEngine: v0.13.1 error-wrap on connect() (#223)', () => {
     // create()).
     // #2084 wrapped the create call in preservingProcessExitCode (Emscripten
     // exitCode containment); the try/catch + error wrap around it is unchanged.
-    expect(src).toContain('this._db = await preservingProcessExitCode(() =>');
+    expect(src).toContain('this._db = this._attachDatabase(await preservingProcessExitCode(() =>');
     expect(src).toContain('PGlite.create({');
     expect(src).toContain('https://github.com/garrytan/gbrain/issues/223');
     expect(src).toContain('gbrain doctor');

@@ -47,6 +47,14 @@ scheduling surfaces — reach for these first:
 For scheduling `sync` + `embed --stale` specifically, the home doc is
 [live-sync.md](live-sync.md).
 
+### Dream beside autopilot
+
+A nightly `gbrain dream` beside autopilot is supported. Source phases run
+under the source's own lease; brain-wide phases (synthesize, patterns, embed,
+purge…) also need the shared `gbrain-cycle` lease, so the later run skips only
+those (`maintenance_lock_busy`) and the holder runs them.
+`gbrain status --section locks --json` shows the holder.
+
 ## Implementation: Setting Up Cron Jobs
 
 ```bash
@@ -95,7 +103,7 @@ infer your current location and timezone. All times shown in YOUR local timezone
 // Hold the notification, fold into morning briefing
 
 get_user_timezone():
-  calendar = gbrain search "flight" --type calendar --recent 7d
+  calendar = gbrain query "flight" --types calendar --since 7d
   if recent_flight:
     return infer_timezone(flight.destination)
   return config.default_timezone  // fallback: US/Pacific
@@ -114,6 +122,191 @@ The most important cron job. Runs while you sleep.
 it nightly and Phase 4 below (plus most of Phase 2's hygiene checks) is
 covered. The pseudocode that follows is the harness-side variant for agents
 that also do LLM-driven entity sweeps and memory consolidation on top.
+
+Nightly summaries land on the calendar day you actually lived: the cycle
+buckets by explicit `--date` > `cycle.timezone` config > the host's IANA
+timezone > UTC, so a run scheduled after local midnight lands on the day
+you lived, not on the UTC date. When the host clock's zone isn't yours (a cloud box on
+UTC), pin it once: `gbrain config set cycle.timezone America/Los_Angeles`.
+
+### Synthesis cost control: the triage cascade
+
+The synthesize phase is a two-stage cascade: a cheap scored triage
+(utility-tier model, one call per new transcript) gates the expensive
+per-transcript synthesis subagents. The dials:
+
+- `dream.triage.threshold` (default 0.5) — the score bar, and the first of the
+  two ways a transcript passes the gate (the verified-segment rescue below is
+  the second). Scores are cached, so retuning it re-gates instantly with
+  **zero** new LLM calls. Raise it if too much routine content synthesizes;
+  lower it if real signal is being skipped.
+- `models.dream.triage` — the triage model (default: utility tier / Haiku).
+- `dream.triage.max_chars` (default 24000, floor 1000) — per-transcript
+  sample window (head/middle/tail) sent to the judge. Not part of cache
+  validity — after changing it, `gbrain dream retriage --force` re-judges
+  under the new sampling.
+- `dream.triage.max_tokens` (default 2048, floor 256) — judge output budget.
+- `dream.triage.concurrency` (default 4, clamped 1–16) — concurrent judge
+  calls.
+- **Verified-segment rescue** (buried-signal recovery, $0): a transcript whose
+  score lands in `[dream.triage.rescue_floor, threshold)` still passes when at
+  least `dream.triage.rescue_min_segments` (default 2; **0 disables**) of the
+  judge's own quoted segments verify as substrings of the transcript AND its
+  content type is in `dream.triage.rescue_content_types` (default
+  `mixed,reflection,idea,strategy,people` — never routine/technical). Zero
+  extra LLM calls; works on cached verdicts; `dream retriage` reads the same
+  gate, so a reconcile sweep never cancels rescued jobs. Telemetry:
+  `details.triage.rescue_checked` / `rescue_fired`.
+- `dream.synthesize.quote_verify` (default on) — the mechanical post-write
+  claim check on every page a synthesis child wrote. Paraphrased quotes are
+  repaired to verbatim transcript slices; a sentence whose quote grounds
+  nowhere, spans two speakers, is attributed to the wrong speaker, or states a
+  number or date the transcript lacks is moved out of the page body into
+  frontmatter `unverified_claims`, so search, recall and think never see it.
+  Pages that already existed are checked only on the sentences this run
+  added. The off switch is the incident escape hatch; telemetry lands in
+  `details.synthesis.quote_verify`.
+- `cycle.propose_takes.types` (default unset = every page type) — a JSON array
+  of page types the `propose_takes` phase may scan, for example
+  `gbrain config set cycle.propose_takes.types '["meeting","analysis"]'`.
+  Pages of other types (machine-written lanes, `note` scratch pages) are
+  never sent to the model, so the phase spends only on the lanes you name.
+  The built-in exclusions (receipts, atoms, the dream cycle's own output)
+  still apply; a value that is not a JSON array is ignored with one stderr
+  line and the phase scans every type. Note that a page with no `type` has
+  no type to match, so it is excluded whenever the list is set.
+- `dream.synthesize.attribution_rules` and `dream.propose_takes.attribution_rules`
+  (default off) — extra prompt rules from #5425: keep who proposed what and
+  later corrections explicit; an assistant-authored judgment is not the
+  user's. Off because matched runs measured no benefit (propose-takes F1
+  0.896 → 0.876); a brain that wants them opts in per phase.
+- `dream.attribution_checks` (default off; `true` or `false`) — the two
+  mechanical attribution checks of #5425 that need the same held-out
+  measurement before they can change defaults. On, `propose_takes` stores a
+  proposal held by `people/<slug>` as held by `brain` when its numbers, dates
+  and quoted phrases appear only in assistant turns of the page and no user
+  turn states or explicitly accepts any of them (a page without speaker turns
+  is left alone), and the synthesis claim check adds `superseded_in_source`:
+  a sentence whose grounded quote a later user turn takes back in a sentence
+  that negates and names the same number or date moves to
+  `unverified_claims`; a later sentence that only repeats the number, or
+  negates a different one, changes nothing. Off, every page and proposal is
+  byte-identical to a release without the checks. One switch, both checks:
+  `gbrain config set dream.attribution_checks true`.
+- `dream.synthesize.max_turns` (default 16) — synthesis turn budget for
+  agentic children and oneshot fallbacks (the default oneshot path — see
+  the next section — is a single completion and never spends turns). The
+  triage map hands the subagent pre-extracted segments, so the mid-tier
+  default model (`models.dream.synthesize`, tier `reasoning`) with a 16-turn
+  budget is the intended pairing — frontier-model overrides are unnecessary
+  and slow the queue. Completeness comes from triage coverage (every file
+  scored, minus files deferred under the `max_ms` budget below) plus
+  segment-guided prompts, not model size. If written-page counts
+  are low, raise it to 30 and check
+  `details.synthesis.avg_turns` for cap pressure.
+- `dream.triage.max_ms` (default 5 min) — per-cycle wall-clock budget for
+  judging NEW files; a big cold corpus triages across a few cycles (cached
+  files are free). Deferred files are labeled "not yet triaged", never
+  silently rejected.
+- A truncated, refused or unparseable verdict backs off (24h, doubling to
+  7 days; `triage_unreliable_backoff`) instead of being re-paid nightly;
+  `gbrain dream retriage --force` re-judges now.
+- `dream.synthesize.max_submissions_per_source_per_day` (default 0 = off) —
+  opt-in backstop cap on synthesis jobs per source; 200/day is a sane value
+  for busy deployments.
+
+Maintenance recipe — after changing the threshold, upgrading through a
+`TRIAGE_VERSION` bump (the current version scores peak-not-average; after a
+bump the first cycle re-judges the corpus within the `max_ms` budget and
+defers the rest to following cycles), or to drain a queued synthesis
+backlog:
+
+```bash
+gbrain dream retriage --dry-run          # what would change (zero LLM calls)
+gbrain dream retriage --reconcile-queue  # re-score + cancel queued jobs that fail the gate
+gbrain dream retriage --audit-rejects 20 # synthesis-model second opinion on 20 gate rejects
+```
+
+### Synthesis speed: oneshot mode + the drain pool
+
+Above the triage cascade sit the execution dials:
+
+- `dream.synthesize.mode` (default `oneshot`) — how each synthesis child
+  runs. `oneshot` makes ONE tool-less completion against a prompt that
+  already carries a pre-retrieved **LINK CANDIDATES** manifest and the write
+  allow-list, then validates and writes the pages programmatically (slug
+  grammar, allow-list, transcript hash suffix, exact-match wikilinks — all
+  checked before any write; embeds deferred out of the model path and
+  backfilled at phase end by a bounded pass over just the pages the phase
+  wrote — never a source-wide sweep). A response that fails any check automatically
+  falls back to the classic agentic loop **in the same job** — no lost work,
+  no resubmission. The oneshot attempt and its fallback calls are both paid
+  provider work and both are included in synthesis token/spend telemetry.
+  Typical effect: 10+ provider round-trips per transcript
+  (up to the 16-turn default cap, more on raised `max_turns`) → 1. Revert
+  dial: `gbrain config set dream.synthesize.mode agentic`.
+- `dream.synthesize.link_manifest` (default on) — the zero-embed
+  pre-retrieval manifest (built from the triage verdict's cached entities +
+  segment notes). Benefits BOTH modes: agentic children stop burning turns
+  on low-yield searches; oneshot children get their link targets up front.
+- `dream.synthesize.inline_concurrency` (default 1, clamp 1–8) — concurrent
+  drain loops for the per-run child queue on Postgres (PGLite always drains
+  serially). Provider ceilings stay with the rate leases (every provider
+  round-trip on every path holds a lease slot), so this dial only removes
+  queue-wait, never over-drives the API.
+
+Reading the phase report (`details.synthesis`): `mode`, `oneshot_jobs` /
+`fallback_jobs` / `agentic_jobs` + a `fallback_reasons` histogram (a rising
+fallback rate means the model is failing the output contract — check the
+top reason before considering the agentic revert; `length` includes malformed
+responses whose output usage reached the requested output cap even when the
+provider stop reason was ambiguous), `queue_wait_ms_p50/p95`
+and `child_runtime_ms_p50/p95` (a slow-but-healthy drain is visible instead
+of indistinguishable from a stuck one), and `dead_jobs`/`degraded`. A run
+with any non-completed child does NOT stamp the cooldown, so the next
+nightly retries exactly the failed transcripts; a run whose EVERY child
+died fails the phase loudly. Synthesis children also fail (dead-letter)
+when every attempted page write failed, or when they attempted no page
+write and stopped dirty, finished with prose instead of calling the write
+tool, or had only failed tool calls. A `completed` child with zero pages written is a
+deliberate answer: the model explicitly skipped the transcript
+(`{"pages":[],"skipped":true}`), or a patterns child ran its tools and found
+nothing new. It completes so the cooldown stamps instead of re-billing the
+same input.
+
+A dream key whose submissions died `dream.breaker.max_dead_submissions`
+times (default 3; `0` disables) within 24 hours is refused before the next
+submission, and `gbrain doctor` reports it as `dream_paid_loop`. Fix the
+cause first (a missing provider key, a quota, a failing transcript), then
+`gbrain dream reset-key --list` shows the refused keys and
+`gbrain dream reset-key '<key>'` re-enables one. Details in
+[spend controls](../operations/spend-controls.md#dream-paid-loop-breaker-dreambreakermax_dead_submissions).
+
+Three more fields answer "what did that cost and did it land":
+
+- `spend` — what the phase actually spent, `cost_basis: 'in+out+cache_read'`.
+  Children are summed from `minion_jobs` token counts priced at the configured
+  synthesis model; triage comes from the pass's own usage. `total_usd` is
+  `null` unless BOTH price, so an unpriced model reads as unknown rather than
+  as a fake `0`. `details.triage` carries the judge's own `tokens_in` /
+  `tokens_out` / `cost_usd` on the same terms.
+- `children_zero_pages` — children that completed but wrote no page. A number
+  that climbs here means the model is producing valid-but-empty output, which
+  a green phase status alone would hide.
+- `quote_verify` — what the post-write claim check touched: quotes checked
+  and repaired, sentences quarantined (with counts per reason:
+  `quote_not_in_source`, `quote_crosses_speakers`, `speaker_mismatch`,
+  `number_not_in_source`, `decision_misattributed`, and, with
+  `dream.attribution_checks` on, `superseded_in_source`), pre-existing pages
+  checked by diff, and unbalanced paragraphs. `decision_misattributed` is a
+  sentence saying a speaker decided, agreed or will do something whose
+  numbers or dates only another speaker stated and the named speaker never
+  explicitly accepted. `superseded_in_source` is a sentence whose quote a
+  later user turn took back on the same number or date.
+
+Per-call spend also lands in the `chat_usage_log` ledger with a phase tag:
+the orchestrator's own calls under `phase:synthesize`, each drained child
+under its own `job:<name>`, so the two never double-count.
 
 ### What It Does
 

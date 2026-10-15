@@ -19,15 +19,38 @@ The epistemological layer. WHO believes WHAT, with confidence weight and time.
 - `holder=world kind=fact` "acme-example raised a Series C" (w=1.0)
 - `holder=brain kind=hunch` "alice-example has a hero/rescuer pattern" (w=0.70)
 
-**Query surface:** `gbrain takes list`, `gbrain takes search`, `gbrain think`
+**Query surface:** `gbrain takes list`, `gbrain takes search`, `gbrain takes search --semantic`, `gbrain think`
 
-## Facts (hot memory — `facts` table, v0.31)
+Take vectors (used by `takes search --semantic` and the `think` vector stream)
+are kept current by `gbrain embed --stale`, which the cycle's embed phase runs:
+it embeds every active take that has no vector, whose claim changed since it
+was embedded, or whose vector came from another embedding model. Each vector
+records the model and the claim text it was computed from. Takes on deleted
+pages or archived sources are skipped. `gbrain takes embed` runs the same pass
+on its own; `gbrain takes embed --dry-run` shows the pending provider work
+without making calls.
+
+To stop automatic take embedding, run `gbrain config set takes.auto_embed false`
+(or set `GBRAIN_EMBED_TAKES=0` for one process; the variable wins over the
+config key). `gbrain takes embed` keeps working when it is off.
+
+`gbrain migrate embeddings` moves take vectors with the rest of the brain: the
+plan counts stale takes, a width change resizes `takes.embedding`, the re-embed
+drain refills it, and the run does not complete while takes are still stale.
+`gbrain doctor` reports takes and facts without a current-model vector in the
+`fact_take_vectors` check ([verification runbook](GBRAIN_VERIFY.md#5a-fact-and-take-vectors)).
+Until take vectors exist, `think` falls back to keyword-only takes retrieval and
+`takes search --semantic` simply reports no semantic matches.
+
+## Facts (hot memory — `facts` table)
 
 Personal knowledge from the brain owner's conversations. Real-time capture.
 
 - **Source:** Extracted per-turn from conversation by the facts hook (Haiku)
 - **Scope:** Single-user — only the brain owner's stated knowledge
-- **Kinds:** `event`, `preference`, `commitment`, `belief`, `fact`
+- **Kinds:** `event`, `preference`, `commitment`, `belief`, `fact`, `idea`
+  (`idea` is extractor/DB-only — the frozen `remember` verb enum stays at five,
+  per `docs/protocol/MEMORY_VERBS_v1.md`)
 - **Lifecycle:** Hot storage, real-time. Captured as conversations happen.
 - **Bridge:** Dream cycle `consolidate` phase promotes hot facts → cold takes nightly
 
@@ -52,7 +75,7 @@ and temporal reasoning.
 
 ## The Bridge
 
-The dream cycle's `consolidate` phase (v0.31) is the one-way bridge:
+The dream cycle's `consolidate` phase is the one-way bridge:
 
 ```
 hot facts → [dream consolidate] → cold takes
@@ -64,9 +87,9 @@ Facts flow in ONE direction. The consolidate phase:
 3. Promotes durable facts to takes with proper holder/weight
 4. Marks consolidated facts with `consolidated_at` + `consolidated_into`
 
-## Production Extraction Data (2026-05-10)
+## Production Extraction Data
 
-First full takes extraction run on a ~100K-page brain:
+Full takes extraction on a ~100K-page brain (measured 2026-05-10):
 - **Model:** Azure GPT-5.5 (ties Opus quality at 1/8th cost — $0.033 vs $0.260/page)
 - **Result:** 100,720 takes from 28,256 on-disk pages, $361.49, 83 errors (0.3%)
 - **Breakdown:** 70,960 takes / 24,342 facts / 2,875 bets / 2,649 hunches
@@ -78,7 +101,7 @@ First full takes extraction run on a ~100K-page brain:
 | Dimension | Score | Notes |
 |-----------|-------|-------|
 | Accuracy | 7.5 | Claims faithfully represent sources |
-| Attribution | 6.5 | Holder/subject confusion was #1 issue |
+| Attribution | 6.5 | Holder/subject confusion is the top issue |
 | Weight calibration | 7.0 | Good range usage, some false precision |
 | Kind classification | 6.5 | Occasional fact/take misclassification |
 | Signal density | 6.5 | Some trivial extractions pass through |
@@ -100,9 +123,9 @@ takes. Calibration, `think`, and the `doctor` calibration check resolve the owne
 holder through `resolveOwnerHolder` (`src/core/owner-holder.ts`): explicit override
 > `emotional_weight.user_holder` config > `self`.
 
-Known limitation (tracked in garrytan/gbrain#2465): the owner can also
+Known limitation: the owner can also
 appear under `brain` (a take the owner asserts, via `propose_takes`) and
 `people/<owner>` (extraction that names the owner). The resolver selects the
 *default* canonical owner string for reads; it does not merge those other
-strings. Per-take attribution for other people (e.g. `people/george`) is
+strings. Per-take attribution for other people (e.g. `people/bob-example`) is
 unaffected and correct.

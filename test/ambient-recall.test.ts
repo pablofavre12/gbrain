@@ -16,9 +16,11 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { configureGateway } from '../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import { operations } from '../src/core/operations.ts';
 import { MEMORY_VERBS_VERSION, VERB_NAMES } from '../src/core/verbs.ts';
+import { estimateTokens } from '../src/core/search/token-budget.ts';
+import { deltaHeaderCost, renderFactLine, renderPageLine, renderThreadLine } from '../src/core/context/turn-context.ts';
 import {
   getSessionContextState,
   upsertSessionContextState,
@@ -79,6 +81,10 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  // Restore the preload baseline — leaving the keyless config in place
+  // configures every LATER file in this shard's process (the exact
+  // leak-to-neighbor class the beforeAll pin defends against).
+  resetGateway();
 });
 
 beforeEach(async () => {
@@ -216,6 +222,19 @@ describe('delta cursor lifecycle', () => {
     expect(r2.text as string).not.toContain('January 1, 2000');
     // An UNPARSEABLE string is rejected outright (defense in depth).
     await expect(call(del, ctxFor({ remote: false }), { since: 'definitely not a date' })).rejects.toThrow(/parseable|ISO/i);
+    // Wave review: a calendar-INVALID value in the microsecond passthrough shape
+    // is Date.parse-able (JS rolls Feb 31 to Mar 3) but would reach the
+    // ::timestamptz cast raw → engine error. It is invalid_params instead.
+    for (const since of [
+      '2026-02-31T00:00:00Z',
+      '2026-02-31T00:00:00.000Z',
+      '2026-02-31T00:00:00.000000Z',
+    ]) {
+      await expect(call(del, ctxFor({ remote: false }), { since })).rejects.toThrow(/calendar|ISO/i);
+    }
+    // ...while a valid microsecond cursor still passes through verbatim.
+    const r3 = await call(del, ctxFor({ remote: false }), { since: '2026-02-28T00:00:00.000100Z' });
+    expect(r3.since).toBe('2026-02-28T00:00:00.000100Z');
   });
 
   test('remote caller cursor is namespaced by auth client', async () => {
@@ -245,7 +264,7 @@ describe('delta cursor lifecycle', () => {
       await call(putPage, local, { slug: `notes/${s}`, content: `# ${s}\n\ncontent for ${s}` });
     }
     // tiny budget: deliver a strict subset, has_more = true, cursor lags
-    const r1 = await call(del, local, { session_id: 'alo', budget_tokens: 8 });
+    const r1 = await call(del, local, { session_id: 'alo', budget_tokens: 80 });
     expect(r1.has_more).toBe(true);
     expect(r1.pages.length).toBeGreaterThan(0);
     expect(r1.pages.length).toBeLessThan(3);
@@ -265,7 +284,7 @@ describe('delta cursor lifecycle', () => {
     for (const s of ['txt-a', 'txt-b', 'txt-c']) {
       await call(putPage, local, { slug: `notes/${s}`, content: `# ${s}\n\ncontent` });
     }
-    const r = await call(del, local, { session_id: 'txt', budget_tokens: 8 });
+    const r = await call(del, local, { session_id: 'txt', budget_tokens: 80 });
     const inText = ['txt-a', 'txt-b', 'txt-c'].filter((s) => (r.text as string).includes(s));
     expect(inText.length).toBe(r.pages.length); // text lists exactly the delivered pages
   });
@@ -287,7 +306,7 @@ describe('delta cursor lifecycle', () => {
     });
     // Tiny budget: deliver a strict subset of the tie cluster (all 4 share one
     // timestamp — the keyset paginates within it by slug).
-    const r1 = await call(del, local, { session_id: 'tie', budget_tokens: 8 });
+    const r1 = await call(del, local, { session_id: 'tie', budget_tokens: 80 });
     expect(r1.pages.length).toBeGreaterThan(0);
     expect(r1.pages.length).toBeLessThan(4);
     expect(r1.has_more).toBe(true);
@@ -390,7 +409,9 @@ describe('delta cursor lifecycle', () => {
     // One identical timestamp, earlier than every other fixture cluster.
     await engine.executeRaw(`UPDATE pages SET updated_at = '2026-08-09T10:00:00Z' WHERE slug LIKE 'notes/sr-%'`);
     // NO session_id anywhere: resume rides next_cursor.since/.slug alone.
-    // budget 8 ≈ 2 pages per call, so the 4-page cluster needs ≥2 wakes.
+    // budget 80 ≈ 1 page per call (#4761: ~53 tokens of envelope+headers are
+    // reserved, each rendered page line is ~15), so the 4-page cluster needs
+    // several wakes.
     const seen: string[] = [];
     let since = '2026-08-09T09:59:00Z';
     let sinceSlug: string | undefined;
@@ -399,7 +420,7 @@ describe('delta cursor lifecycle', () => {
       const r = await call(del, ctxFor({ remote: false }), {
         since,
         ...(sinceSlug !== undefined ? { since_slug: sinceSlug } : {}),
-        budget_tokens: 8,
+        budget_tokens: 80,
       });
       for (const pg of r.pages as Array<{ slug: string }>) {
         if (pg.slug.startsWith('notes/sr-')) seen.push(pg.slug);
@@ -460,12 +481,10 @@ describe('delta cursor lifecycle', () => {
     // The state READ degrades to null, never a throw.
     await expect(getSessionContextState(failing as never, 'default', null, 'outage')).resolves.toBeNull();
     const ctx = { ...ctxFor({ remote: false }), engine: failing } as OperationContext;
-    // First-wake path: cursor read + establish-write + GC all fail — the verb
-    // still answers with a complete payload.
-    const r1 = await call(del, ctx, { session_id: 'outage' });
-    expect(r1.protocol_version).toBe(1);
-    expect(r1.pages).toEqual([]);
-    expect(r1.since).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
+    // Session-state read failure with no explicit position: a failed read is
+    // NOT a first wake (contributor audit wave P0), so no cursor is
+    // initialized at now; the refusal is retryable and names the reason.
+    await expect(call(del, ctx, { session_id: 'outage' })).rejects.toMatchObject({ code: 'unavailable', reason: 'session_state' });
     // Full delta path: assembly reads run fine; the cursor-advance write fails
     // silently and the payload is still complete.
     const r2 = await call(del, ctx, { session_id: 'outage', since: '1970-01-01T00:00:00Z' });
@@ -641,6 +660,52 @@ describe('visibility (eng 1A / D2=A): world-only default, fail-closed widen', ()
     expect(facts).not.toContain('secret burn rate');
     expect(r.text as string).not.toContain('secret burn rate');
   });
+
+  test('delta page arm widens private pages only for trusted local include_private', async () => {
+    const since = new Date(Date.now() - 5 * 60_000).toISOString();
+    await engine.putPage('notes/delta-world-page', {
+      title: 'Delta World Page',
+      type: 'note',
+      frontmatter: { visibility: 'world' },
+      compiled_truth: 'world page body',
+      timeline: '',
+    });
+    await engine.putPage('notes/delta-private-page', {
+      title: 'Delta Private Page',
+      type: 'note',
+      frontmatter: { visibility: 'private' },
+      compiled_truth: 'private page body',
+      timeline: '',
+    });
+
+    const worldOnly = await call(del, ctxFor({ remote: false }), { since });
+    const widened = await call(del, ctxFor({ remote: false }), {
+      since,
+      include_private: true,
+    });
+    const remote = await call(del, ctxFor({ remote: true, clientId: 'c1' }), {
+      since,
+      include_private: true,
+    });
+
+    for (const result of [worldOnly, widened, remote]) {
+      expect(result.pages.map((p: { slug: string }) => p.slug)).toContain(
+        'notes/delta-world-page',
+      );
+    }
+    expect(worldOnly.pages.map((p: { slug: string }) => p.slug)).not.toContain(
+      'notes/delta-private-page',
+    );
+    expect(worldOnly.text as string).not.toContain('Delta Private Page');
+    expect(widened.pages.map((p: { slug: string }) => p.slug)).toContain(
+      'notes/delta-private-page',
+    );
+    expect(widened.text as string).toContain('Delta Private Page');
+    expect(remote.pages.map((p: { slug: string }) => p.slug)).not.toContain(
+      'notes/delta-private-page',
+    );
+    expect(remote.text as string).not.toContain('Delta Private Page');
+  });
 });
 
 describe('budget packing + drop footer', () => {
@@ -663,6 +728,146 @@ describe('budget packing + drop footer', () => {
     const r = await call(contextPack, ctxFor({ remote: false }), { entities: 'acme-example' });
     expect(r.budget_tokens).toBeUndefined();
     expect(r.dropped_count).toBeUndefined();
+  });
+
+  // #4761: `text` is what harnesses inject — it must fit budget_tokens, so the
+  // packer prices the RENDERED line (+ envelope/header reserve), not raw fields.
+  test('context_pack text never exceeds budget_tokens (#4761)', async () => {
+    const r = await call(contextPack, ctxFor({ remote: false }), { entities: 'acme-example', budget_tokens: 80 });
+    expect((r.facts as unknown[]).length).toBeGreaterThan(0);
+    expect(r.dropped_count).toBeGreaterThan(0);
+    expect(estimateTokens(r.text as string)).toBeLessThanOrEqual(80);
+    expect(r.budget_used).toBeLessThanOrEqual(80);
+  });
+
+  test('delta text never exceeds budget_tokens (#4761)', async () => {
+    const putPage = operations.find((o) => o.name === 'put_page')!;
+    const local = ctxFor({ remote: false });
+    await call(del, local, { session_id: 'fit' });
+    for (const s of ['fit-a', 'fit-b', 'fit-c', 'fit-d', 'fit-e', 'fit-f']) {
+      await call(putPage, local, { slug: `notes/${s}`, content: `# ${s}\n\ncontent` });
+    }
+    const r = await call(del, local, { session_id: 'fit', budget_tokens: 90 });
+    expect((r.pages as unknown[]).length).toBeGreaterThan(0);
+    expect(r.has_more).toBe(true);
+    expect(estimateTokens(r.text as string)).toBeLessThanOrEqual(90);
+    expect(r.budget_used).toBeLessThanOrEqual(90);
+  });
+
+  // Threads are the commitments a heartbeat must never miss: delta reserves
+  // every thread line ahead of pages/facts and never budget-drops one. Only
+  // pages and facts count toward dropped_count; budget_used reports the real
+  // rendered size (it exceeds the budget only when header + threads alone do).
+  test('delta never budget-drops threads — dropped_count counts only pages/facts', async () => {
+    const putPage = operations.find((o) => o.name === 'put_page')!;
+    const local = ctxFor({ remote: false });
+    await call(putPage, local, { slug: 'people/alice-example', content: '# Alice Example\n\nbody' });
+    for (const tag of ['nt-a', 'nt-b', 'nt-c']) {
+      await call(remember, local, {
+        fact: `${tag} alice-example will send the signed term sheet by Friday`,
+        kind: 'commitment',
+        entity: 'people/alice-example',
+        provenance: 'test',
+        visibility: 'world',
+      });
+    }
+    __resetHotMemoryCacheForTests();
+    const since = '1970-01-01T00:00:00Z';
+    const full = await call(del, local, { since, entities: 'people/alice-example' });
+    const threadText = (r: VerbResult) => (r.threads as Array<{ text: string }>).map((t) => t.text).sort();
+    expect((full.threads as unknown[]).length).toBe(3);
+    expect((full.pages as unknown[]).length + (full.facts as unknown[]).length).toBeGreaterThan(0);
+    // A budget below even the envelope: every page and fact drops, every thread stays.
+    const r = await call(del, local, { since, entities: 'people/alice-example', budget_tokens: 1 });
+    expect(threadText(r)).toEqual(threadText(full));
+    expect(r.pages).toEqual([]);
+    expect(r.facts).toEqual([]);
+    expect(r.dropped_count).toBe((full.pages as unknown[]).length + (full.facts as unknown[]).length);
+    expect(r.has_more).toBe(true);
+    for (const t of threadText(full)) expect(r.text as string).toContain(t);
+    expect(r.budget_used).toBe(estimateTokens(r.text as string));
+    expect(r.budget_used).toBeGreaterThan(1); // documented: threads are never truncated
+  });
+
+  // Cursor semantics are the v1 page keyset alone: facts/threads never move
+  // `next_cursor`, and it carries exactly { since, slug } (no skip list).
+  test('next_cursor is the page keyset — unaffected by delivered or dropped facts/threads', async () => {
+    const putPage = operations.find((o) => o.name === 'put_page')!;
+    const local = ctxFor({ remote: false });
+    await call(putPage, local, { slug: 'people/bob-example', content: '# Bob Example\n\nbody' });
+    const entityBeforeRemember = (await engine.readPageSnapshot('people/bob-example', { sourceId: 'default' }))!;
+    await new Promise((r) => setTimeout(r, 5));
+    let since = new Date().toISOString();
+    await new Promise((r) => setTimeout(r, 5));
+    for (const s of ['kc-a', 'kc-b']) {
+      await call(putPage, local, { slug: `notes/${s}`, content: `# ${s}\n\ncontent` });
+    }
+    await new Promise((r) => setTimeout(r, 5));
+    let mid = new Date().toISOString();
+    await new Promise((r) => setTimeout(r, 5));
+    for (let i = 0; i < 3; i++) {
+      await call(remember, local, { fact: `kc-fact-${i} ${'z'.repeat(120)}`, provenance: 'test', visibility: 'world' });
+    }
+    await call(remember, local, {
+      fact: 'bob-example will send the revised partnership deck',
+      kind: 'commitment',
+      entity: 'people/bob-example',
+      provenance: 'test',
+      visibility: 'world',
+    });
+    const entityAfterRemember = (await engine.readPageSnapshot('people/bob-example', { sourceId: 'default' }))!;
+    expect(entityAfterRemember.revision).not.toBe(entityBeforeRemember.revision);
+    // Entity-bound remember publishes a canonical facts fence and advances the
+    // page revision. Pin this fixture's page clock before the cutoff so the
+    // keyset assertions below isolate pages from newer fact/thread records.
+    expect(entityBeforeRemember.page.updated_at.getTime()).toBeLessThan(Date.parse(since));
+    await engine.executeRaw('UPDATE pages SET updated_at = $1::timestamptz WHERE source_id = $2 AND slug = $3',
+      [entityBeforeRemember.page.updated_at.toISOString(), 'default', 'people/bob-example']);
+    // delta never advances a cursor past now() - 2 s (commit-visibility lag),
+    // so age the whole fixture a minute to keep the keyset assertions exact.
+    await engine.executeRaw(`UPDATE pages SET updated_at = updated_at - interval '1 minute'`);
+    await engine.executeRaw(`UPDATE facts SET created_at = created_at - interval '1 minute'`);
+    since = new Date(Date.parse(since) - 60_000).toISOString();
+    mid = new Date(Date.parse(mid) - 60_000).toISOString();
+    __resetHotMemoryCacheForTests();
+    const full = await call(del, local, { since, entities: 'people/bob-example' });
+    const pages = full.pages as Parameters<typeof renderPageLine>[0][];
+    expect(pages.map((p) => p.slug)).toEqual(['notes/kc-a', 'notes/kc-b']);
+    expect((full.facts as unknown[]).length).toBeGreaterThanOrEqual(3);
+    expect((full.threads as unknown[]).length).toBeGreaterThan(0);
+    // Unbudgeted: the cursor is the last delivered page, exactly as a
+    // stateless page-only call would report it.
+    expect(full.next_cursor).toMatchObject({ since: pages[1].updated_at, slug: pages[1].slug });
+    // Budget = header + every thread line + the first page line + a sliver:
+    // one page delivered, every fact dropped — the cursor is still that page.
+    const reserved =
+      deltaHeaderCost(since) +
+      (full.threads as Parameters<typeof renderThreadLine>[0][]).reduce((n, t) => n + estimateTokens(renderThreadLine(t) + '\n'), 0);
+    const r1 = await call(del, local, {
+      since,
+      entities: 'people/bob-example',
+      budget_tokens: reserved + estimateTokens(renderPageLine(pages[0]) + '\n') + 2,
+    });
+    expect((r1.pages as Array<{ slug: string }>).map((p) => p.slug)).toEqual(['notes/kc-a']);
+    expect(r1.facts).toEqual([]);
+    expect((r1.threads as unknown[]).length).toBe((full.threads as unknown[]).length);
+    expect(r1.has_more).toBe(true);
+    expect(r1.next_cursor).toMatchObject({ since: pages[0].updated_at, slug: pages[0].slug });
+    expect(estimateTokens(r1.text as string)).toBeLessThanOrEqual(r1.budget_tokens);
+    // Page-less wake: facts/threads delivered and some facts dropped. The
+    // legacy time cursor moves to the delivered fact and stays strictly before
+    // the oldest dropped one, so an old client drains the rest instead of
+    // re-reading the same prefix (contributor audit wave P0).
+    const oneFact = estimateTokens(renderFactLine((full.facts as Parameters<typeof renderFactLine>[0][])[0]) + '\n');
+    const r2 = await call(del, local, { since: mid, entities: 'people/bob-example', budget_tokens: reserved + oneFact + 2 });
+    expect(r2.pages).toEqual([]);
+    expect((r2.facts as unknown[]).length).toBe(1);
+    expect((r2.threads as unknown[]).length).toBe((full.threads as unknown[]).length);
+    expect(r2.has_more).toBe(true);
+    expect(r2.next_cursor.slug).toBe('');
+    expect(r2.next_cursor.since > mid).toBe(true);
+    const r3 = await call(del, local, { since: r2.next_cursor.since, since_slug: r2.next_cursor.slug, entities: 'people/bob-example', budget_tokens: reserved + oneFact + 2 });
+    expect((r3.facts as Array<{ fact: string }>)[0].fact).not.toBe((r2.facts as Array<{ fact: string }>)[0].fact);
   });
 
   test('forced overflow: dropped_count > 0 and budget_used stays within budget_tokens (v0.45.7)', async () => {

@@ -62,6 +62,44 @@ async function putThesis(): Promise<void> {
 }
 
 describe('#2138 per-claim proposal idempotency', () => {
+  test('skips extract receipts before invoking the extractor (#4621)', async () => {
+    await putThesis();
+    await engine.putPage('extracts/2026-08-27/takes.proposed/default/propose/round-single', {
+      title: 'propose_takes receipt',
+      type: 'extract_receipt',
+      compiled_truth: 'Operational receipt with no gradeable claims.',
+      frontmatter: { type: 'extract_receipt', dream_generated: true },
+      timeline: '',
+    });
+
+    const scannedPages: string[] = [];
+    const extractor: ProposeTakesExtractor = async ({ pagePath }) => {
+      scannedPages.push(pagePath);
+      return [];
+    };
+
+    const result = await runPhaseProposeTakes(context(), { extractor });
+
+    expect(scannedPages).toEqual(['wiki/essays/thesis']);
+    expect((result.details as Record<string, unknown>).pages_scanned).toBe(1);
+  });
+
+  test('skips the dream cycle\'s own output: dream-generated, atom and concept pages (#5212)', async () => {
+    await putThesis();
+    const own: Array<[string, string, Record<string, unknown>]> = [
+      ['wiki/personal/reflections/2026-10-01-dream', 'note', { dream_generated: true }],
+      ['atoms/acme-example-claim', 'atom', { extracted_by: 'extract_atoms-v0.41.2.1' }],
+      ['concepts/founder-mode', 'concept', { synthesized_by: 'synthesize_concepts-v1' }],
+    ];
+    for (const [slug, type, frontmatter] of own) {
+      await engine.putPage(slug, { title: slug, type: type as never, compiled_truth: 'A strong claim the dream cycle wrote.', frontmatter, timeline: '' });
+    }
+    const scannedPages: string[] = [];
+    const result = await runPhaseProposeTakes(context(), { extractor: async ({ pagePath }) => { scannedPages.push(pagePath); return []; } });
+    expect(scannedPages).toEqual(['wiki/essays/thesis']);
+    expect((result.details as Record<string, unknown>).pages_scanned).toBe(1);
+  });
+
   test('keeps distinct claims, drops repeated claim, then page-cache hits', async () => {
     await putThesis();
     const result = await runPhaseProposeTakes(context(), { extractor: proposals });

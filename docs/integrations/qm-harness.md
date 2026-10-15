@@ -31,8 +31,7 @@ Isolation model:
 
 - **Reads** are source-granular, SQL-enforced (`federated_read`): every
   employee client reads `agents` + the read-only sources you grant.
-- **Writes** are slug-prefix-granular, server-enforced (`bound_slug_prefixes`,
-  v0.42.72.0+): a client can only mutate pages under its own `emp-<slug>/`
+- **Writes** are slug-prefix-granular, server-enforced (`bound_slug_prefixes`): a client can only mutate pages under its own `emp-<slug>/`
   and its channels' `chan-<x>/` prefixes — on `put_page`, `delete_page`,
   `restore_page`, `add_tag`, `remove_tag`, `add_link`/`remove_link`,
   `add_timeline_entry`, `revert_version` and `put_raw_data`, plus the
@@ -47,20 +46,22 @@ Isolation model:
   later (or one carrying a bespoke scope) is denied until it is explicitly
   fenced and added to `CLIENT_FENCED_WRITE_OPS` (`src/core/operations.ts`).
   `think` is allow-listed because remote callers cannot persist from it;
-  `submit_agent` because it enforces this same column itself.
+  `submit_agent` because it enforces this same column itself; `remember`
+  (#5913) because it fences the one slug it writes and confines `replaces` to
+  the caller's entity. `forget`/`forget_fact` are not: a withdrawal's write set
+  reaches pages the fenced slug does not name.
 - **Indirect write paths are gated too, not just the ops.** `put_page`'s
   facts backstop would otherwise extract entities from the page body and
   write fact rows (and a `## Facts` fence on git-backed sources) onto
   `people/*` pages the caller never named — the same capability
   `extract_facts` is denied for, reached through an in-prefix write. It is
   skipped for bound clients. `POST /ingest` is refused outright: its handler
-  bypasses the op layer *and* discards the source grant for untrusted
-  payloads, so it would write into the `default` source.
+  bypasses the op layer, so `enforceClientSlugFence` never runs and a bound
+  client could write any slug inside its granted source.
 ### Known limitations — read these before you rely on the fence
 
 The write fence is a **write** boundary within a source. It is not a privacy
-boundary, and it does not make every side effect prefix-clean. As of
-v0.42.73.2:
+boundary, and it does not make every side effect prefix-clean:
 
 - **The fence follows a delegated write.** When a client with `agent` scope
   hands work to a subagent via `submit_agent`, that subagent runs under its own
@@ -86,20 +87,25 @@ v0.42.73.2:
   page content. Unreachable in the layout above (the `agents` source is
   path-less and holds no code pages); it applies only if you point employee
   writes at a code-synced source.
-- **A few read ops are still brain-wide** and ignore the federated grant:
-  `get_recent_salience`, `find_anomalies`, `find_contradictions`, and
-  `sources_list`/`sources_status` (which expose source ids, paths and URLs).
-  A read-scoped client can learn facts derived from sources it was not
-  granted. Pre-existing, not introduced by the fence; if that matters for
-  your deployment, withhold those tools at the harness layer for now.
-- **Reads touch `last_retrieved_at`** on the pages they return, including
+- **Stored contradiction reports are temporarily local-only.**
+  `find_contradictions` returns stored findings only to trusted local callers
+  without a source filter. Harness clients receive `{ contradictions: [], note }`
+  with an availability note. Other brain-wide read ops (`get_recent_salience`,
+  `find_anomalies`, and `sources_list`/`sources_status`) honor the federated
+  grant; `sources_status` answers `not_found` for an out-of-grant ID.
+- **Reads touch `last_retrieved_at`** (in `page_retrievals`) on the pages they return, including
   pages in read-only sources. Freshness/usage signals are therefore
   writable-by-reading; nothing else about the page is.
-- **`POST /ingest` writes land in the `default` source** regardless of the
-  calling client's `source_id`, because the handler discards the source for
-  untrusted payloads. Bound clients are refused the route outright for this
-  reason; if you point a webhook integration at it, scope that brain's
-  `default` source deliberately.
+- **`POST /ingest` writes land in the calling client's granted source.** The
+  write source is resolved server-side from `oauth_clients.source_id`; the
+  caller-supplied `X-Gbrain-Source-Id` header does not route anything, so a
+  client cannot choose its own write partition. A client registered without a
+  source writes to `default`, and a write falls back to `default` if its
+  source is unregistered, archived, or deleted mid-write (the job result
+  reports this via `source_fallback`). If you point a webhook integration at
+  this route, give its client an explicit `--source` so its captures do not
+  accumulate in the brain's `default` source. Bound clients are still refused
+  the route outright, because the slug fence cannot run on this path.
 - **Tradeoff to state out loud:** read isolation is per-source, so within the
   shared `agents` source every employee can *read* every prefix (including
   other employees' `emp-*/`). That matches qm's transparent-by-default,
@@ -162,7 +168,7 @@ In the org's qm deployment repo (the directory `qm init` produced):
 
 1. **Tool:** copy [`qm-harness-snippets/tool.json`](qm-harness-snippets/tool.json)
    to `sandbox/tools/gbrain/tool.json` and drop the compiled `gbrain` binary
-   beside it (`bun build --compile --outfile gbrain src/cli.ts`, built for
+   beside it (`bun build --compile --no-compile-autoload-bunfig --outfile gbrain src/cli.ts`, built for
    the sandbox image's OS/arch). `auth.credentialPaths` marks
    `~/.gbrain/config.json` as the scope's resident credential file;
    `auth.check` wires `gbrain whoami` into qm's connector status (read-scope;

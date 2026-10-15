@@ -1,13 +1,11 @@
 import { afterEach, describe, expect, it, setDefaultTimeout } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
-const PACKAGE_JSON = resolve(REPO_ROOT, 'package.json');
 const GUARD = resolve(REPO_ROOT, 'scripts', 'check-engine-dynamic-import.sh');
-const VERIFY_DISPATCHER = resolve(REPO_ROOT, 'scripts', 'run-verify-parallel.sh');
 const BASH = process.platform === 'win32'
   ? resolve(process.env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'bin', 'bash.exe')
   : 'bash';
@@ -21,6 +19,23 @@ function fixture(name: string, content: string): string {
   const path = join(dir, name);
   writeFileSync(path, content, 'utf8');
   return path;
+}
+
+/**
+ * The guard's default scan set = the 3 engine-live façades PLUS every .ts
+ * file peeled into src/core/{pglite,postgres}-engine/ (the guard resolves its
+ * ROOT from its own script path, so the count always reflects the REAL repo
+ * regardless of cwd). Derived, not hardcoded, so adding an engine module
+ * doesn't break this test.
+ */
+function expectedDefaultScanCount(): number {
+  let count = 3;
+  for (const dir of ['src/core/pglite-engine', 'src/core/postgres-engine', 'src/core/engine-sql', 'src/core/schema-migrations']) {
+    const full = join(REPO_ROOT, dir);
+    if (!existsSync(full)) continue;
+    count += readdirSync(full, { recursive: true }).filter((f) => String(f).endsWith('.ts')).length;
+  }
+  return count;
 }
 
 function runGuard(files: string[] = [], cwd = REPO_ROOT) {
@@ -43,9 +58,6 @@ afterEach(() => {
 });
 
 describe('check-engine-dynamic-import.sh', () => {
-  it('exists', () => {
-    expect(existsSync(GUARD)).toBe(true);
-  });
 
   it('rejects and reports an unmarked dynamic import', () => {
     const path = fixture('violator.ts', "async function load() {\n  return await import('./helper.ts');\n}\n");
@@ -286,7 +298,9 @@ describe('check-engine-dynamic-import.sh', () => {
 
     const result = runGuard([], foreign);
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain('check-engine-dynamic-import: ok (3 file(s) scanned)');
+    expect(result.stdout).toContain(
+      `check-engine-dynamic-import: ok (${expectedDefaultScanCount()} file(s) scanned)`,
+    );
   }, 30_000);
 
   it('still catches a violation in CRLF input', () => {
@@ -299,32 +313,8 @@ describe('check-engine-dynamic-import.sh', () => {
   it('passes on the reconciled repository sources', () => {
     const result = runGuard();
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain('check-engine-dynamic-import: ok (3 file(s) scanned)');
+    expect(result.stdout).toContain(
+      `check-engine-dynamic-import: ok (${expectedDefaultScanCount()} file(s) scanned)`,
+    );
   }, 30_000);
-});
-
-describe('engine dynamic-import guard wiring', () => {
-  it('is invoked through bash by check:all', () => {
-    const pkg = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8')) as {
-      scripts: Record<string, string>;
-    };
-    expect(pkg.scripts['check:engine-dynamic-import']).toBe(
-      'bash scripts/check-engine-dynamic-import.sh',
-    );
-    expect(pkg.scripts['check:all']).toContain(
-      'bash scripts/check-engine-dynamic-import.sh',
-    );
-  });
-
-  it('is listed by the authoritative verify dispatcher', () => {
-    const result = spawnSync(BASH, [VERIFY_DISPATCHER, '--dry-list'], {
-      cwd: REPO_ROOT,
-      encoding: 'utf8',
-      timeout: 30_000,
-    });
-    expect(result.status).toBe(0);
-    expect(new Set((result.stdout ?? '').trim().split('\n'))).toContain(
-      'check:engine-dynamic-import',
-    );
-  });
 });

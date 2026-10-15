@@ -40,6 +40,7 @@
  *   - src/commands/sync.ts (performSync + in-file callees)
  *   - src/commands/embed.ts (runEmbedCore + helpers)
  *   - src/core/progress.ts (heartbeat / progress writer)
+ *   - src/commands/import.ts (runImport's human-only info() + summary lines)
  *
  * Anything outside those modules that writes directly to stdout/stderr will
  * NOT get the prefix. If you find a delegate-module line that escapes the
@@ -60,6 +61,42 @@ const __prefixStore = new AsyncLocalStorage<string>();
 // onto the JSON-RPC channel. One direction only — never unset at runtime
 // (the serve process is stdio-MCP for its whole lifetime).
 let __stdoutLoggingRedirected = false;
+
+// CLI `--json` mode: stdout is reserved for the JSON envelope (and any JSON
+// status lines). Scoped, not process-wide: rebinding console.log here would
+// also push the envelope itself to stderr. slog consults it; serr is stderr
+// already; direct console.log(JSON.stringify(..)) sites are untouched.
+const __humanToStderr = new AsyncLocalStorage<true>();
+
+// #6317: a resident serve running a delegated managed sync captures the
+// drain's human lines for the polling CLI instead of printing them to its
+// own stderr. Scoped like the prefix: it rides every await (and Bun's
+// timers) under the wrap, so the drain's progress and stall lines, which an
+// interval prints, reach the sink too.
+const __lineSink = new AsyncLocalStorage<(line: string) => void>();
+
+/**
+ * Run `fn` with every `slog` / `serr` line delivered to `sink` (one call
+ * per formatted line, prefix applied, no trailing newline) instead of the
+ * process streams. Nests with `withSourcePrefix`; the innermost sink wins.
+ */
+export function withHumanLineSink<T>(sink: (line: string) => void, fn: () => Promise<T>): Promise<T> {
+  return __lineSink.run(sink, fn);
+}
+
+function deliverToSink(sink: (line: string) => void, args: unknown[], prefix: string | null): void {
+  const text = prefix === null ? formatArgs(args) : prefixLines(formatArgs(args), prefix);
+  for (const line of text.split('\n')) sink(line);
+}
+
+/**
+ * Run `fn` with every `slog` line (prefixed or not) routed to stderr, so a
+ * command's human output cannot interleave with the JSON it emits on
+ * stdout. Propagates through `await` like `withSourcePrefix`; nests with it.
+ */
+export function withHumanLogsToStderr<T>(fn: () => Promise<T>): Promise<T> {
+  return __humanToStderr.run(true, fn);
+}
 
 /**
  * Route ALL stdout-bound logging to stderr for the lifetime of this
@@ -131,15 +168,19 @@ export function getSourcePrefix(): string | null {
  */
 export function slog(...args: unknown[]): void {
   const prefix = getSourcePrefix();
+  const sink = __lineSink.getStore();
+  if (sink) { deliverToSink(sink, args, prefix); return; }
+  const toStderr = __stdoutLoggingRedirected || __humanToStderr.getStore() === true;
   if (prefix === null) {
     // Back-compat fast path: bare console.log semantics. (Under the stdio
     // MCP redirect, console.log is rebound to stderr — see
-    // redirectStdoutLoggingToStderr.)
+    // redirectStdoutLoggingToStderr; under withHumanLogsToStderr the line
+    // is routed to stderr here instead.)
     // eslint-disable-next-line no-console
-    console.log(...args);
+    if (toStderr) console.error(...args); else console.log(...args);
     return;
   }
-  const out = __stdoutLoggingRedirected ? process.stderr : process.stdout;
+  const out = toStderr ? process.stderr : process.stdout;
   out.write(prefixLines(formatArgs(args), prefix) + '\n');
 }
 
@@ -150,6 +191,8 @@ export function slog(...args: unknown[]): void {
  */
 export function serr(...args: unknown[]): void {
   const prefix = getSourcePrefix();
+  const sink = __lineSink.getStore();
+  if (sink) { deliverToSink(sink, args, prefix); return; }
   if (prefix === null) {
     // eslint-disable-next-line no-console
     console.error(...args);

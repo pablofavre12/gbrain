@@ -18,6 +18,7 @@ import { loadQuestionBank } from '../src/core/bootstrap/assets.ts';
 import { byteFloors } from '../src/core/bootstrap/render.ts';
 import {
   verifyWorkspace,
+  resolveVerifySourceId,
   VERIFY_PROBE_SLUG,
   VERIFY_PROBE_ENTITY_SLUG,
   VERIFY_MAGIC_TOKEN,
@@ -26,8 +27,11 @@ import {
 } from '../src/core/bootstrap/verify.ts';
 import { listVerifyRuns } from '../src/core/bootstrap/status.ts';
 import type { CapabilityReport } from '../src/core/capability.ts';
+import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
 import { loadCorpusPages, loadCorpusQueries } from './helpers/bootstrap-corpus.ts';
+import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 
 const KEYLESS: CapabilityReport = {
   embeddings: { available: false },
@@ -88,6 +92,11 @@ beforeAll(async () => {
   expect(confirm(ws, h.hash).ok).toBe(true);
 
   const floors = byteFloors(required.length);
+  writeFileSync(
+    join(ws, 'AGENTS.md'),
+    '⛔ **WRITE IT DOWN — SAME TURN, THROUGH THE BRAIN.**\n\n' +
+      '**Gate 7 — Write-back.** Before ending the turn, persist durable learning.\n',
+  );
   writeFileSync(join(ws, 'SOUL.md'), pad('# Soul\n\nIdentity rendered from answers.\n', floors['SOUL.md'] + 200));
   writeFileSync(join(ws, 'USER.md'), pad('# User\n\nTheir literal words are ground truth.\n', floors['USER.md'] + 100));
   mkdirSync(join(ws, 'brain'), { recursive: true });
@@ -138,12 +147,17 @@ describe('verifyWorkspace — keyless pass', () => {
     expect(check(res.checks, 'doctor_green')[0].ok).toBe(true);
     expect(check(res.checks, 'token_sweep')[0].ok).toBe(true);
     expect(check(res.checks, 'byte_floors')[0].ok).toBe(true);
+    expect(check(res.checks, 'writeback_contract')[0].ok).toBe(true);
     expect(check(res.checks, 'secret_scan')[0].ok).toBe(true);
     expect(check(res.checks, 'deny_globs')[0].ok).toBe(true);
     expect(check(res.checks, 'repo_privacy')[0].ok).toBe(true); // local-only
     // execution_env is informational and NEVER gates [D-cloud].
     expect(check(res.checks, 'execution_env')[0].ok).toBe(true);
     for (const c of check(res.checks, 'roundtrip')) expect(c.ok).toBe(true);
+    // #4287 wiring: the active-plane probe runs on every verify; keyless
+    // installs pass it (no active plane exists to split).
+    expect(check(res.checks, 'embedding_plane')[0].ok).toBe(true);
+    expect(check(res.checks, 'embedding_plane')[0].detail).toContain('keyless');
     expect(check(res.checks, 'graph_floor')[0].ok).toBe(true);
     expect(check(res.checks, 'magic_moment')[0].ok).toBe(true);
     expect(check(res.checks, 'capability_report')[0].detail).toContain('keyless');
@@ -158,9 +172,25 @@ describe('verifyWorkspace — keyless pass', () => {
     }
     expect(res.tour).toEqual([...FIRST_RUN_TOUR]);
 
+    // The OOBE hand-off block prints after the tour on PASS: ownership (this
+    // ws has no origin remote → the local-only variant with the repo upgrade
+    // path) and the ONE next action (the cold-start skill via ClawVisor).
+    expect(res.report).toContain('What you own');
+    expect(res.report).toContain('gbrain bootstrap repo');
+    expect(res.report).toContain('cold-start');
+    expect(res.report).toContain('ClawVisor');
+    expect(res.handoff.length).toBeGreaterThan(0);
+
     // Probe cleanup [G13]: pages, files, and the reconciled fact are gone.
     expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`))).toBe(false);
     expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_ENTITY_SLUG}.md`))).toBe(false);
+    // Tombstone-proof: the cleanup HARD-deletes via engine.deletePage — a
+    // soft delete (deleted_at tombstone) would leave these rows countable.
+    const probeRows = await engine.executeRaw<{ n: string }>(
+      `SELECT count(*)::text AS n FROM pages WHERE slug = ANY($1::text[])`,
+      [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+    );
+    expect(probeRows[0].n).toBe('0');
     const facts = await engine.executeRaw<{ fact: string }>(
       `SELECT fact FROM facts WHERE source_id = $1 AND fact LIKE $2`,
       ['workspace', `%${VERIFY_MAGIC_TOKEN}%`],
@@ -245,14 +275,83 @@ describe('verifyWorkspace — keyless pass', () => {
       const scan = check(res.checks, 'secret_scan')[0];
       expect(scan.ok).toBe(false);
       expect(scan.detail).toContain('openai');
+      expect(scan.detail).toContain(`allowlist only a reviewed false positive by appending its fingerprint to ${join(ws, '.gbrain-scan-allow')}`);
+      expect(scan.detail).toContain('write-refusals.md#secret-scan-refusals-and-redaction');
       // Redaction discipline: the finding detail NEVER carries the secret value.
       expect(scan.detail).not.toContain('sk-AAAAAAAAAAAAAAAAAAAAAAAA');
 
       expect(res.ok).toBe(false);
+
+      // Tour gating on FAIL: the report says fix-first and withholds the
+      // celebration prompts ("broken, but go enjoy it" is a mixed signal) …
+      expect(res.report).toContain('Fix the FAIL checks above');
+      expect(res.report).not.toContain('Who am I to you?');
+      // … the hand-off block is withheld with the tour (celebrating ownership
+      // of a FAILED install is the same mixed signal) …
+      expect(res.report).not.toContain('What you own');
+      expect(res.report).not.toContain('cold-start');
+      // … while the returned tour + handoff arrays stay unconditional so
+      // machine consumers (--json) keep a stable shape, and the check names
+      // the gate.
+      expect(res.tour).toEqual([...FIRST_RUN_TOUR]);
+      expect(res.handoff.length).toBeGreaterThan(0);
+      expect(check(res.checks, 'first_run_tour')[0].detail).toContain('withheld');
     } finally {
       rmSync(githubPath, { force: true });
       writeFileSync(userPath, userOriginal);
       writeFileSync(soulPath, soulOriginal);
+    }
+  }, 240_000);
+});
+
+describe('verifyWorkspace — write-through disabled by config', () => {
+  test('sync.write_through=false → roundtrip WARNs naming the config key; the rest of the family still runs', async () => {
+    await engine.setConfig('sync.write_through', 'false');
+    _resetWriteThroughCacheForTest(); // prior verify runs primed the ~30s per-engine cache
+    try {
+      const res = await verifyWorkspace(engine, ws, {
+        sourceId: 'workspace',
+        gbrainHomeDir: home,
+        capabilities: KEYLESS,
+      });
+      const wtWarn = check(res.checks, 'roundtrip').find((c) => c.detail.includes('sync.write_through'));
+      expect(wtWarn).toBeDefined();
+      expect(wtWarn!.ok).toBe(true);
+      expect(wtWarn!.warn).toBe(true);
+      // The remaining roundtrip-family checks still ran off the DB row.
+      expect(check(res.checks, 'graph_floor')[0].ok).toBe(true);
+      expect(check(res.checks, 'magic_moment')[0].ok).toBe(true);
+      expect(res.ok).toBe(true);
+      // No file materialized under brain/ (DB-only by operator choice).
+      expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`))).toBe(false);
+    } finally {
+      await engine.unsetConfig('sync.write_through');
+      _resetWriteThroughCacheForTest();
+    }
+  }, 240_000);
+});
+
+describe('verifyWorkspace — probe cleanup on an early roundtrip exit (#6001)', () => {
+  test('a roundtrip that fails before its cleanup step still removes both probe pages', async () => {
+    // A DIRECTORY where the second probe's file must go: the entity probe lands (row + file), the
+    // probe page's put_page throws, the roundtrip FAILS at step 1 and returns early, which used to
+    // skip removeProbes and leave the entity probe behind.
+    const inTheWay = join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`);
+    mkdirSync(inTheWay, { recursive: true });
+    try {
+      const res = await verifyWorkspace(engine, ws, { sourceId: 'workspace', gbrainHomeDir: home, capabilities: KEYLESS, skipHooksSmoke: true });
+      const rt = check(res.checks, 'roundtrip');
+      expect(rt.some((c) => !c.ok && c.detail.includes('put_page failed'))).toBe(true);
+      expect(res.checks.filter((c) => c.id === 'graph_floor')).toEqual([]);
+      expect(res.checks.filter((c) => c.id === 'probe_cleanup')).toEqual([]);
+      const probeRows = await engine.executeRaw<{ n: string }>(
+        `SELECT count(*)::text AS n FROM pages WHERE source_id = 'workspace' AND slug = ANY($1::text[])`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+      );
+      expect(probeRows[0].n).toBe('0');
+      expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_ENTITY_SLUG}.md`))).toBe(false);
+    } finally {
+      rmSync(inTheWay, { recursive: true, force: true });
     }
   }, 240_000);
 });
@@ -282,6 +381,10 @@ describe('verifyWorkspace — engine-plane side effects', () => {
       expect(check.detail).toContain('world');
       expect(check.detail).toContain('facts.default_visibility');
       expect(check.detail).toContain('gbrain config set');
+      // The key governs extraction-path writes only; `remember` hard-defaults
+      // to 'world' — the message must disclose that carve-out (#5605).
+      expect(check.detail).toContain('`remember`');
+      expect(check.detail).toContain('extraction-path');
 
       // Pre-set explicit value survives verify (set-if-unset, never override).
       await e2.setConfig('facts.default_visibility', 'private');
@@ -296,6 +399,7 @@ describe('verifyWorkspace — engine-plane side effects', () => {
       const check2 = res2.checks.find((c) => c.id === 'facts_visibility')!;
       expect(check2.detail).toContain('private');
       expect(check2.detail).toContain('untouched');
+      expect(check2.detail).toContain('`remember`');
     } finally {
       await e2.disconnect();
       rmSync(ws2, { recursive: true, force: true });
@@ -394,6 +498,97 @@ describe('verifyWorkspace — source_id collision resolution', () => {
   }, 240_000);
 });
 
+describe('verifyWorkspace — workspace source registration (#4328)', () => {
+  test("uninitialized workspace resolves through the source resolver to 'default' and verify passes", async () => {
+    const e2 = new PGLiteEngine();
+    await e2.connect({});
+    await e2.initSchema();
+    const ws2 = mkdtempSync(join(tmpdir(), 'gb-verify-uninit-'));
+    try {
+      mkdirSync(join(ws2, 'brain'), { recursive: true });
+      // Identity files above the 0-answer floors (uninit ws — no interview ran).
+      const floors0 = byteFloors(0);
+      writeFileSync(join(ws2, 'SOUL.md'), pad('# Soul\n\nMinimal identity.\n', floors0['SOUL.md'] + 200));
+      writeFileSync(join(ws2, 'USER.md'), pad('# User\n\nMinimal user notes.\n', floors0['USER.md'] + 100));
+      // The writeback_contract check requires the integrated gate; this test
+      // exercises source resolution, not the contract audit.
+      writeFileSync(
+        join(ws2, 'AGENTS.md'),
+        '⛔ **WRITE IT DOWN — SAME TURN, THROUGH THE BRAIN.**\n\n' +
+          '**Gate 7 — Write-back.** Before ending the turn, persist durable learning.\n',
+      );
+      // No manifest at all — the pre-fix hardcoded 'workspace' fallback made
+      // put_page fail its sources FK on any brain that never registered it.
+      const resolved = await resolveVerifySourceId(e2, ws2);
+      expect(resolved).toBe('default');
+      // The shape `gbrain sources add` leaves behind: the resolved source's
+      // local_path is the workspace brain/ so write-through materializes.
+      // (Direct UPDATE — 'default' is seeded by migration, so add would collide.)
+      await e2.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [join(ws2, 'brain')]);
+      const res = await verifyWorkspace(e2, ws2, {
+        sourceId: resolved,
+        gbrainHomeDir: home,
+        capabilities: KEYLESS,
+        skipHooksSmoke: true,
+        sweepBudgetMs: 5_000,
+      });
+      if (!res.ok) console.error(res.report);
+      expect(res.ok).toBe(true);
+      for (const c of res.checks) expect(c.detail).not.toContain('foreign key');
+    } finally {
+      await e2.disconnect();
+      rmSync(ws2, { recursive: true, force: true });
+    }
+  }, 240_000);
+
+  test('unregistered workspace source → named actionable FAIL, probe writes + hooks smoke skipped, no raw FK error', async () => {
+    const e2 = new PGLiteEngine();
+    await e2.connect({});
+    await e2.initSchema();
+    const ws2 = mkdtempSync(join(tmpdir(), 'gb-verify-unreg-'));
+    try {
+      mkdirSync(join(ws2, 'brain'), { recursive: true });
+      writeManifest(ws2, {
+        format_version: 1,
+        initialized: true,
+        agent_name: 'Unregistered',
+        created_by: 'test',
+        created_at: new Date().toISOString(),
+        source_id: 'workspace',
+      });
+      // Initialized manifest wins resolution — but 'workspace' was never
+      // `gbrain sources add`-ed on this brain.
+      expect(await resolveVerifySourceId(e2, ws2)).toBe('workspace');
+      const res = await verifyWorkspace(e2, ws2, {
+        sourceId: 'workspace',
+        gbrainHomeDir: home,
+        capabilities: KEYLESS,
+        sweepBudgetMs: 5_000,
+      });
+      expect(res.ok).toBe(false);
+      const rt = check(res.checks, 'roundtrip');
+      expect(rt.length).toBe(1);
+      expect(rt[0].ok).toBe(false);
+      expect(rt[0].detail).toContain(`gbrain sources add workspace --path ${join(ws2, 'brain')}`);
+      // The named FAIL replaces the raw FK violation the put used to surface.
+      for (const c of res.checks) expect(c.detail).not.toContain('foreign key');
+      // put_page was SKIPPED (not attempted-and-failed): zero probe rows.
+      const rows = await e2.executeRaw<{ n: string }>(
+        `SELECT count(*)::text AS n FROM pages WHERE slug = ANY($1::text[])`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+      );
+      expect(rows[0].n).toBe('0');
+      // The hooks smoke binds the workspace source id — skipped with the same pointer.
+      const hooks = check(res.checks, 'hooks_smoke')[0];
+      expect(hooks.ok).toBe(true);
+      expect(hooks.detail).toContain('not registered');
+    } finally {
+      await e2.disconnect();
+      rmSync(ws2, { recursive: true, force: true });
+    }
+  }, 240_000);
+});
+
 describe('verifyWorkspace — real corpus graph floor + qrels recall', () => {
   test('auto-link builds real multi-entity edges; verify passes on the populated brain; gold queries recall the expected pages', async () => {
     // Seed the synthetic world into the SAME workspace source verify checks,
@@ -448,4 +643,63 @@ describe('verifyWorkspace — real corpus graph floor + qrels recall', () => {
     }
     expect(misses).toEqual([]);
   }, 240_000);
+});
+
+describe('verifyWorkspace — managed brain (#5280)', () => {
+  test('verify runs on a managed brain and purges its probes through the coordinator', async () => {
+    await claimWorktree(engine, 'workspace', join(ws, 'brain'));
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    try {
+      const res = await verifyWorkspace(engine, ws, { sourceId: 'workspace', gbrainHomeDir: home, capabilities: KEYLESS, skipHooksSmoke: true });
+      for (const c of check(res.checks, 'roundtrip')) expect(c.ok).toBe(true);
+      expect(res.checks.filter((c) => c.id === 'probe_cleanup')).toEqual([]);
+      const probeRows = await engine.executeRaw<{ n: string }>(
+        `SELECT count(*)::text AS n FROM pages WHERE source_id = 'workspace' AND slug = ANY($1::text[])`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+      );
+      expect(probeRows[0].n).toBe('0');
+      expect(existsSync(join(ws, 'brain', `${VERIFY_PROBE_SLUG}.md`))).toBe(false);
+      const purged = await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM persistence_requests WHERE source_id = 'workspace' AND operation = 'delete_page' AND state = 'committed'
+            AND outcome->>'status' = 'purged' AND slug = ANY($1::text[]) ORDER BY slug`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]],
+      );
+      expect(new Set(purged.map((r) => r.slug))).toEqual(new Set([VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]));
+      expect(await engine.executeRaw(`SELECT id FROM facts WHERE source_id = 'workspace' AND source_markdown_slug = ANY($1::text[])`,
+        [[VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG]])).toEqual([]);
+    } finally {
+      await disposePersistenceConsumer(engine);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    }
+  }, 240_000);
+});
+
+describe('bootstrap verify write wait (#6356)', () => {
+  test('the probe ctx waits as long as a CLI write: 30 s by default, GBRAIN_WRITE_WAIT_MS when set', async () => {
+    const verify = await import('../src/core/bootstrap/verify.ts') as Record<string, unknown>;
+    const localCtx = verify.localCtx as (engine: unknown, sourceId: string) => OperationContext;
+    expect(typeof localCtx).toBe('function');
+    const saved = process.env.GBRAIN_WRITE_WAIT_MS;
+    try {
+      delete process.env.GBRAIN_WRITE_WAIT_MS;
+      expect(localCtx({}, 'default').writeWaitMs).toBe(30_000);
+      process.env.GBRAIN_WRITE_WAIT_MS = '45000';
+      expect(localCtx({}, 'default').writeWaitMs).toBe(45_000);
+    } finally {
+      if (saved === undefined) delete process.env.GBRAIN_WRITE_WAIT_MS; else process.env.GBRAIN_WRITE_WAIT_MS = saved;
+    }
+  });
+
+  test('an admitted, still-pending probe write names its request and the poll command', async () => {
+    const verify = await import('../src/core/bootstrap/verify.ts') as Record<string, unknown>;
+    const detail = verify.putPageFailureDetail as (e: unknown, waitMs: number | undefined) => string;
+    expect(typeof detail).toBe('function');
+    const pending = { message: 'write pending', toJSON: () => ({ error: 'write_pending', write_request: { request_id: '0b6f6f0e-2c1a-4d8e-9f3a-5e2b7c9d1a44', state: 'queued', retry_after_ms: 1000 } }) };
+    const text = detail(pending, 30_000);
+    expect(text).toContain('still pending after 30s');
+    expect(text).toContain('0b6f6f0e-2c1a-4d8e-9f3a-5e2b7c9d1a44');
+    expect(text).toContain('gbrain write-request -- 0b6f6f0e-2c1a-4d8e-9f3a-5e2b7c9d1a44');
+    expect(text).toContain('GBRAIN_WRITE_WAIT_MS');
+    expect(detail(new Error('boom'), 30_000)).toBe('put_page failed: boom');
+  });
 });

@@ -10,16 +10,21 @@
  *   - P0-5: each per-source cycle writes `last_full_cycle_at` in its
  *     `sources.config` JSONB on success (handled in `runCycle` exit hook,
  *     not here — this module just READS it for freshness gating).
- *   - P1-2: explicitly threads `pull: !!source.config.remote_url` so
- *     local-only sources don't try to git-pull.
+ *   - P1-2: automatic pull needs a remote and an unmanaged source
+ *     (`automaticSyncPull`), so local-only and managed sources never git-pull.
  *   - P1-3: PGLite engines default `fanoutMax=1` (PGLite is single-writer;
  *     parallel fan-out would queue uselessly behind the file lock).
- *   - P1-4: enumeration filters `local_path IS NOT NULL` so pure-DB
+ *   - P1-4: enumeration keeps sources with a `local_path`, so pure-DB
  *     sources don't get dispatched (handler would fall back to global
- *     sync.repo_path, which is wrong for them).
+ *     sync.repo_path, which is wrong for them). Connector sources (#5673)
+ *     are enumerated whatever their `local_path` once they have a recorded
+ *     sync attempt; their cycles run only CONNECTOR_SOURCE_PHASES with no
+ *     brain directory, because the freshness loop owns their sync.
  *   - P1-5: archive recheck happens in the handler (jobs.ts:1146), not
  *     here, so a source archived between fan-out and worker claim still
  *     skips cleanly.
+ *   - Missing checkout paths are skipped at dispatch time; sources.local_path
+ *     is machine-specific shared state and can legitimately point elsewhere.
  *
  * Phase-scope caveat (codex r1 P0-1): per-source cycle LOCKS let two cycles
  * RUN concurrently, but several phases (embed, orphans, purge,
@@ -30,12 +35,17 @@
  * row layer; cost duplication is the visible tradeoff).
  */
 
+import { existsSync } from 'fs';
 import type { BrainEngine, SourceRow } from '../core/engine.ts';
 import type { MinionQueue } from '../core/minions/queue.ts';
-import { NON_GLOBAL_PHASES, GLOBAL_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
-import { sourceConfigHasRemoteUrl } from '../core/sources-load.ts';
-
-const FULL_CYCLE_FLOOR_MIN = 60;
+import { SOURCE_FRESHNESS_PHASES, MAINTENANCE_PHASES, LAST_GLOBAL_AT_KEY } from '../core/cycle.ts';
+import { CONNECTOR_SOURCE_PHASES } from '../core/cycle/phase-scope.ts';
+import { isConnectorSourceKind } from '../core/persistence/connector-identity.ts';
+import { attemptedConnectorSourceIds } from '../core/persistence/connector-state.ts';
+import { parseSourceConfig, sourceLocalPathSkipWarning } from '../core/sources-load.ts';
+import { automaticSyncPull } from '../core/persistence/automatic-sync-policy.ts';
+import { automaticSyncSkip, loadActivationPendingSourceIds, reportAutomaticSyncSkip } from '../core/sync-policy.ts';
+import { AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES } from './autopilot-remediation-policy.ts';
 
 // #2194 fix #2: failure cooldown. A source whose autopilot-cycle keeps
 // failing/timing-out re-dispatches every tick today (only SUCCESS gates
@@ -67,20 +77,41 @@ export interface FanoutOpts {
   emit?: (line: string) => void;
   /** Sink for non-JSON human log lines; defaults to console.log. */
   log?: (line: string) => void;
+  /** Test seam for source checkout availability. */
+  pathExists?: (path: string) => boolean;
+}
+
+/** True only for "the sources table does not exist" (pre-v0.18 brains). */
+export function isMissingSourcesTable(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (code === '42P01') return true;                       // Postgres undefined_table
+  const message = e instanceof Error ? e.message : String(e);
+  return /relation "?sources"? does not exist|no such table:? sources|sources table missing/i.test(message);
 }
 
 export interface FanoutResult {
-  /** Source ids dispatched this tick. */
+  /** Source ids whose submission INSERTED a fresh job this tick. */
   dispatched: string[];
+  /** Source ids whose submission coalesced onto an existing pending job
+   *  (maxPending single-flight or same-slot idempotency) — work is in
+   *  flight, but no new row was created. Kept separate so no surface
+   *  claims a dispatch that didn't insert. */
+  coalesced: string[];
   /** Source ids skipped because their last_full_cycle_at is still fresh. */
   skipped_fresh: string[];
   /** Source ids beyond the fanoutMax cap (will retry next tick). */
   skipped_cap: string[];
   /** Source ids skipped because they're in failure cooldown (#2194 fix #2). */
   skipped_cooldown: string[];
+  /** Source ids skipped because local_path is unavailable from this machine. */
+  skipped_unavailable_path: string[];
   /** True when this tick fell back to the legacy single-job path
    *  (no sources rows / engine empty). */
   legacy_fallback: boolean;
+  /** True when every enumerated source is inside the freshness window. */
+  all_sources_fresh: boolean;
+  /** True when every enumerated source is either fresh or skipped locally. */
+  all_sources_handled: boolean;
 }
 
 /**
@@ -180,7 +211,11 @@ export function readLastFullCycleAt(src: SourceRow): Date | null {
  * a brain may have fresh sync but stale extract/embed. The 60-min floor on
  * full-cycle is the canonical freshness signal for autopilot dispatch.
  */
-export function isSourceStale(src: SourceRow, now = Date.now(), floorMin = FULL_CYCLE_FLOOR_MIN): boolean {
+export function isSourceStale(
+  src: SourceRow,
+  now = Date.now(),
+  floorMin = AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES,
+): boolean {
   const last = readLastFullCycleAt(src);
   if (last === null) return true;
   const ageMin = (now - last.getTime()) / 60_000;
@@ -328,14 +363,30 @@ export function selectSourcesForDispatch(
   sources: SourceRow[],
   fanoutMax: number,
   now = Date.now(),
-  floorMin = FULL_CYCLE_FLOOR_MIN,
+  floorMin = AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES,
   recentFailures: Map<string, SourceFailure> = new Map(),
   cooldownOpts: CooldownOpts = { baseMin: FAILURE_COOLDOWN_BASE_MIN, capMin: FAILURE_COOLDOWN_CAP_MIN },
-): { dispatch: SourceRow[]; skippedFresh: SourceRow[]; skippedCap: SourceRow[]; skippedCooldown: SourceRow[] } {
+  pathExists: (path: string) => boolean = () => true,
+  connectorIds: ReadonlySet<string> = new Set(),
+): {
+  dispatch: SourceRow[];
+  skippedFresh: SourceRow[];
+  skippedCap: SourceRow[];
+  skippedCooldown: SourceRow[];
+  /** Each row carries the warning that excluded it, so the caller logs it
+   *  directly instead of recomputing (a second existsSync per row). */
+  skippedUnavailablePath: Array<SourceRow & { skip_warning: string }>;
+} {
   const stale: SourceRow[] = [];
   const fresh: SourceRow[] = [];
   const cooldown: SourceRow[] = [];
+  const unavailablePath: Array<SourceRow & { skip_warning: string }> = [];
   for (const s of sources) {
+    const skipWarning = s.local_path && !connectorIds.has(s.id) ? sourceLocalPathSkipWarning(s.id, s.local_path, pathExists, s.config) : null;
+    if (skipWarning) {
+      unavailablePath.push({ ...s, skip_warning: skipWarning });
+      continue;
+    }
     if (!isSourceStale(s, now, floorMin)) { fresh.push(s); continue; }
     // #2194 fix #2: a stale source that recently failed is held in cooldown so
     // it can't re-dispatch every tick (the storm). Success clears it.
@@ -354,7 +405,7 @@ export function selectSourcesForDispatch(
   });
   const dispatch = stale.slice(0, fanoutMax);
   const skippedCap = stale.slice(fanoutMax);
-  return { dispatch, skippedFresh: fresh, skippedCap, skippedCooldown: cooldown };
+  return { dispatch, skippedFresh: fresh, skippedCap, skippedCooldown: cooldown, skippedUnavailablePath: unavailablePath };
 }
 
 /**
@@ -375,16 +426,59 @@ export async function dispatchPerSource(
   const log = opts.log ?? ((line) => console.log(line));
 
   let sources: SourceRow[];
+  let connectorIds = new Set<string>();
+  let idleConnectors = 0;
   try {
     sources = await engine.listAllSources({ localPathOnly: true });
+    // The DX O1 dispatch gate is read whether or not any checkout source
+    // exists, so a connector whose path was cleared is never folded into the
+    // legacy cycle (#5673). An unreadable gate fails closed for connectors.
+    const { connectorAwaitingFirstSync } = await import('./autopilot-dispatch.ts');
+    const attempted = await attemptedConnectorSourceIds(engine).catch(() => null);
+    connectorIds = new Set(attempted ?? []);
+    const checkouts = new Set(sources.filter(s => !isConnectorSourceKind(parseSourceConfig(s.config).kind)).map(s => s.id));
+    idleConnectors = sources.filter(s => connectorAwaitingFirstSync(s, attempted, opts.jsonMode === true, emit)).length;
+    const all = connectorIds.size ? await engine.listAllSources() : sources;
+    sources = all.filter(s => connectorIds.has(s.id) || checkouts.has(s.id));
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
     // Brand-new brain without sources table (pre-v0.18) — fall through
-    // to the legacy single-job path. The error path here also covers
-    // a misconfigured engine, but legacy fallback is safer than failing.
+    // to the legacy single-job path.
+    //
+    // Any OTHER error (connection timeout, pooler CONNECTION_CLOSED, …) is
+    // transient and says nothing about the brain's shape. Falling back then
+    // dispatched a legacy cycle against repoPath on a multi-source brain,
+    // which full-imported the repo root into the 'default' source and
+    // duplicated every page under a new slug prefix. Skip this tick instead;
+    // the next tick retries once the database is reachable.
+    if (!isMissingSourcesTable(e)) {
+      if (opts.jsonMode) {
+        emit(JSON.stringify({ event: 'fanout_skipped', reason: 'sources_unavailable', error: message }));
+      } else {
+        log(`[dispatch] skipped tick: could not list sources (${message}); retrying next tick`);
+      }
+      return {
+        dispatched: [],
+        coalesced: [],
+        skipped_fresh: [],
+        skipped_cap: [],
+        skipped_cooldown: [],
+        skipped_unavailable_path: [],
+        legacy_fallback: false,
+        all_sources_fresh: false,
+        all_sources_handled: false,
+      };
+    }
     if (opts.jsonMode) {
-      emit(JSON.stringify({ event: 'fanout_unavailable', error: e instanceof Error ? e.message : String(e) }));
+      emit(JSON.stringify({ event: 'fanout_unavailable', error: message }));
     }
     sources = [];
+  }
+  // Sources exist but every one is a connector awaiting its first sync: stay
+  // idle rather than falling back to the legacy cycle on the global repo path.
+  if (sources.length === 0 && idleConnectors > 0) {
+    return { dispatched: [], coalesced: [], skipped_fresh: [], skipped_cap: [], skipped_cooldown: [], skipped_unavailable_path: [],
+      legacy_fallback: false, all_sources_fresh: false, all_sources_handled: false };
   }
 
   if (sources.length === 0) {
@@ -395,18 +489,40 @@ export async function dispatchPerSource(
       { repoPath: opts.repoPath },
       {
         queue: 'default',
+        // Slot key dedups repeats within one slot; maxPending: 1 is the
+        // cross-slot guard — an in-flight (waiting or live-lock active)
+        // cycle suppresses re-dispatch even after the slot rotates. This
+        // closes the unbounded-duplicate loop: slot rotation used to mint
+        // a fresh key every baseInterval while maxWaiting ignored the
+        // active row, growing the queue forever when a cycle stalled.
         idempotency_key: `autopilot-cycle:${opts.slot}`,
         max_attempts: 2,
         timeout_ms: opts.timeoutMs,
-        maxWaiting: 1,
+        maxPending: 1,
       },
     );
-    if (opts.jsonMode) {
+    if (job.coalesced) {
+      if (opts.jsonMode) {
+        emit(JSON.stringify({ event: 'dispatch_coalesced', job_id: job.id, mode: 'legacy', slot: opts.slot }));
+      } else {
+        log(`[dispatch] coalesced onto job #${job.id} autopilot-cycle (legacy single-source; already in flight)`);
+      }
+    } else if (opts.jsonMode) {
       emit(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'legacy', slot: opts.slot }));
     } else {
       log(`[dispatch] job #${job.id} autopilot-cycle (legacy single-source)`);
     }
-    return { dispatched: [], skipped_fresh: [], skipped_cap: [], skipped_cooldown: [], legacy_fallback: true };
+    return {
+      dispatched: [],
+      coalesced: [],
+      skipped_fresh: [],
+      skipped_cap: [],
+      skipped_cooldown: [],
+      skipped_unavailable_path: [],
+      legacy_fallback: true,
+      all_sources_fresh: false,
+      all_sources_handled: false,
+    };
   }
 
   // #2194 fix #2: load recent per-source failures + cooldown knobs so a
@@ -425,24 +541,56 @@ export async function dispatchPerSource(
     cooldownOpts = { baseMin: 0, capMin: FAILURE_COOLDOWN_CAP_MIN };
   }
 
-  const { dispatch, skippedFresh, skippedCap, skippedCooldown } =
-    selectSourcesForDispatch(sources, opts.fanoutMax, Date.now(), FULL_CYCLE_FLOOR_MIN, recentFailures, cooldownOpts);
+  const pathExists = opts.pathExists ?? existsSync;
+  const { dispatch, skippedFresh, skippedCap, skippedCooldown, skippedUnavailablePath } =
+    selectSourcesForDispatch(
+      sources,
+      opts.fanoutMax,
+      Date.now(),
+      AUTOPILOT_FULL_CYCLE_FLOOR_MINUTES,
+      recentFailures,
+      cooldownOpts,
+      pathExists,
+      connectorIds,
+    );
+
+  for (const src of skippedUnavailablePath) {
+    if (opts.jsonMode) {
+      emit(JSON.stringify({ event: 'fanout_source_path_skipped', source_id: src.id, reason: src.skip_warning }));
+    } else {
+      log(src.skip_warning);
+    }
+  }
+
+  // #5198: claimed-but-not-activated sources refuse sync until activation.
+  const activationPending = await loadActivationPendingSourceIds(engine);
 
   const dispatched: string[] = [];
+  const coalesced: string[] = [];
   for (const src of dispatch) {
     try {
-      const shouldPull = sourceConfigHasRemoteUrl(src.config);
+      // #4399: config.syncEnabled=false excludes the source from automatic
+      // sync. It still gets its lint/backlinks/extract cycle and freshness
+      // stamp; only the sync phase (and the pull that feeds it) is dropped —
+      // normalizeQueuedSourcePhases passes a freshness subset through as-is.
+      // #5198: a claimed source awaiting activation is treated the same way,
+      // so its cycle does not fail on a sync that is refused by contract, and
+      // so is a gbrain-owned content directory where sync does not apply (P4.2).
+      const skip = await automaticSyncSkip(engine, src, activationPending);
+      if (skip?.reason !== 'sync_disabled') reportAutomaticSyncSkip(src.id, skip, 'fanout_sync_skipped', opts.jsonMode === true, opts.jsonMode ? emit : log);
+      const syncDisabled = !!skip;
+      const connector = connectorIds.has(src.id);
+      const shouldPull = !syncDisabled && !connector && await automaticSyncPull(engine, src);
       const job = await queue.add(
         'autopilot-cycle',
         {
-          repoPath: opts.repoPath,
+          repoPath: connector ? null : opts.repoPath,
           source_id: src.id,
           pull: shouldPull,
-          // #2194 fix #3 (cycle split): per-source cycles run ONLY source-scoped
-          // (+ mixed) phases. The brain-wide global phases (embed, orphans,
-          // purge, …) run once in autopilot-global-maintenance, not N times
-          // concurrently here — the fix for the 4→10GB RSS blowout.
-          phases: NON_GLOBAL_PHASES,
+          // Freshness is stamped by bounded deterministic work only. LLM-backed
+          // source enrichment (atoms, takes, thin-page development, etc.) is
+          // explicit/background work and cannot hold source freshness hostage.
+          phases: connector ? CONNECTOR_SOURCE_PHASES : syncDisabled ? SOURCE_FRESHNESS_PHASES.filter((p) => p !== 'sync') : SOURCE_FRESHNESS_PHASES,
         },
         {
           queue: 'default',
@@ -451,26 +599,43 @@ export async function dispatchPerSource(
           idempotency_key: `autopilot-cycle:${src.id}:${opts.slot}`,
           max_attempts: 2,
           timeout_ms: opts.timeoutMs,
-          // DELIBERATELY no maxWaiting: 1 here. maxWaiting is per
-          // (name, queue), so it would coalesce all N per-source jobs
-          // sharing name='autopilot-cycle' down to ONE waiting job —
-          // killing the fan-out. The per-source idempotency_key
-          // already provides the right dedup granularity (one job per
-          // source per slot, regardless of how many ticks try).
+          // Still DELIBERATELY no maxWaiting here (its NULL-as-wildcard
+          // source scope would coalesce N per-source jobs down to one).
+          // maxPending is safe: its scope is EXACT on
+          // COALESCE(data.sourceId, data.source_id), so each source keeps
+          // an independent single-flight cap — and unlike the slot key, it
+          // suppresses cross-slot re-dispatch while THIS source's cycle is
+          // still in flight (waiting or live-lock active).
+          maxPending: 1,
         },
       );
-      dispatched.push(src.id);
-      if (opts.jsonMode) {
-        emit(JSON.stringify({
-          event: 'dispatched',
-          job_id: job.id,
-          mode: 'per_source',
-          source_id: src.id,
-          pull: shouldPull,
-          slot: opts.slot,
-        }));
+      if (job.coalesced) {
+        coalesced.push(src.id);
+        if (opts.jsonMode) {
+          emit(JSON.stringify({
+            event: 'dispatch_coalesced',
+            job_id: job.id,
+            mode: 'per_source',
+            source_id: src.id,
+            slot: opts.slot,
+          }));
+        } else {
+          log(`[dispatch] coalesced onto job #${job.id} autopilot-cycle source=${src.id} (already in flight)`);
+        }
       } else {
-        log(`[dispatch] job #${job.id} autopilot-cycle source=${src.id}${shouldPull ? ' pull=yes' : ''}`);
+        dispatched.push(src.id);
+        if (opts.jsonMode) {
+          emit(JSON.stringify({
+            event: 'dispatched',
+            job_id: job.id,
+            mode: 'per_source',
+            source_id: src.id,
+            pull: shouldPull,
+            slot: opts.slot,
+          }));
+        } else {
+          log(`[dispatch] job #${job.id} autopilot-cycle source=${src.id}${shouldPull ? ' pull=yes' : ''}`);
+        }
       }
     } catch (e) {
       // Per-source submit failure does NOT abort the tick (codex E1 F1
@@ -505,10 +670,14 @@ export async function dispatchPerSource(
 
   return {
     dispatched,
+    coalesced,
     skipped_fresh: skippedFresh.map(s => s.id),
     skipped_cap: skippedCap.map(s => s.id),
     skipped_cooldown: skippedCooldown.map(s => s.id),
+    skipped_unavailable_path: skippedUnavailablePath.map(s => s.id),
     legacy_fallback: false,
+    all_sources_fresh: skippedFresh.length === sources.length,
+    all_sources_handled: skippedFresh.length + skippedUnavailablePath.length === sources.length,
   };
 }
 
@@ -523,19 +692,36 @@ export function isGlobalMaintenanceStale(lastGlobalAtIso: string | null, now = D
 }
 
 /**
+ * #4578: the global maintenance job deadline. Precedence:
+ * GBRAIN_GLOBAL_MAINTENANCE_TIMEOUT_MS > config autopilot.global_maintenance_timeout_ms
+ * > the autopilot full-cycle default. Values below one minute are ignored.
+ */
+export async function resolveGlobalMaintenanceTimeoutMs(engine: BrainEngine, fallbackMs: number): Promise<number> {
+  const parse = (raw: string | null | undefined) => {
+    const n = raw ? Number(raw) : NaN;
+    return Number.isSafeInteger(n) && n >= 60_000 ? n : null;
+  };
+  return parse(process.env.GBRAIN_GLOBAL_MAINTENANCE_TIMEOUT_MS)
+    ?? parse(await engine.getConfig('autopilot.global_maintenance_timeout_ms'))
+    ?? fallbackMs;
+}
+
+/**
  * #2194 fix #3 / #2227 bug #3 — dispatch the single brain-wide maintenance job
- * that runs the `global` cycle phases (embed, orphans, purge, …) ONCE per
+ * that runs the `mixed` + `global` cycle phases ONCE per
  * window, instead of N per-source cycles each running them concurrently (the
- * RSS blowout). Single-flight is structural: one `idempotency_key` +
- * `maxWaiting:1`, so a slow run never stacks. Gated on `autopilot.last_global_at`
- * (stamped by the handler on success). Postgres-only fan-out concern; on PGLite
- * the file lock already serializes, but the job is still correct there.
+ * RSS blowout). Single-flight is structural: one `idempotency_key` per slot +
+ * `maxPending:1` (an in-flight waiting/live-lock-active run suppresses
+ * re-dispatch even across slot rotation), so a slow run never stacks. Gated on
+ * `autopilot.last_global_at` (stamped by the handler on success). Postgres-only
+ * fan-out concern; on PGLite the file lock already serializes, but the job is
+ * still correct there.
  */
 export async function dispatchGlobalMaintenance(
   engine: BrainEngine,
   queue: MinionQueue,
   opts: { repoPath: string; slot: string; timeoutMs: number; jsonMode: boolean; emit?: (l: string) => void; log?: (l: string) => void },
-): Promise<{ dispatched: boolean; reason: 'stale' | 'fresh' }> {
+): Promise<{ dispatched: boolean; coalesced?: boolean; reason: 'stale' | 'fresh' }> {
   const emit = opts.emit ?? ((line) => process.stderr.write(line + '\n'));
   const log = opts.log ?? ((line) => console.log(line));
 
@@ -550,23 +736,112 @@ export async function dispatchGlobalMaintenance(
     return { dispatched: false, reason: 'fresh' };
   }
 
+  const timeoutMs = await resolveGlobalMaintenanceTimeoutMs(engine, opts.timeoutMs);
   const job = await queue.add(
     'autopilot-global-maintenance',
-    { repoPath: opts.repoPath, phases: GLOBAL_PHASES },
+    { repoPath: opts.repoPath, phases: MAINTENANCE_PHASES },
     {
       queue: 'default',
-      // Structural single-flight: one global job per slot; maxWaiting:1 coalesces
-      // any surplus so a slow brain-wide pass never stacks duplicates.
+      // Structural single-flight: one global job per slot; maxPending:1
+      // coalesces any surplus — including across slot rotation while a slow
+      // brain-wide pass is still in flight — so duplicates never stack.
       idempotency_key: `autopilot-global:${opts.slot}`,
       max_attempts: 2,
-      timeout_ms: opts.timeoutMs,
-      maxWaiting: 1,
+      timeout_ms: timeoutMs,
+      maxPending: 1,
     },
   );
+  if (job.coalesced) {
+    if (opts.jsonMode) {
+      emit(JSON.stringify({ event: 'dispatch_coalesced', job_id: job.id, mode: 'global_maintenance', slot: opts.slot }));
+    } else {
+      log(`[dispatch] coalesced onto job #${job.id} autopilot-global-maintenance (already in flight)`);
+    }
+    // dispatched: false — no row was inserted (same honest-dispatch contract
+    // as dispatchPerSource, where coalesced sources are excluded from
+    // `dispatched`). The coalesced flag says work is already in flight.
+    return { dispatched: false, coalesced: true, reason: 'stale' };
+  }
   if (opts.jsonMode) {
     emit(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'global_maintenance', slot: opts.slot }));
   } else {
     log(`[dispatch] job #${job.id} autopilot-global-maintenance (brain-wide phases)`);
   }
   return { dispatched: true, reason: 'stale' };
+}
+
+/**
+ * Opt-in scheduled connector sync (OV#4: default OFF, daily cadence). For each
+ * provider that has a credential AND `connectors.<p>.auto_sync` truthy AND no
+ * `auth_error_at` newer than the credential's `savedAt` (a dead cookie must not
+ * burn job slots), submit a `connector-sync` job when the last sync is older
+ * than `connectors.sync_floor_min` (default 1440). Idempotency-keyed +
+ * maxPending:1 so a slow sync never stacks.
+ */
+export async function maybeDispatchConnectorSyncs(
+  engine: BrainEngine,
+  queue: MinionQueue,
+  opts: { slot: string; timeoutMs: number; jsonMode: boolean; nowMs?: number; emit?: (l: string) => void; log?: (l: string) => void },
+): Promise<{ dispatched: string[] }> {
+  const emit = opts.emit ?? ((line) => process.stderr.write(line + '\n'));
+  const log = opts.log ?? ((line) => console.log(line));
+  const nowMs = opts.nowMs ?? Date.now();
+
+  const { connectorProviderNames } = await import('../core/connectors/registry.ts');
+  const { loadCredential } = await import('../core/connectors/credentials.ts');
+  const {
+    autoSyncKey,
+    authErrorAtKey,
+    readConnectorState,
+    syncFloorMinKey,
+    sourceIdKey,
+    isTruthy,
+    isConnectorSyncStale,
+    DEFAULT_SYNC_FLOOR_MIN,
+  } = await import('../core/connectors/config-keys.ts');
+
+  let floorMin = DEFAULT_SYNC_FLOOR_MIN;
+  const floorCfg = await engine.getConfig(syncFloorMinKey());
+  if (floorCfg) {
+    const n = parseInt(floorCfg, 10);
+    if (Number.isFinite(n) && n >= 1) floorMin = n;
+  }
+  const sourceId = (await engine.getConfig(sourceIdKey())) || 'default';
+  const dispatched: string[] = [];
+
+  for (const provider of connectorProviderNames()) {
+    const cred = loadCredential(provider);
+    if (!cred) continue; // no credential → nothing to sync
+    if (!isTruthy(await engine.getConfig(autoSyncKey(provider)))) continue; // opt-in only
+    // A dead cookie stamps auth_error_at; skip until the user re-auths (a fresh
+    // credential's savedAt will be newer than the stale error).
+    const authErrorAt = await engine.getConfig(authErrorAtKey(provider));
+    if (authErrorAt && cred.savedAt && authErrorAt > cred.savedAt) continue;
+
+    const lastSyncAt = await readConnectorState(engine, provider, sourceId, 'last_sync_at');
+    if (!isConnectorSyncStale(lastSyncAt, nowMs, floorMin)) continue;
+
+    const job = await queue.add(
+      'connector-sync',
+      { provider, sourceId },
+      {
+        queue: 'default',
+        idempotency_key: `connector-sync:${provider}:${opts.slot}`,
+        max_attempts: 2,
+        timeout_ms: opts.timeoutMs,
+        maxPending: 1,
+      },
+    );
+    if (job.coalesced) {
+      if (!opts.jsonMode) log(`[dispatch] coalesced connector-sync ${provider} (already in flight)`);
+      continue;
+    }
+    dispatched.push(provider);
+    if (opts.jsonMode) {
+      emit(JSON.stringify({ event: 'dispatched', job_id: job.id, mode: 'connector_sync', provider, slot: opts.slot }));
+    } else {
+      log(`[dispatch] job #${job.id} connector-sync ${provider}`);
+    }
+  }
+  return { dispatched };
 }

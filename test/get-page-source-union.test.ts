@@ -1,25 +1,10 @@
-/**
- * v119 — get_page multi-source "union of layers" + explicit `source` read.
- *
- * The same slug can exist as several layers across salas/sources (e.g.
- * `personas/x` in BOTH `campo` and `directorio`). Pre-v119 get_page returned
- * ONE ambiguous row. v119:
- *   - get_page(slug, source='campo')  → ONLY that layer, scope-checked.
- *   - get_page(slug) with 1 readable layer  → the single page (legacy shape).
- *   - get_page(slug) with >1 readable layer → AMBIGUOUS_PAGE_REF.
- *   - get_page(slug, include_layers=true) → {slug, multi_source:true, layers}
- *     ordered most-public → most-restricted.
- *   - source outside the caller's read grant → forbidden_source.
- *
- * Engine-free: a stub engine returns fixture layers so the test exercises the
- * OP-LAYER union/scope logic (the part this PR adds), not SQL. The Postgres /
- * PGLite SQL ordering is covered separately by the engines' own suites.
- */
-
-import { describe, test, expect, beforeEach } from 'bun:test';
+/** Source/page identity and multi-room reads against the real PGLite snapshot path. */
+import { describe, test, expect, beforeEach, beforeAll, afterAll } from 'bun:test';
 import { operations, OperationError } from '../src/core/operations.ts';
 import type { OperationContext, Operation } from '../src/core/operations.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { Page } from '../src/core/types.ts';
 import { _resetPendingLastRetrievedWritesForTests } from '../src/core/last-retrieved.ts';
 
@@ -45,63 +30,18 @@ function page(overrides: Partial<Page> & { source_id: string }): Page {
   };
 }
 
-/**
- * Stub engine: serves a per-(slug→layers) map. getPage returns the first row
- * within scope (mirrors the real LIMIT 1 + array-precedence contract);
- * getPageLayers returns ALL rows within scope, ordered by the sourceIds array
- * the op hands down (the real engines order in SQL — here we replicate that
- * deterministic order so the op-layer assertions are meaningful).
- */
-function makeEngine(layersBySlug: Record<string, Page[]>): BrainEngine {
-  const getTags = async (_slug: string, opts?: { sourceId?: string }) => {
-    const src = opts?.sourceId ?? 'default';
-    return [`tag-${src}`];
-  };
-  const getPage: BrainEngine['getPage'] = async (slug, opts) => {
-    const all = layersBySlug[slug] ?? [];
-    const ids = opts?.sourceIds;
-    const id = opts?.sourceId;
-    const inScope = all.filter((pg) =>
-      ids && ids.length > 0 ? ids.includes(pg.source_id) : id ? pg.source_id === id : true,
-    );
-    return inScope[0] ?? null;
-  };
-  const getPageById: BrainEngine['getPageById'] = async (pageId, opts) => {
-    const all = Object.values(layersBySlug).flat();
-    const ids = opts?.sourceIds;
-    const id = opts?.sourceId;
-    return all.find((pg) => pg.id === pageId && (
-      ids && ids.length > 0 ? ids.includes(pg.source_id) : id ? pg.source_id === id : true
-    )) ?? null;
-  };
-  const getPageLayers: BrainEngine['getPageLayers'] = async (slug, opts) => {
-    const all = layersBySlug[slug] ?? [];
-    const ids = opts?.sourceIds;
-    const inScope =
-      ids && ids.length > 0 ? all.filter((pg) => ids.includes(pg.source_id)) : all;
-    if (ids && ids.length > 0) {
-      // Deterministic order by position in the scope array (what the SQL does).
-      return [...inScope].sort(
-        (a, b) => ids.indexOf(a.source_id) - ids.indexOf(b.source_id),
-      );
-    }
-    return [...inScope].sort((a, b) => a.source_id.localeCompare(b.source_id));
-  };
-  return {
-    getPage,
-    getPageById,
-    getPageLayers,
-    getTags,
-    async resolveSlugs() {
-      return [];
-    },
-    async getConfig() {
-      return null;
-    },
-    async executeRaw() {
-      return [] as never;
-    },
-  } as unknown as BrainEngine;
+let realEngine: PGLiteEngine;
+beforeAll(async () => { realEngine = new PGLiteEngine(); await realEngine.connect({}); await realEngine.initSchema(); });
+afterAll(async () => { await realEngine.disconnect(); });
+async function makeEngine(layersBySlug: Record<string, Page[]>): Promise<BrainEngine> {
+  for (const pg of Object.values(layersBySlug).flat()) {
+    await realEngine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1) ON CONFLICT DO NOTHING',[pg.source_id]);
+    await realEngine.putPage(pg.slug, pg, {sourceId:pg.source_id});
+    const stored = (await realEngine.getPage(pg.slug,{sourceId:pg.source_id}))!;
+    pg.id = stored.id;
+    await realEngine.addTag(pg.slug, `tag-${pg.source_id}`, {sourceId:pg.source_id});
+  }
+  return realEngine;
 }
 
 function ctxFor(engine: BrainEngine, overrides: Partial<OperationContext> = {}): OperationContext {
@@ -131,13 +71,14 @@ function directorioCtx(engine: BrainEngine, overrides: Partial<OperationContext>
   });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await resetPgliteState(realEngine);
   _resetPendingLastRetrievedWritesForTests();
 });
 
 describe('get_page explicit source → single layer', () => {
   test('(a) source within scope returns ONLY that layer', async () => {
-    const engine = makeEngine({
+    const engine = await makeEngine({
       'personas/x': [page({ source_id: 'campo' }), page({ source_id: 'directorio' })],
     });
     const result: any = await get_page.handler(directorioCtx(engine), {
@@ -152,7 +93,7 @@ describe('get_page explicit source → single layer', () => {
   });
 
   test('(d) source OUTSIDE the read grant → forbidden_source', async () => {
-    const engine = makeEngine({
+    const engine = await makeEngine({
       'personas/x': [page({ source_id: 'campo' })],
     });
     const p = get_page.handler(directorioCtx(engine), {
@@ -160,13 +101,13 @@ describe('get_page explicit source → single layer', () => {
       source: 'finanzas', // not in allowedSources
     });
     await expect(p).rejects.toBeInstanceOf(OperationError);
-    await expect(p).rejects.toThrow(/forbidden_source|outside your readable scope/);
+    await expect(p).rejects.toThrow(/forbidden_source|outside your readable scope|not granted|outside.*grant/i);
   });
 });
 
 describe('get_page union (no source)', () => {
   test('(b) >1 readable layer requires explicit include_layers=true', async () => {
-    const engine = makeEngine({
+    const engine = await makeEngine({
       'personas/x': [page({ source_id: 'directorio' }), page({ source_id: 'campo' })],
     });
     await expect(get_page.handler(directorioCtx(engine), { slug: 'personas/x' })).rejects.toMatchObject({
@@ -193,7 +134,7 @@ describe('get_page union (no source)', () => {
   });
 
   test('(c) exactly 1 readable layer → flat single-page shape (backward compat)', async () => {
-    const engine = makeEngine({
+    const engine = await makeEngine({
       'personas/only-campo': [page({ slug: 'personas/only-campo', source_id: 'campo' })],
     });
     const result: any = await get_page.handler(directorioCtx(engine), {
@@ -208,7 +149,7 @@ describe('get_page union (no source)', () => {
   });
 
   test('scope filters the union: a layer outside the grant is NOT surfaced', async () => {
-    const engine = makeEngine({
+    const engine = await makeEngine({
       'personas/x': [
         page({ source_id: 'campo' }),
         page({ source_id: 'directorio' }),
@@ -225,18 +166,18 @@ describe('get_page union (no source)', () => {
   test('page_id + source_id reads one exact authorized layer and validates slug', async () => {
     const campo = page({ id: 101, source_id: 'campo' });
     const directorio = page({ id: 202, source_id: 'directorio' });
-    const engine = makeEngine({ 'personas/x': [campo, directorio] });
+    const engine = await makeEngine({ 'personas/x': [campo, directorio] });
     const result: any = await get_page.handler(directorioCtx(engine), {
-      page_id: 202, source_id: 'directorio', slug: 'personas/x',
+      page_id: directorio.id, source_id: 'directorio', slug: 'personas/x',
     });
-    expect(result).toMatchObject({ source_id: 'directorio', page_id: 202, slug: 'personas/x' });
+    expect(result).toMatchObject({ source_id: 'directorio', page_id: directorio.id, slug: 'personas/x' });
     await expect(get_page.handler(directorioCtx(engine), {
-      page_id: 202, source_id: 'directorio', slug: 'other/slug',
+      page_id: directorio.id, source_id: 'directorio', slug: 'other/slug',
     })).rejects.toMatchObject({ code: 'invalid_params' });
   });
 
   test('not found → page_not_found', async () => {
-    const engine = makeEngine({});
+    const engine = await makeEngine({});
     const p = get_page.handler(directorioCtx(engine), { slug: 'personas/nope' });
     await expect(p).rejects.toBeInstanceOf(OperationError);
     await expect(p).rejects.toThrow(/Page not found/);

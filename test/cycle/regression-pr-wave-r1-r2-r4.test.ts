@@ -24,7 +24,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { operations, OperationError } from '../../src/core/operations.ts';
 import type { OperationContext, Operation } from '../../src/core/operations.ts';
-import type { BrainEngine } from '../../src/core/engine.ts';
+import type { BrainEngine, PageSnapshot } from '../../src/core/engine.ts';
 
 const get_page = operations.find(o => o.name === 'get_page') as Operation;
 const put_page = operations.find(o => o.name === 'put_page') as Operation;
@@ -32,31 +32,30 @@ if (!get_page) throw new Error('get_page op missing');
 if (!put_page) throw new Error('put_page op missing');
 
 function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
-  const alicePage = {
-    id: 1,
-    slug: 'people/alice',
-    type: 'person',
-    title: 'Alice',
-    compiled_truth: 'stub',
-    timeline: '',
-    tags: [],
-    created_at: new Date('2026-05-24'),
-    updated_at: new Date('2026-05-24'),
-    content_hash: 'sha-stub',
-    source_id: 'default',
-    effective_date: null,
-    deleted_at: null,
+  const snapshot: PageSnapshot = {
+    page: {
+      id: 1,
+      slug: 'people/alice-example',
+      type: 'person',
+      title: 'Example person',
+      compiled_truth: 'stub',
+      timeline: '',
+      frontmatter: {},
+      created_at: new Date('2026-05-24'),
+      updated_at: new Date('2026-05-24'),
+      content_hash: 'sha-stub',
+      source_id: 'default',
+      effective_date: null,
+      deleted_at: null,
+    },
+    tags: ['fixture-tag'],
+    revision: '10000000-0000-4000-8000-000000000001',
+    sourceIncarnation: '10000000-0000-4000-8000-000000000002',
+    withdrawals: [],
   };
   const engine = {
-    getPage: async (_slug: string) => alicePage,
-    // v119: get_page reads via getPageLayers (union-of-sources). The mock
-    // returns a single layer so the handler takes the backward-compatible
-    // single-page path. Without this the handler throws "getPageLayers is not
-    // a function" (the mock predates the v119 get_page refactor).
-    getPageLayers: async (_slug: string) => [alicePage],
-    getTags: async () => [],
-    resolveSlugs: async () => [],
-    putPage: async () => ({ slug: 'stub', id: 1, created: true }),
+    readPageSnapshot: async (_slug: string) => snapshot,
+    executeRaw: async () => [], // best-effort read telemetry
   } as unknown as BrainEngine;
   return {
     engine,
@@ -75,8 +74,9 @@ describe('R1 — get_page handler accepts calls without content param', () => {
     // If PR #1365's broken handler-block lived in get_page, this call would
     // throw OperationError('invalid_request', 'put_page requires either content
     // or file parameter'). The pin: get_page MUST NOT require content.
-    const result = await get_page.handler(ctx, { slug: 'people/alice' });
-    expect(result).toBeDefined();
+    const result = await get_page.handler(ctx, { slug: 'people/alice-example' });
+    expect(result).toMatchObject({ slug: 'people/alice-example', tags: ['fixture-tag'],
+      revision: '10000000-0000-4000-8000-000000000001', compiled_truth: 'stub' });
   });
 
   test('R1 corollary: get_page schema has no `content` param (read op)', () => {
@@ -111,12 +111,16 @@ describe('R2 — put_page schema content stays required: true', () => {
 });
 
 describe('R4 — cross-platform stdin via fd 0 (PR #1325 regression pin)', () => {
-  test('R4 source-grep: src/cli.ts uses readFileSync(0, ...) not readFileSync("/dev/stdin", ...)', () => {
+  test('R4 source-grep: the stdin reader uses readFileSync(0, ...) not readFileSync("/dev/stdin", ...)', () => {
     // Belt-and-suspenders source-grep guard. The behavior of fd 0 is OS-level
     // and hard to unit-test deterministically across platforms; this guard
-    // catches a future contributor reverting the cross-platform fix.
-    const path = join(import.meta.dir ?? '.', '..', '..', 'src', 'cli.ts');
-    const src = readFileSync(path, 'utf-8');
+    // catches a future contributor reverting the cross-platform fix. The
+    // reader moved from src/cli.ts to src/core/interaction.ts (agent operator
+    // wave A5); cli.ts keeps a legacy-signature shim, so both are checked.
+    const root = join(import.meta.dir ?? '.', '..', '..', 'src');
+    // test-reads-source-ok[structural]: the R4 regression pins the absence of the /dev/stdin read in the CLI shim (moved there by A5).
+    const src = readFileSync(join(root, 'core', 'interaction.ts'), 'utf-8');
+    expect(readFileSync(join(root, 'cli', 'main.ts'), 'utf-8')).not.toMatch(/readFileSync\(\s*['"]\/dev\/stdin['"]/);
 
     // The exact pattern the PR replaced. If anyone reintroduces it, R4 fires.
     // Look for `'/dev/stdin'` with surrounding quote so we don't false-fire
@@ -137,7 +141,7 @@ describe('R4 — cross-platform stdin via fd 0 (PR #1325 regression pin)', () =>
     // the surrounding shape of the parseOpArgs stdin-reading branch hasn't
     // drifted (existence of the branch + 5MB cap), since the branch itself
     // is what was modified by PR #1325.
-    const path = join(import.meta.dir ?? '.', '..', '..', 'src', 'cli.ts');
+    const path = join(import.meta.dir ?? '.', '..', '..', 'src', 'cli', 'main.ts');
     const src = readFileSync(path, 'utf-8');
 
     // Stdin reading branch still exists in parseOpArgs.

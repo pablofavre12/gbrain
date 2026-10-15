@@ -9,6 +9,16 @@
  * Before this module these predicates lived inline at each site and drifted
  * over time. One source of truth here; new call sites import the typed
  * helper instead of pattern-matching the same regexes again.
+ *
+ * TWO-AXIS DESIGN NOTE (do not "fix" one side to match the other):
+ * this module answers "should I retry?" — and deliberately treats
+ * `password authentication failed` as RETRYABLE (auth race during DNS
+ * failover). The REASON classifier (`src/core/pg-access-classify.ts`)
+ * answers "what went wrong and what fixes it?" — and reports the same
+ * error as `auth_failed` with `transient: false` (a persistently wrong
+ * password is not transient). Both are correct on their own axis.
+ * This module's only exports consumed there are the predicates plus the
+ * `getCode`/`getMessage` shape helpers; no new patterns land here.
  */
 
 const CONN_PATTERNS = [
@@ -38,6 +48,12 @@ const CONN_PATTERNS = [
   // retry, the checkpoint write (and every other pool-contending write) is
   // dropped during the exact spike #1794's resumable sync must survive.
   /EMAXCONNSESSION/i,
+  // #6340: the socket errnos postgres.js surfaces as "write <ERRNO> host:port" when a
+  // session-mode pooler drops the connection mid-statement (ECONNABORTED was the one
+  // that ended four managed catch-up runs in one afternoon). Same class as ECONNRESET.
+  /ECONNABORTED/i,
+  /ETIMEDOUT/i,
+  /EPIPE/i,
   /too many clients already/i,
   /max.*clients?.*in session mode/i,
   /remaining connection slots are reserved/i,
@@ -52,7 +68,7 @@ interface PgError {
   problem?: string;
 }
 
-function getCode(err: unknown): string | undefined {
+export function getCode(err: unknown): string | undefined {
   if (err && typeof err === 'object') {
     const code = (err as PgError).code;
     if (typeof code === 'string') return code;
@@ -60,7 +76,7 @@ function getCode(err: unknown): string | undefined {
   return undefined;
 }
 
-function getMessage(err: unknown): string {
+export function getMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (err && typeof err === 'object') {
     const msg = (err as PgError).message;
@@ -135,6 +151,19 @@ export function isRetryableConnError(err: unknown): boolean {
 }
 
 /**
+ * #6355: did the database session go away under a statement that was already sent? Narrower than
+ * `isRetryableConnError` (no auth or startup races): the connection-class SQLSTATEs, postgres.js's own
+ * connection codes, the server's admin/crash shutdown codes (`pg_terminate_backend`, a failover) and the
+ * socket errnos. Such an error says nothing about whether the statement's transaction committed, so a
+ * caller that sent a write must re-read its retained request id instead of inferring rollback.
+ */
+export function isConnectionLoss(err: unknown): boolean {
+  const code = getCode(err);
+  if (code && (/^08/.test(code) || ['CONNECTION_CLOSED', 'CONNECTION_ENDED', 'CONNECTION_DESTROYED', '57P01', '57P02', '57P03'].includes(code))) return true;
+  return /\b(ECONNRESET|ECONNABORTED|ETIMEDOUT|EPIPE)\b|Connection terminated unexpectedly|server closed the connection|connection.*closed|terminating connection due to administrator command/i.test(getMessage(err));
+}
+
+/**
  * issue #1685 (CODEX #8): is this error specifically a POOLER REAP — postgres.js's
  * library-level `CONNECTION_ENDED` code (the transaction-mode pooler dropping an
  * idle socket between ticks)? Narrower than `isRetryableConnError`, which also
@@ -147,6 +176,23 @@ export function isConnectionEndedError(err: unknown): boolean {
   if (code === 'CONNECTION_ENDED') return true;
   const msg = getMessage(err);
   return /CONNECTION_ENDED/i.test(msg);
+}
+
+/**
+ * Did postgres.js abandon a connection handshake because its own
+ * `connect_timeout` timer fired? It reports that as code `CONNECT_TIMEOUT`
+ * with the message "write CONNECT_TIMEOUT <host>:<port>" (the host and port
+ * read "undefined:undefined" once the socket has been upgraded to TLS).
+ *
+ * Kept OUT of `isRetryableConnError` on purpose: on a process's first connect
+ * a handshake timeout usually means the host does not route, which
+ * pg-access-classify reports as `network_unreachable`, and retrying cannot
+ * fix that. A caller that has already reached the same URL in this process
+ * opts in through connectWithRetry's `retryConnectTimeout`.
+ */
+export function isConnectTimeoutError(err: unknown): boolean {
+  if (getCode(err) === 'CONNECT_TIMEOUT') return true;
+  return /\bCONNECT_TIMEOUT\b/.test(getMessage(err));
 }
 
 /**

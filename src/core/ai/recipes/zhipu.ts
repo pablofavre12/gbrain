@@ -15,11 +15,32 @@ import type { Recipe } from '../types.ts';
  *
  * Reference: https://open.bigmodel.cn/
  */
+
+/**
+ * GLM-4.5+ and the GLM-5.x series reason by default and bill that reasoning
+ * as output tokens (gbrain#4727). Shared with the ollama / openrouter recipes,
+ * which host the same models under their own prefixes, so the version cutoff
+ * lives in exactly one place. Pre-4.5 ids (glm-4, glm-4-plus, glm-3-turbo)
+ * do not match and keep the conservative output caps.
+ */
+export const GLM_THINKING_BY_DEFAULT_RE = /glm-(?:4\.[5-9]|[5-9])/i;
+
 export const zhipu: Recipe = {
   id: 'zhipu',
   name: 'Zhipu AI (智谱AI BigModel)',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'glm-5.3',
+    'glm-5.3-flash',
+    'glm-5.1',
+    'glm-4.6',
+    'glm-4.5',
+    'embedding-3',
+    'embedding-2',
+  ],
   base_url_default: 'https://open.bigmodel.cn/api/paas/v4',
   auth_env: {
     required: ['ZHIPUAI_API_KEY'],
@@ -29,8 +50,11 @@ export const zhipu: Recipe = {
     chat: {
       // Informational list (openai-compat tier: assertTouchpoint doesn't
       // enforce it), so newer GLM ids pass without a recipe edit.
-      models: ['glm-5.1', 'glm-4.6', 'glm-4.5'],
+      models: ['glm-5.3', 'glm-5.3-flash', 'glm-5.1', 'glm-4.6', 'glm-4.5'],
       supports_tools: true,
+      // The exact semantic thinking_by_default documents (see deepseek.ts);
+      // predicate + rationale on GLM_THINKING_BY_DEFAULT_RE above.
+      thinking_by_default: (modelId) => GLM_THINKING_BY_DEFAULT_RE.test(modelId),
       // gbrain-side stable tool ids (v0.38 D11) decoupled the loop from
       // Anthropic response formats; GLM tool calling is stable through the
       // OpenAI-compat path, same as deepseek/groq.
@@ -42,6 +66,10 @@ export const zhipu: Recipe = {
     },
     embedding: {
       models: ['embedding-3', 'embedding-2'],
+      // [R13] audit: BigModel's documented per-INPUT caps (text-embedding API
+      // reference, read 2026-10-11): embedding-2 takes 512 tokens per string,
+      // embedding-3 takes 3,072.
+      max_input_tokens: { 'embedding-3': 3072, 'embedding-2': 512 },
       default_dims: 1024,
       // 2048 exposed but breaks HNSW (exact-scan fallback). 1024/512/256
       // stay HNSW-compatible.

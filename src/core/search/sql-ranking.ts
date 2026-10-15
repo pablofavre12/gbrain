@@ -19,6 +19,10 @@
 
 import { quarantineFilterFragment } from '../quarantine.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
+import { privatePagesFilterFragment } from './private-visibility.ts';
+import { currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
+import { pageEligibleSql } from '../eligibility/sql.ts';
+import type { TrustTier } from '../trust/tier.ts';
 
 /**
  * Escape `%`, `_`, and `\` so a string can be used as a LIKE prefix literal.
@@ -169,11 +173,41 @@ export function buildHardExcludeClause(slugColumn: string, prefixes: string[]): 
  * @returns raw SQL fragment, e.g.
  *   `AND p.deleted_at IS NULL AND NOT s.archived AND NOT (COALESCE(p.frontmatter, '{}'::jsonb) ? 'quarantine')`
  */
-export function buildVisibilityClause(pageAlias: string, sourceAlias: string): string {
+export function buildVisibilityClause(
+  pageAlias: string,
+  sourceAlias: string,
+  opts?: {
+    /**
+     * #4352 — untrusted-caller predicate: hide pages whose frontmatter
+     * carries `visibility: private` (absent visibility defaults to 'world',
+     * or to 'private' on derived atoms and synthesized concepts).
+     * Set from SearchOpts.excludePrivate by both engines; callers resolve
+     * trust + the config gate via resolveExcludePrivatePages
+     * (search/private-visibility.ts). Off by default — trusted local reads
+     * are unchanged.
+     */
+    excludePrivate?: boolean;
+    requireSafeChunks?: boolean;
+    /** #5575: the read floor and proactive activation control (eligibility/sql.ts), applied before LIMIT. */
+    minTrust?: TrustTier;
+    suppressFlagged?: boolean;
+  },
+): string {
   // Single source of truth for the quarantine SQL lives in quarantine.ts so
   // the marker key + filter can't drift from the search filter (#1699).
   const quarantine = quarantineFilterFragment(pageAlias);
-  return `AND ${pageAlias}.deleted_at IS NULL AND NOT ${sourceAlias}.archived AND ${quarantine}`;
+  // #4352 remediation: the predicate text lives ONCE in private-visibility.ts
+  // (shared with listPages + the relational-arm hydrate) so it cannot drift.
+  const privateClause = opts?.excludePrivate
+    ? ` AND ${privatePagesFilterFragment(pageAlias)}`
+    : '';
+  const chunksClause = requiresSafeChunks(opts) ? ` AND ${safeChunksFilter(pageAlias)}` : '';
+  // C4: a pinned question's page holds only the question and owner notes; it is
+  // read through questions_* and never ranks in retrieval (questions/pages.ts).
+  const pinnedQuestion = ` AND NOT (COALESCE(${pageAlias}.frontmatter, '{}'::jsonb) ? 'pinned_question')`;
+  const trustClause = opts?.minTrust || opts?.suppressFlagged
+    ? ` AND ${pageEligibleSql(pageAlias, { floor: opts.minTrust, suppressFlagged: opts.suppressFlagged })}` : '';
+  return `AND ${pageAlias}.deleted_at IS NULL AND ${currentTextProjectionFilter(pageAlias)} AND NOT ${sourceAlias}.archived AND ${quarantine}${pinnedQuestion}${privateClause}${chunksClause}${trustClause}`;
 }
 
 // ============================================================
@@ -225,6 +259,66 @@ export function buildBestPerPagePoolCte(candidateCte: string): string {
         FROM ${candidateCte}
         ORDER BY COALESCE(source_id, 'default'), slug, score DESC, page_id ASC, chunk_id ASC
       )`;
+}
+
+// ============================================================
+// websearch_to_tsquery input bounds
+// ============================================================
+
+export const MAX_WEBSEARCH_QUERY_CHARS = 64_000;
+export const MAX_WEBSEARCH_QUERY_TERMS = 256;
+
+/** Longest run of dash negations `websearch_to_tsquery` parses: its operator stack holds 32 entries. */
+export const MAX_WEBSEARCH_DASH_RUN = 31;
+
+/**
+ * Collapse runs of more than MAX_WEBSEARCH_DASH_RUN dash negations to their
+ * parity. websearch_to_tsquery reads every `-` before a term as one more NOT
+ * (`x ---- y` is `'x' & !!!!'y'`), so a markdown rule or setext underline of
+ * 32+ dashes (`-----...` or `- - - ...`) overflows its operator stack and
+ * raises `tsquery stack too small`, failing the keyword and title arms for
+ * the whole query. An even run becomes a space and an odd run a single `-`:
+ * the tsquery a deeper stack would build. Shorter runs, and so every query
+ * that parses today, pass through unchanged.
+ */
+export function collapseWebsearchDashRuns(query: string): string {
+  return query.replace(/-(?:\s*-){31,}/g, run => ((run.match(/-/g)!.length % 2) === 1 ? ' -' : ' '));
+}
+
+/**
+ * Bound caller text before feeding it to `websearch_to_tsquery`.
+ *
+ * Postgres can hit `stack depth limit exceeded` when websearch parses very
+ * large, high-term-count strings. Keep ordinary exact-title/body searches
+ * untouched, but cap pasted grounding blobs before they reach SQL.
+ */
+export function boundWebsearchQuery(raw: string): string {
+  const query = collapseWebsearchDashRuns(raw);
+  if (query.length <= MAX_WEBSEARCH_QUERY_CHARS) {
+    let terms = 0;
+    for (const _ of query.matchAll(/[\p{L}\p{N}]+/gu)) {
+      terms++;
+      if (terms > MAX_WEBSEARCH_QUERY_TERMS) break;
+    }
+    if (terms <= MAX_WEBSEARCH_QUERY_TERMS) return query;
+  }
+
+  let end = Math.min(query.length, MAX_WEBSEARCH_QUERY_CHARS);
+  let terms = 0;
+  for (const match of query.matchAll(/[\p{L}\p{N}]+/gu)) {
+    if (match.index >= MAX_WEBSEARCH_QUERY_CHARS) {
+      end = Math.min(end, match.index);
+      break;
+    }
+    terms++;
+    if (terms > MAX_WEBSEARCH_QUERY_TERMS) {
+      end = Math.min(end, match.index);
+      break;
+    }
+  }
+
+  const bounded = query.slice(0, end).trim();
+  return bounded.length > 0 ? bounded : query.slice(0, MAX_WEBSEARCH_QUERY_CHARS).trim();
 }
 
 // ============================================================

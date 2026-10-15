@@ -12,6 +12,8 @@ import type { Recipe } from '../types.ts';
 export const cohere: Recipe = {
   id: 'cohere',
   name: 'Cohere (reranker)',
+  // Search-unit billing cannot be represented by the token-priced budget contract.
+  unpriced_models: ['rerank-v4.0-pro', 'rerank-v4.0-fast', 'rerank-v3.5'],
   tier: 'openai-compat',
   implementation: 'openai-compatible',
   base_url_default: 'https://api.cohere.com',

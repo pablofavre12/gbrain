@@ -32,12 +32,15 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { configDir } from '../config.ts';
+import { invalidateBackupStatus } from '../backup/status-file.ts';
 import { realpathOrResolve } from '../path-confine.ts';
 import { defaultRunner, isProxyBlocked403, parseGithubOwnerRepo, type ExecRunner } from '../repo-visibility.ts';
 import { detectExecutionEnvironment } from '../execution-env.ts';
-import { loadWorkspaceAllowlist, scanFiles, SCAN_ALLOW_FILENAME } from '../secret-scan.ts';
+import { loadWorkspaceAllowlist, scanFiles, SCAN_ALLOW_FILENAME, type SecretFinding } from '../secret-scan.ts';
+import { SECRET_SCAN_REFUSAL_DOCS } from '../workspace-push.ts';
+import { shellQuote } from '../mcp-registration.ts';
 import { GITHUB_URL_PLACEHOLDER } from './assets.ts';
 import {
   guardReceiptOverwrite,
@@ -131,6 +134,28 @@ function requireInitializedManifest(workspaceDir: string): { state: ManifestStat
 
 function isRateLimitOr5xx(stderr: string): boolean {
   return /HTTP 5\d\d|HTTP 429|rate limit/i.test(stderr);
+}
+
+/** `gh auth status`'s `--active` flag (added in cli/cli v2.57.0, 2024-09-11)
+ * scopes the check to only the active account instead of aggregating every
+ * registered account. On an older `gh`, passing an unrecognized flag makes
+ * the WHOLE command fail — so Gate 2 must detect support before using it. */
+const GH_ACTIVE_FLAG_MIN_VERSION = [2, 57, 0] as const;
+
+/** Parses the `X.Y.Z` out of `gh --version`'s first line (`gh version X.Y.Z (DATE)`).
+ * Returns null on any unrecognized format — callers treat that as "unknown,
+ * don't assume support". */
+function parseGhVersion(versionOutput: string): readonly [number, number, number] | null {
+  const m = /\bgh version (\d+)\.(\d+)\.(\d+)/.exec(versionOutput);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+function ghVersionAtLeast(v: readonly [number, number, number], min: readonly [number, number, number]): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== min[i]) return v[i]! > min[i]!;
+  }
+  return true;
 }
 
 /** The authenticated gh login, or null when it cannot be read/parsed. */
@@ -342,6 +367,10 @@ function recordRepoInReceipt(gbrainHomeDir: string, workspaceDir: string, manife
   receipt.repo_url = url;
   delete receipt.pending_repo_url;
   writeReceipt(gbrainHomeDir, receipt);
+  // Fix-path invalidation: the workspace just gained a verified remote — the
+  // backup-coverage cache must stop warning NOW, not at the next 30-day
+  // recompute (backup/status-file.ts). Best-effort by construction.
+  invalidateBackupStatus();
 }
 
 // ---------------------------------------------------------------------------
@@ -388,12 +417,16 @@ function secretScanOrThrow(workspaceDir: string, relFiles: string[]): void {
     workspaceRoot: workspaceDir,
   });
   if (findings.length > 0) {
-    const sample = findings.slice(0, 5).map((f) => `${f.file}:${f.line} [${f.pattern}]`).join('; ');
+    const sample = findings.slice(0, 5).map((f) => {
+      const { since } = f as SecretFinding & { since?: string };
+      return `${f.file}:${f.line} [${f.pattern}${since ? ` since gbrain v${since.replace(/^v/, '')}` : ''}] ${f.fingerprint}`;
+    }).join('; ');
     throw new BootstrapError(
       'SECRET_SCAN_BLOCKED',
       `secret scan found ${findings.length} finding(s) before the first push: ${sample}` +
         `${findings.length > 5 ? '; …' : ''} — nothing was committed or pushed. ` +
-        `Remove the secret(s), or allowlist a false positive in ${SCAN_ALLOW_FILENAME}, then re-run \`gbrain bootstrap repo\`.`,
+        'Remove a real credential first; allowlist only a reviewed false positive by appending its fingerprint to ' +
+        `${shellQuote(resolve(workspaceDir, SCAN_ALLOW_FILENAME))} (${SECRET_SCAN_REFUSAL_DOCS}), then re-run \`gbrain bootstrap repo\`.`,
       { details: { findings: findings.length } },
     );
   }
@@ -594,7 +627,22 @@ export async function createPrivateRepo(
   }
 
   // Gate 2: authenticated. Exit-code-2 — the human runs `gh auth login`.
-  const ghAuth = await runner(['gh', 'auth', 'status']);
+  // `--hostname github.com` scopes the check to the host this flow actually
+  // targets (every downstream call — parseGithubOwnerRepo, the repo-create
+  // URL fallback, etc. — is github.com-only), so an unrelated broken account
+  // on some other configured host (e.g. a GitHub Enterprise instance) can't
+  // false-block it either. `--active` (only when the installed `gh` supports
+  // it) further restricts that host's check to the active account. Bare
+  // `gh auth status` aggregates EVERY registered account on EVERY host and
+  // exits 1 if any one of them is invalid — even an unused, long-expired
+  // account — which false-blocks this gate while the active account (what
+  // `gh`/`git` actually use) is perfectly healthy.
+  const ghVersionTuple = parseGhVersion(ghVersion.stdout);
+  const ghSupportsActiveFlag = ghVersionTuple !== null && ghVersionAtLeast(ghVersionTuple, GH_ACTIVE_FLAG_MIN_VERSION);
+  const ghAuthArgv = ghSupportsActiveFlag
+    ? ['gh', 'auth', 'status', '--active', '--hostname', 'github.com']
+    : ['gh', 'auth', 'status', '--hostname', 'github.com'];
+  const ghAuth = await runner(ghAuthArgv);
   if (ghAuth.code !== 0) {
     throw new BootstrapError(
       'GH_AUTH',

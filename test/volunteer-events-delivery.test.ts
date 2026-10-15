@@ -10,6 +10,7 @@ import {
   logTurnContextDeliveryFireAndForget,
   awaitPendingVolunteerEventWrites,
   _resetPendingVolunteerEventWritesForTests,
+  _peekPendingVolunteerEventWritesForTests,
 } from '../src/core/context/volunteer-events.ts';
 import { logDeliveredReflexPointers, type ReflexPointer } from '../src/core/context/retrieval-reflex.ts';
 import type { VolunteeredPage } from '../src/core/context/volunteer.ts';
@@ -40,8 +41,8 @@ beforeEach(() => {
 });
 
 describe('isVolunteerChannel', () => {
-  test('accepts exactly the five known channels; rejects everything else', () => {
-    for (const ok of ['op', 'reflex', 'watch', 'claude-code', 'codex']) {
+  test('accepts exactly the six known channels; rejects everything else', () => {
+    for (const ok of ['op', 'reflex', 'watch', 'claude-code', 'codex', 'opencode']) {
       expect(isVolunteerChannel(ok)).toBe(true);
     }
     for (const bad of ['vim', '', null, undefined, 42, {}, 'CLAUDE-CODE', 'hook']) {
@@ -106,6 +107,20 @@ describe('logTurnContextDeliveryFireAndForget — the shipped serve wiring', () 
 });
 
 describe('logDeliveredReflexPointers — ambient reflex channel', () => {
+  test('registers its write before returning so an immediate CLI drain cannot miss it', async () => {
+    const engine = {
+      executeRaw: async () => {
+        await Promise.resolve();
+        return [];
+      },
+    } as unknown as BrainEngine;
+
+    logDeliveredReflexPointers(engine, [POINTER]);
+
+    expect(_peekPendingVolunteerEventWritesForTests()).toBe(1);
+    expect(await awaitPendingVolunteerEventWrites(2_000)).toEqual({ unfinished: 0 });
+  });
+
   test('logs under the reflex channel with the shared rationale template', async () => {
     const captured: CapturedInsert[] = [];
     logDeliveredReflexPointers(stubEngine(captured), [POINTER]);
@@ -121,6 +136,9 @@ describe('channel guards', () => {
     const { isHarnessChannel } = await import('../src/core/context/volunteer-events.ts');
     expect(isHarnessChannel('claude-code')).toBe(true);
     expect(isHarnessChannel('codex')).toBe(true);
+    // opencode widening (v0.45.x): without this membership a hook delivery
+    // attributed `--harness opencode` silently rebadges as claude-code.
+    expect(isHarnessChannel('opencode')).toBe(true);
     for (const internal of ['op', 'reflex', 'watch']) expect(isHarnessChannel(internal)).toBe(false);
   });
 

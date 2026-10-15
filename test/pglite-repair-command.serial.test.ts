@@ -18,10 +18,11 @@
  */
 import { describe, test, expect } from 'bun:test';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { runPgliteRepair } from '../src/commands/pglite-repair.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -38,6 +39,31 @@ function makeFakeLayout(dir: string): void {
   mkdirSync(join(dir, 'pg_wal'), { recursive: true });
   writeFileSync(join(dir, 'PG_VERSION'), '17\n');
   writeFileSync(join(dir, 'global', 'pg_control'), Buffer.alloc(8192));
+}
+
+/**
+ * Swap the global `process.stdin` for a fake TTY-flagged PassThrough for the
+ * duration of `fn`, writing `answer` to it shortly after `fn` starts (so the
+ * interactive `rl.question` inside `promptYesNo` has already attached its
+ * listener). Restores the real `process.stdin` in `finally` regardless of
+ * outcome. Confirmed to work under both node and bun (readline reads
+ * `process.stdin` at call time, not import time).
+ */
+async function withInteractiveAnswer<T>(answer: string, fn: () => Promise<T>): Promise<T> {
+  // Restore the ORIGINAL property descriptor, not just the original value:
+  // on Node this is a getter, and on Bun a plain data property whose
+  // writable/enumerable flags must match what we found.
+  const realStdinDescriptor = Object.getOwnPropertyDescriptor(process, 'stdin')!;
+  const fake = new PassThrough() as unknown as NodeJS.ReadStream;
+  (fake as unknown as { isTTY: boolean }).isTTY = true;
+  Object.defineProperty(process, 'stdin', { value: fake, configurable: true });
+  try {
+    const resultPromise = fn();
+    setTimeout(() => (fake as unknown as PassThrough).write(`${answer}\n`), 20);
+    return await resultPromise;
+  } finally {
+    Object.defineProperty(process, 'stdin', realStdinDescriptor);
+  }
 }
 
 function writeLockFile(dir: string, lock: Record<string, unknown>): string {
@@ -101,6 +127,17 @@ function deadPid(): number {
   throw new Error('could not obtain a provably-dead PID after 5 spawns');
 }
 
+/** The plan_hash `--dry-run --json` reports for a data dir (what `--yes --expect` must name). */
+async function approvedPlanHash(dir: string): Promise<string> {
+  const cap = captureConsole();
+  try {
+    await runPgliteRepair(['--path', dir, '--dry-run', '--json']);
+  } finally {
+    cap.restore();
+  }
+  return parseJsonLine(cap.logs).plan_hash as string;
+}
+
 const backupDirsBeside = (dir: string): string[] =>
   readdirSync(join(dir, '..')).filter((n) => n.startsWith(`${basename(dir)}.wal-repair-backup-`));
 
@@ -109,7 +146,7 @@ describe('gbrain pglite-repair — dry-run is strictly read-only', () => {
     const parent = tmp('gbrain-repair-dry-');
     const dir = join(parent, 'brain.pglite');
     makeFakeLayout(dir);
-    writeFileSync(join(dir, 'postmaster.pid'), '99999\n'); // unclean-shutdown marker
+    writeFileSync(join(dir, 'postmaster.pid'), `${deadPid()}\n`); // unclean-shutdown marker from a provably dead PID
     const parentBefore = readdirSync(parent).sort();
     const dirBefore = readdirSync(dir).sort();
 
@@ -212,7 +249,9 @@ describe('gbrain pglite-repair — refusals (validate before lock, never mkdir a
     const dir = join(tmp('gbrain-repair-reaped-'), 'brain.pglite');
     makeFakeLayout(dir);
     writeLockFile(dir, {
-      pid: deadPid(), // provably dead — acquireLock reaps it, then refuses
+      pid: deadPid(), // dead in this exact boot/PID namespace — eligible for migration
+      pid_ns: process.platform === 'linux' ? readlinkSync('/proc/self/ns/pid') : null,
+      boot_id: process.platform === 'linux' ? readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() : null,
       acquired_at: Date.now() - 60_000,
       refreshed_at: Date.now() - 60_000,
       command: 'gbrain embed',
@@ -222,7 +261,8 @@ describe('gbrain pglite-repair — refusals (validate before lock, never mkdir a
     const cap = captureConsole();
     let rc: number;
     try {
-      rc = await runPgliteRepair(['--path', dir, '--yes', '--json']);
+      // Approved for the diagnosed plan, so the refusal under test is the lock gate's.
+      rc = await runPgliteRepair(['--path', dir, '--yes', '--expect', await approvedPlanHash(dir), '--json']);
     } finally {
       cap.restore();
     }
@@ -266,34 +306,72 @@ describe('gbrain pglite-repair — refusals (validate before lock, never mkdir a
 });
 
 describe('gbrain pglite-repair — TTY + config gates', () => {
-  test('8. non-TTY without --yes refuses: exit 1, no_tty_no_yes, zero mutation', async () => {
+  test('8. non-TTY without the bound approval refuses: exit 3, consent payload with risk + undo, zero mutation', async () => {
     const dir = join(tmp('gbrain-repair-notty-'), 'brain.pglite');
     makeFakeLayout(dir);
 
-    // Pin stdin to non-TTY: under `bun test` in a terminal stdin can still be
-    // a TTY, which would route into the interactive confirm instead.
-    const origTty = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
-    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
     const cap = captureConsole();
+    let stdout = '';
+    const write = process.stdout.write;
+    process.stdout.write = ((c: string | Uint8Array) => { stdout += String(c); return true; }) as typeof process.stdout.write;
     let rc: number;
+    let bare: number;
     try {
-      rc = await runPgliteRepair(['--path', dir, '--json']); // no --yes
+      rc = await withEnv({ GBRAIN_NON_INTERACTIVE: '1' }, () => runPgliteRepair(['--path', dir, '--json'])); // no --yes
+      // A bare --yes retry is not the user's approval of this plan.
+      bare = await withEnv({ GBRAIN_NON_INTERACTIVE: '1' }, () => runPgliteRepair(['--path', dir, '--yes', '--json']));
     } finally {
+      process.stdout.write = write;
       cap.restore();
-      if (origTty) Object.defineProperty(process.stdin, 'isTTY', origTty);
-      else delete (process.stdin as unknown as Record<string, unknown>).isTTY;
+      process.exitCode = 0;
     }
 
-    expect(rc).toBe(1);
-    const out = parseJsonLine(cap.logs);
-    expect(out.status).toBe('error');
-    expect(out.code).toBe('no_tty_no_yes');
+    expect(rc).toBe(3);
+    expect(bare).toBe(3);
+    const out = JSON.parse(stdout.slice(0, stdout.indexOf('\n}\n') + 2));
+    expect(out).toMatchObject({ code: 'confirmation_required', effects: ['destructive'], actor: 'agent' });
+    expect(out.risk).toContain('may be lost');
+    expect(out.risk).toContain('Undo, with gbrain stopped: mv');
+    expect(out.fix.argv).toEqual(['gbrain', 'pglite-repair', '--path', dir, '--json', '--yes', '--expect', out.plan_hash]);
+    expect(out.user_message).toContain('Reset its write-ahead log now?');
     // Refused BEFORE any surgery: no backup dir, no sidecar.
     expect(backupDirsBeside(dir)).toEqual([]);
     expect(existsSync(`${dir}.wal-repair-attempt.json`)).toBe(false);
   });
 
-  test('9. no --path with a non-pglite configured engine: exit 1, not_pglite', async () => {
+  test('9. interactive "y" answer proceeds with repair (#4318 close-before-resolve race)', async () => {
+    // Regression for #4318: the old inline promptYesNo in this file called
+    // rl.close() BEFORE resolving the answer, and its unguarded
+    // rl.on('close', () => resolve(false)) fired synchronously during that
+    // close — so a typed "y" still resolved false and the command took the
+    // "Aborted" branch. This pins that a "y" answer is honored end-to-end
+    // through the actual interactive confirm gate (not just via the shared
+    // helper's own unit tests in test/confirm-prompt.test.ts).
+    const dir = join(tmp('gbrain-repair-interactive-'), 'brain.pglite');
+    makeFakeLayout(dir);
+
+    const cap = captureConsole();
+    const origOutTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
+    try {
+      await withEnv({ GBRAIN_INTERACTIVE: '1' }, () => withInteractiveAnswer('y', () => runPgliteRepair(['--path', dir, '--json'])));
+    } finally {
+      cap.restore();
+      if (origOutTty) Object.defineProperty(process.stdout, 'isTTY', origOutTty);
+      else delete (process.stdout as unknown as Record<string, unknown>).isTTY;
+    }
+
+    const out = parseJsonLine(cap.logs);
+    // The race resolved the confirm to `false` even for a typed "y" — the
+    // broken behavior always produced this exact receipt. Assert its absence
+    // rather than a specific return code, since what happens AFTER a
+    // correctly-honored "y" (repair attempted on this fake layout) is
+    // covered by other tests in this file.
+    expect(out).not.toEqual({ status: 'aborted', reason: 'user_declined' });
+    expect(out.code).not.toBe('confirmation_required');
+  }, 30_000);
+
+  test('10. no --path with a non-pglite configured engine: exit 1, not_pglite', async () => {
     // Hermetic GBRAIN_HOME (same convention as apply-migrations-pglite-spawn):
     // configDir() appends '.gbrain', so the config lands at <home>/.gbrain/.
     const home = tmp('gbrain-repair-home-');
@@ -341,11 +419,19 @@ describe('gbrain pglite-repair — the happy path (real PGLite)', () => {
       writeFileSync(join(walDir, seg), Buffer.alloc(1024, 0xff));
     }
 
-    // 3) Repair in place.
+    // 3) Repair in place, approved for the diagnosed plan (C2: --yes --expect <plan_hash>).
+    const dry = captureConsole();
+    try {
+      expect(await runPgliteRepair(['--path', dir, '--dry-run', '--json'])).toBe(0);
+    } finally {
+      dry.restore();
+    }
+    const planHash = parseJsonLine(dry.logs).plan_hash as string;
+    expect(planHash).toMatch(/^ph_/);
     const cap = captureConsole();
     let rc: number;
     try {
-      rc = await runPgliteRepair(['--path', dir, '--yes', '--json']);
+      rc = await runPgliteRepair(['--path', dir, '--yes', '--expect', planHash, '--json']);
     } finally {
       cap.restore();
     }
@@ -357,6 +443,7 @@ describe('gbrain pglite-repair — the happy path (real PGLite)', () => {
     expect(receipt.reset_segment).toMatch(/^[0-9A-F]{24}$/);
     expect(existsSync(receipt.backup_path)).toBe(true);
     expect(existsSync(join(receipt.backup_path, 'pg_wal'))).toBe(true);
+    expect(receipt.restore_command).toContain(`${receipt.backup_path}/pg_wal`);
 
     // 4) The repaired dir opens WITHOUT auto-repair firing, data intact.
     const engine2 = new PGLiteEngine();
@@ -415,4 +502,20 @@ describe('gbrain pglite-repair — argument + quarantine hardening (adversarial 
     // No surgery: no backup dir created.
     expect(readdirSync(join(dir, '..')).some((f) => f.includes('.wal-repair-backup-'))).toBe(false);
   });
+});
+
+describe('gbrain pglite-repair — interactive confirm wiring (#4318 residual)', () => {
+  test('asks through the consent primitive, not a local prompt', () => {
+    // #4318 class: a local promptYesNo/readline here once read a typed "y" as
+    // decline. The prompt now lives in requireConsent (interaction.readLine on
+    // stderr, EOF/timeout = decline); this pins that no local prompt returns.
+    // test-reads-source-ok[structural]: no injectable seam names the prompt implementation.
+    const src = readFileSync(join(import.meta.dir, '../src/commands/pglite-repair.ts'), 'utf8');
+    expect(src).toContain("import { consentGate } from '../core/consent-cli.ts';");
+    expect(src).not.toMatch(/\bfunction promptYesNo\b/);
+    expect(src).not.toContain('promptYesNo(');
+    expect(src).not.toContain("from 'readline'");
+    expect(src).not.toContain("from 'node:readline'");
+  });
+;
 });

@@ -36,14 +36,29 @@ describe('dedupResults', () => {
     expect(aChunks.length).toBeLessThanOrEqual(2);
   });
 
-  test('removes text-similar chunks', () => {
+  test('removes text-similar chunks WITHIN a page (v0.46.15 #3983 scope)', () => {
+    const base = 'the quick brown fox jumps over the lazy dog while seventeen other animals watch from a nearby grassy hill in silence';
     const results = [
-      makeResult({ slug: 'a', score: 0.9, chunk_text: 'the quick brown fox jumps over the lazy dog' }),
-      makeResult({ slug: 'b', score: 0.8, chunk_text: 'the quick brown fox jumps over the lazy cat' }),
+      makeResult({ slug: 'a', chunk_id: 1, score: 0.9, chunk_text: `${base} today` }),
+      makeResult({ slug: 'a', chunk_id: 2, score: 0.8, chunk_text: `${base} now` }),
     ];
     const deduped = dedupResults(results);
-    // These share high Jaccard similarity, one should be removed
-    expect(deduped.length).toBeLessThanOrEqual(2);
+    // Same page, near-identical text → intra-page collapse still fires.
+    expect(deduped.filter(r => r.slug === 'a').length).toBe(1);
+  });
+
+  test('REGRESSION (#3983): near-duplicate text on DIFFERENT pages never deletes a page', () => {
+    // Near-duplicate-record corpus: two deal memos sharing boilerplate.
+    // The unscoped Jaccard drop silently deleted the second PAGE from the
+    // result set — distinct pages are distinct answers.
+    const results = [
+      makeResult({ slug: 'deals/acme-seed', page_id: 1, score: 0.9, chunk_text: 'standard deal memo boilerplate terms valuation notes intro' }),
+      makeResult({ slug: 'deals/widget-series-a', page_id: 2, score: 0.85, chunk_text: 'standard deal memo boilerplate terms valuation notes summary' }),
+    ];
+    const deduped = dedupResults(results);
+    const pages = new Set(deduped.map(r => r.slug));
+    expect(pages.has('deals/acme-seed')).toBe(true);
+    expect(pages.has('deals/widget-series-a')).toBe(true);
   });
 
   test('enforces type diversity when mixed types present', () => {
@@ -63,6 +78,38 @@ describe('dedupResults', () => {
     expect(personCount).toBeGreaterThan(0);
     expect(conceptCount).toBeGreaterThan(0);
   });
+
+  test('nightly-7 regression: preserves all three distinct note sessions', () => {
+    const results = [
+      makeResult({
+        slug: 'chat/nightly-7-s1',
+        page_id: 1,
+        score: 0.8381,
+        type: 'note',
+        chunk_text: 'alice-example launched widget-co/payments in January',
+      }),
+      makeResult({
+        slug: 'chat/nightly-7-s3',
+        page_id: 3,
+        score: 0.8280,
+        type: 'note',
+        chunk_text: 'alice-example launched widget-co/reporting in June',
+      }),
+      makeResult({
+        slug: 'chat/nightly-7-s2',
+        page_id: 2,
+        score: 0.8213,
+        type: 'note',
+        chunk_text: 'alice-example launched widget-co/identity in March',
+      }),
+    ];
+
+    expect(dedupResults(results).map(result => result.slug)).toEqual([
+      'chat/nightly-7-s1',
+      'chat/nightly-7-s3',
+      'chat/nightly-7-s2',
+    ]);
+  });
 });
 
 describe('compiled truth guarantee', () => {
@@ -77,6 +124,19 @@ describe('compiled truth guarantee', () => {
     const aChunks = deduped.filter(r => r.slug === 'a');
     const hasCompiledTruth = aChunks.some(c => c.chunk_source === 'compiled_truth');
     expect(hasCompiledTruth).toBe(true);
+  });
+
+  test('adds the highest-scoring compiled_truth chunk; first seen wins a tie', () => {
+    const timeline = (id: number, score: number) => makeResult({
+      slug: 'a', chunk_id: id, score, chunk_source: 'timeline', chunk_text: `timeline entry number ${id}`,
+    });
+    const truth = (id: number, score: number) => makeResult({
+      slug: 'a', chunk_id: id, score, chunk_source: 'compiled_truth', chunk_text: `compiled truth variant ${id}`,
+    });
+    const best = dedupResults([timeline(1, 0.9), timeline(2, 0.8), timeline(3, 0.7), truth(4, 0.2), truth(5, 0.4), truth(6, 0.3)]);
+    expect(best.map(r => r.chunk_id)).toEqual([1, 2, 5]);
+    const tie = dedupResults([timeline(1, 0.9), timeline(2, 0.8), timeline(3, 0.7), truth(7, 0.3), truth(8, 0.3)]);
+    expect(tie.map(r => r.chunk_id)).toEqual([1, 2, 7]);
   });
 
   test('does not swap when page already has compiled_truth', () => {
@@ -224,5 +284,19 @@ describe('dedup — source-aware composite key (v0.18.0)', () => {
     );
     expect(wikiCompiledTruths.length).toBe(1);
     expect(wikiCompiledTruths[0].chunk_id).toBe(2); // wiki's own compiled_truth, NOT gstack's (id=3)
+  });
+});
+
+describe('compiled truth guarantee keeps evidence and score order (read-path audit #11)', () => {
+  test('appends the compiled_truth chunk instead of evicting a matching chunk, output stays score-sorted', () => {
+    const results = [
+      makeResult({ slug: 'a', chunk_id: 1, score: 0.95, chunk_source: 'timeline', chunk_text: 'alpha timeline first match text' }),
+      makeResult({ slug: 'a', chunk_id: 2, score: 0.90, chunk_source: 'timeline', chunk_text: 'second different timeline evidence words' }),
+      makeResult({ slug: 'b', chunk_id: 3, score: 0.80, chunk_source: 'compiled_truth', chunk_text: 'page b compiled truth summary' }),
+      makeResult({ slug: 'a', chunk_id: 4, score: 0.10, chunk_source: 'compiled_truth', chunk_text: 'page a compiled truth summary' }),
+    ];
+    const out = dedupResults(results);
+    expect(out.map(r => r.chunk_id)).toEqual([1, 2, 3, 4]);
+    for (let i = 1; i < out.length; i++) expect(out[i - 1].score).toBeGreaterThanOrEqual(out[i].score);
   });
 });

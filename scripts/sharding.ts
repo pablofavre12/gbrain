@@ -12,7 +12,7 @@
  *
  * Weights live in scripts/test-weights.json — committed, mined from real
  * CI run logs via scripts/mine-shard-weights.ts. Files absent from the
- * weights map fall back to the corpus median (not zero — that would
+ * weights map fall back to the corpus p75 (not zero — that would
  * favor unknown new files into the smallest shard, defeating balance).
  *
  * CLI:
@@ -20,8 +20,18 @@
  *     Reads test file list from stdin (one path per line). Prints the
  *     subset assigned to <shard-index> to stdout, one per line.
  *
- *   bun run scripts/sharding.ts <shard-index> <total-shards> --files <glob>
- *     Walks the filesystem for matching files instead of reading stdin.
+ *   bun run scripts/sharding.ts <shard-index> <total-shards> --weights <path>
+ *     Uses lane-specific weights. --fallback-on-error warns and uses uniform
+ *     weights if the advisory file is malformed (serial runner compatibility).
+ *
+ *   bun run scripts/sharding.ts --sum [--weights <path>]
+ *     Read-only diagnostic: reads an already-partitioned file list from
+ *     stdin and prints its predicted weight (the same per-file weights and
+ *     p75 fallback `partition` uses) as one line, e.g.
+ *     `predicted 412.3s over 401 files (37 unweighted at p75 1.2s)`.
+ *     test-shard.sh prints it beside its "(LPT-balanced)" line so a shard
+ *     whose measured time is far above the prediction points at the runner
+ *     or a process-wide slowdown, not at the partition.
  *
  * Exit codes:
  *   0   success
@@ -54,7 +64,10 @@ export class WeightsLoadError extends Error {
  * caller decides whether to fall through to defaults or surface.
  */
 export function loadWeights(path: string = DEFAULT_WEIGHTS_PATH): WeightMap {
-  if (!existsSync(path)) return new Map();
+  if (!existsSync(path)) {
+    console.error(`warning: weights missing at ${path}; using uniform fallback weights`);
+    return new Map();
+  }
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
@@ -96,10 +109,21 @@ export function computeMedian(values: number[]): number {
     : sorted[mid]!;
 }
 
+/**
+ * Quantile (nearest-rank) of a list of numbers. Empty input returns 0.
+ * q in [0, 1]; q=0.75 is the missing-file fallback weight (see partition).
+ */
+export function computeQuantile(values: number[], q: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
+  return sorted[idx]!;
+}
+
 export interface PartitionOpts {
   /**
    * Weight to assign files that are absent from the weights map. Defaults
-   * to the median of present weights (computed inside `partition`) so
+   * to the p75 of present weights (computed inside `partition`) so
    * unknown new files cluster around the typical file's cost.
    *
    * Override mainly for tests; production callers should use the default.
@@ -119,7 +143,7 @@ export interface PartitionOpts {
  *   - Every file in `files` appears in exactly one returned shard.
  *   - If `files` is empty, returns `n` empty arrays.
  *   - If `n <= 0`, throws RangeError.
- *   - Files missing from `weights` get `opts.fallbackWeight` (or median).
+ *   - Files missing from `weights` get `opts.fallbackWeight` (or p75).
  */
 export function partition(
   files: string[],
@@ -133,8 +157,15 @@ export function partition(
   const shards: string[][] = Array.from({ length: n }, () => []);
   if (files.length === 0) return shards;
 
-  // Compute fallback weight from the median of present weights, unless
-  // the caller supplied an explicit override.
+  // Compute fallback weight from the p75 of present weights, unless the
+  // caller supplied an explicit override. p75, not median: the weight
+  // distribution is extremely right-skewed (median ~27ms, mean ~800ms —
+  // most files are trivial greps, the tail boots PGLite), and files
+  // MISSING from the map skew heavy (new integration tests land unweighted
+  // more often than new pure-unit tests). A median fallback modeled 45% of
+  // the corpus at ~30ms and let one shard silently carry the unweighted
+  // heavies; p75 over-weights small new files slightly (harmless — LPT
+  // self-corrects on the next mine) instead of under-weighting big ones.
   let fallback: number;
   if (opts.fallbackWeight !== undefined) {
     if (!Number.isFinite(opts.fallbackWeight) || opts.fallbackWeight < 0) {
@@ -144,14 +175,10 @@ export function partition(
     }
     fallback = opts.fallbackWeight;
   } else {
-    fallback = computeMedian(Array.from(weights.values()));
+    fallback = computeQuantile(Array.from(weights.values()), 0.75);
   }
-  // Cold-start guard: if the weights map is empty AND no explicit
-  // fallback was supplied, every effective weight would be 0 and LPT
-  // collapses (all ties → lowest-index wins → every file in shard 0).
-  // Normalize fallback to 1 so LPT degenerates to round-robin, which is
-  // a strictly better default than "everything in shard 1" until
-  // test-weights.json gets mined.
+  // Keep a nonzero estimate for unknown files until timings are available.
+  // Equal-load file-count ties also distribute explicitly zero-valued weights.
   if (fallback === 0 && opts.fallbackWeight === undefined) {
     fallback = 1;
   }
@@ -167,12 +194,14 @@ export function partition(
     return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
   });
 
-  // Running per-shard totals. argmin tiebreaker: lowest index (stable).
+  // Equal loads prefer fewer files, then lowest index. In particular, measured
+  // zero-duration files must not all collapse into the first shard.
   const totals = new Array<number>(n).fill(0);
   for (const t of tuples) {
     let minIdx = 0;
     for (let i = 1; i < n; i++) {
-      if (totals[i]! < totals[minIdx]!) minIdx = i;
+      if (totals[i]! < totals[minIdx]! ||
+          (totals[i] === totals[minIdx] && shards[i]!.length < shards[minIdx]!.length)) minIdx = i;
     }
     shards[minIdx]!.push(t.path);
     totals[minIdx] = totals[minIdx]! + t.weight;
@@ -198,6 +227,32 @@ export function imbalanceRatio(shards: string[][], weights: WeightMap, fallback:
   return max / min;
 }
 
+/**
+ * Predicted weight of an already-partitioned file list: the sum of each
+ * file's mined weight, with the same p75 fallback `partition` assigns to
+ * files absent from the map. Read-only over the weights.
+ */
+export function predictedWeight(
+  files: string[],
+  weights: WeightMap,
+): { totalMs: number; files: number; unweighted: number; fallbackMs: number } {
+  let fallbackMs = computeQuantile(Array.from(weights.values()), 0.75);
+  if (fallbackMs === 0) fallbackMs = 1;
+  let totalMs = 0;
+  let unweighted = 0;
+  for (const f of files) {
+    const w = weights.get(f);
+    if (w === undefined) unweighted++;
+    totalMs += w ?? fallbackMs;
+  }
+  return { totalMs, files: files.length, unweighted, fallbackMs };
+}
+
+export function formatPredictedWeight(p: ReturnType<typeof predictedWeight>): string {
+  const s = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+  return `predicted ${s(p.totalMs)} over ${p.files} files (${p.unweighted} unweighted at p75 ${s(p.fallbackMs)})`;
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // CLI
 // ──────────────────────────────────────────────────────────────────────────
@@ -218,16 +273,47 @@ async function readStdinLines(): Promise<string[]> {
 
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
-  if (argv.length < 2) {
-    console.error("usage: bun run scripts/sharding.ts <shard-index> <total-shards>");
+  const positional: string[] = [];
+  let weightsPath: string | undefined;
+  let fallbackOnError = false;
+  let sumOnly = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--weights" && argv[i + 1] && !argv[i + 1]!.startsWith("--")) weightsPath = argv[++i];
+    else if (arg === "--fallback-on-error") fallbackOnError = true;
+    else if (arg === "--sum") sumOnly = true;
+    else if (arg.startsWith("--")) {
+      console.error(`error: unknown or incomplete option ${arg}`);
+      return 2;
+    } else positional.push(arg);
+  }
+  if (sumOnly) {
+    if (positional.length !== 0) {
+      console.error("usage: bun run scripts/sharding.ts --sum [--weights PATH]  (reads the shard's file list from stdin)");
+      return 2;
+    }
+    let weights: WeightMap;
+    try {
+      weights = loadWeights(weightsPath);
+    } catch (e) {
+      console.error(`${fallbackOnError ? "warning" : "error"}: ${e instanceof Error ? e.message : String(e)}`);
+      if (!fallbackOnError) return 1;
+      weights = new Map();
+    }
+    process.stdout.write(`${formatPredictedWeight(predictedWeight(await readStdinLines(), weights))}\n`);
+    return 0;
+  }
+  if (positional.length !== 2) {
+    console.error("usage: bun run scripts/sharding.ts <shard-index> <total-shards> [--weights PATH] [--fallback-on-error]");
+    console.error("       bun run scripts/sharding.ts --sum [--weights PATH]");
     console.error("       (reads file list from stdin, one path per line)");
     return 2;
   }
-  const idx = Number.parseInt(argv[0]!, 10);
-  const total = Number.parseInt(argv[1]!, 10);
-  if (!Number.isInteger(idx) || !Number.isInteger(total) || idx < 1 || total < 1 || idx > total) {
+  const idx = Number(positional[0]);
+  const total = Number(positional[1]);
+  if (!positional.every((v) => /^[0-9]+$/.test(v)) || !Number.isSafeInteger(idx) || !Number.isSafeInteger(total) || idx < 1 || total < 1 || idx > total) {
     console.error(
-      `error: shard index ${argv[0]} / total ${argv[1]} invalid (need 1 <= index <= total, both ints)`,
+      `error: shard index ${positional[0]} / total ${positional[1]} invalid (need 1 <= index <= total, both ints)`,
     );
     return 2;
   }
@@ -239,10 +325,11 @@ async function main(): Promise<number> {
   }
   let weights: WeightMap;
   try {
-    weights = loadWeights();
+    weights = loadWeights(weightsPath);
   } catch (e) {
-    console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
-    return 1;
+    console.error(`${fallbackOnError ? "warning" : "error"}: ${e instanceof Error ? e.message : String(e)}`);
+    if (!fallbackOnError) return 1;
+    weights = new Map();
   }
   const shards = partition(files, weights, total);
   for (const f of shards[idx - 1]!) {
@@ -252,5 +339,11 @@ async function main(): Promise<number> {
 }
 
 if (import.meta.main) {
-  main().then((code) => process.exit(code));
+  // #5669: set exitCode and let the runtime drain instead of process.exit().
+  // With stdout a PIPE (test-shard.sh / run-unit-shard.sh / the serial pool
+  // all consume this CLI), process.exit() can terminate before the pending
+  // writes flush — a 10,000-file selection delivered 8,187 paths at exit 0,
+  // so the wrapper ran a partial shard without knowing. Setting exitCode
+  // keeps the codes identical while the event loop flushes stdout first.
+  main().then((code) => { process.exitCode = code; });
 }

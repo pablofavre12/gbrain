@@ -19,7 +19,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { buildGatewayConfig } from '../../src/cli.ts';
+import { buildGatewayConfig } from '../../src/cli/main.ts';
 import { KNOWN_CONFIG_KEYS, type GBrainConfig } from '../../src/core/config.ts';
 import { withEnv } from '../helpers/with-env.ts';
 
@@ -121,7 +121,7 @@ describe('buildGatewayConfig config-plane API-key folding', () => {
   // #2662: voyage_api_key was accepted at the file plane (config.json) but
   // never folded into the gateway env, so daemons/launchd/MCP callers with
   // no process-env export silently failed multimodal embeds. Same fold
-  // pattern as zeroentropy/openrouter above.
+  // pattern as Voyage/openrouter above.
   test('voyage_api_key folds into gateway env as VOYAGE_API_KEY', async () => {
     await withEnv({ VOYAGE_API_KEY: undefined }, async () => {
       const cfg = buildGatewayConfig({
@@ -161,6 +161,46 @@ describe('buildGatewayConfig config-plane API-key folding', () => {
     });
   });
 
+  // Same seam for LiteLLM + Together, closed alongside litellm's chat
+  // touchpoint (v0.42.61.0): once litellm became a full chat provider,
+  // daemon/launchd/MCP contexts hit the same config-plane gap voyage did
+  // (#2662). The fold lives in mergedProviderEnv (src/core/ai/provider-env.ts).
+  test('litellm_api_key folds into gateway env as LITELLM_API_KEY', async () => {
+    await withEnv({ LITELLM_API_KEY: undefined }, async () => {
+      const cfg = buildGatewayConfig({
+        litellm_api_key: 'sk-llm-config-plane',
+      } as unknown as GBrainConfig);
+      expect(cfg.env.LITELLM_API_KEY).toBe('sk-llm-config-plane');
+    });
+  });
+
+  test('a real LITELLM_API_KEY process.env value wins over the config-plane fallback', async () => {
+    await withEnv({ LITELLM_API_KEY: 'sk-llm-env-plane' }, async () => {
+      const cfg = buildGatewayConfig({
+        litellm_api_key: 'sk-llm-config-plane',
+      } as unknown as GBrainConfig);
+      expect(cfg.env.LITELLM_API_KEY).toBe('sk-llm-env-plane');
+    });
+  });
+
+  test('together_api_key folds into gateway env as TOGETHER_API_KEY', async () => {
+    await withEnv({ TOGETHER_API_KEY: undefined }, async () => {
+      const cfg = buildGatewayConfig({
+        together_api_key: 'sk-tg-config-plane',
+      } as unknown as GBrainConfig);
+      expect(cfg.env.TOGETHER_API_KEY).toBe('sk-tg-config-plane');
+    });
+  });
+
+  test('a real TOGETHER_API_KEY process.env value wins over the config-plane fallback', async () => {
+    await withEnv({ TOGETHER_API_KEY: 'sk-tg-env-plane' }, async () => {
+      const cfg = buildGatewayConfig({
+        together_api_key: 'sk-tg-config-plane',
+      } as unknown as GBrainConfig);
+      expect(cfg.env.TOGETHER_API_KEY).toBe('sk-tg-env-plane');
+    });
+  });
+
   // #3500: the google recipe reads GOOGLE_GENERATIVE_AI_API_KEY; before this
   // fold the ONLY configuration route was exporting that exact env name.
   test('google_api_key folds into gateway env as GOOGLE_GENERATIVE_AI_API_KEY', async () => {
@@ -173,6 +213,15 @@ describe('buildGatewayConfig config-plane API-key folding', () => {
         expect(cfg.env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('AIza-config-plane');
       },
     );
+  });
+
+  test('deepseek_api_key folds into gateway env as DEEPSEEK_API_KEY (#4808)', async () => {
+    await withEnv({ DEEPSEEK_API_KEY: undefined }, async () => {
+      const cfg = buildGatewayConfig({
+        deepseek_api_key: 'sk-deepseek-config-plane',
+      } as unknown as GBrainConfig);
+      expect(cfg.env.DEEPSEEK_API_KEY).toBe('sk-deepseek-config-plane');
+    });
   });
 
   // Recurring-class guard: EVERY *_api_key field declared in
@@ -272,6 +321,22 @@ describe('buildGatewayConfig env empty-string clobber guard (#1249)', () => {
   });
 });
 
+describe('buildGatewayConfig OCR-model threading (#4107)', () => {
+  // The config key was declared/env-merged/DB-merged in config.ts but never
+  // picked into AIGatewayConfig, so generateOcrText() could not see it.
+  test('embedding_image_ocr_model reaches the gateway config', () => {
+    const cfg = buildGatewayConfig({
+      embedding_image_ocr_model: 'deepseek:deepseek-v4-pro',
+    } as unknown as GBrainConfig);
+    expect(cfg.embedding_image_ocr_model).toBe('deepseek:deepseek-v4-pro');
+  });
+
+  test('absent embedding_image_ocr_model stays undefined (expansion fallback signal preserved)', () => {
+    const cfg = buildGatewayConfig(baseConfig);
+    expect(cfg.embedding_image_ocr_model).toBeUndefined();
+  });
+});
+
 /**
  * Side-effect guard (v0.37.x): importing buildGatewayConfig from src/cli.ts
  * must NOT trigger the CLI's top-level main() and dump help to stdout. The
@@ -320,7 +385,7 @@ describe('buildGatewayConfig import side effect guard', () => {
     // already ran by the time describe() executes. Re-importing here is
     // belt-and-suspenders: any future test that splits the suite would still
     // exercise the side-effect contract from a fresh module record.
-    const mod = await import('../../src/cli.ts');
+    const mod = await import('../../src/cli/main.ts');
     expect(typeof mod.buildGatewayConfig).toBe('function');
 
     // Build a synthetic config and call it. Pre-fix behavior: importing the
@@ -341,7 +406,7 @@ describe('buildGatewayConfig import side effect guard', () => {
     // Post-fix: stdout is empty; only the bun runtime header / warnings may
     // appear on stderr.
     const inline = `
-      import { buildGatewayConfig } from './src/cli.ts';
+      import { buildGatewayConfig } from './src/cli/main.ts';
       const cfg = buildGatewayConfig({});
       // Touch the result so the engine does not dead-code-eliminate the call.
       if (!cfg) process.exit(2);

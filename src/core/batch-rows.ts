@@ -87,6 +87,18 @@ export const stripNul = (s: string): string => (s.includes('\0') ? s.replace(/\0
  */
 export const sanitizeForJsonb = (s: string): string => ensureWellFormed(stripNul(s));
 
+/**
+ * Null-safe free-prose sanitizer for plain TEXT / TEXT[] columns (title,
+ * compiled_truth, timeline, chunk_text). Same NUL + lone-surrogate cleanup as
+ * `sanitizeForJsonb` — a raw 0x00 in a page body otherwise aborts the INSERT
+ * with `invalid byte sequence for encoding "UTF8": 0x00` (Postgres text cannot
+ * store NUL), and a lone surrogate is likewise rejected. Passes null/undefined
+ * through unchanged so nullable columns keep their semantics. Same policy as
+ * sanitizeForJsonb: free-prose body only, NEVER identity/security fields.
+ */
+export const sanitizeText = <T extends string | null | undefined>(s: T): T =>
+  (typeof s === 'string' ? (sanitizeForJsonb(s) as T) : s);
+
 /** One links row, keys === the jsonb_to_recordset column list. */
 export interface LinkRow {
   from_slug: string;
@@ -100,6 +112,7 @@ export interface LinkRow {
   to_source_id: string;
   origin_source_id: string;
   link_kind: string | null;
+  resolution_type: string | null;
 }
 
 /** One timeline row, keys === the jsonb_to_recordset column list. */
@@ -141,6 +154,7 @@ export function buildLinkRows(links: LinkBatchInput[]): LinkRow[] {
     to_source_id: l.to_source_id || 'default',
     origin_source_id: l.origin_source_id || 'default',
     link_kind: l.link_kind ?? null,
+    resolution_type: l.resolution_type ?? null,
   }));
 }
 

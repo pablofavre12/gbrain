@@ -53,9 +53,14 @@ describe('copyPageToTarget — undefined-column normalization (#3194)', () => {
         putPageCalls.push({ slug, page, opts });
         return fakePage();
       },
+      // #4527: copyPageToTarget restores the source row's timestamps via a
+      // raw UPDATE right after putPage.
+      executeRaw: async () => [],
+      setPageAliases: async () => {}, // #6286: frontmatter aliases travel with the page
     } as unknown as BrainEngine;
     const source = {
       getChunksWithEmbeddings: async () => [],
+      executeRaw: async () => [], // #6286: the copier reads the source row's origin and provenance columns
       getTags: async () => [],
       getTimeline: async () => [],
       getRawData: async () => [],
@@ -82,7 +87,10 @@ describe('copyPageToTarget — undefined-column normalization (#3194)', () => {
     expect(call.page.content_hash).toBeNull();
     // ...while legitimately-populated fields pass through untouched.
     expect(call.page.title).toBe('a title');
-    expect(call.opts).toEqual({ sourceId: 'default' });
+    // Verbatim copy: the source row is authoritative, so the copy carries
+    // putPage's empty-overwrite escape hatch (a legitimately blank body must
+    // land over a drifted non-empty target row on re-run).
+    expect(call.opts).toEqual({ sourceId: 'default', allowEmptyOverwrite: true });
   });
 
   test('already-null / already-populated fields are left as-is (no double-mapping)', async () => {
@@ -92,9 +100,14 @@ describe('copyPageToTarget — undefined-column normalization (#3194)', () => {
         putPageCalls.push({ slug, page, opts });
         return fakePage();
       },
+      // #4527: copyPageToTarget restores the source row's timestamps via a
+      // raw UPDATE right after putPage.
+      executeRaw: async () => [],
+      setPageAliases: async () => {}, // #6286: frontmatter aliases travel with the page
     } as unknown as BrainEngine;
     const source = {
       getChunksWithEmbeddings: async () => [],
+      executeRaw: async () => [], // #6286: the copier reads the source row's origin and provenance columns
       getTags: async () => [],
       getTimeline: async () => [],
       getRawData: async () => [],

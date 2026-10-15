@@ -118,7 +118,7 @@ describe('recipe: cohere', () => {
       throw new Error('expected rerank to reject');
     } catch (error) {
       expect(error).toBeInstanceOf(RerankError);
-      expect((error as RerankError).reason).toBe('auth');
+      expect((error as RerankError).reason).toBe('no_key');
       expect((error as Error).message).toContain('COHERE_API_KEY');
       expect(called).toBe(false);
     }
