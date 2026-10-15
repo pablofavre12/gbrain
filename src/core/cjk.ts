@@ -43,6 +43,15 @@ export const CJK_RANGES_REGEX = new RegExp(`[${CJK_SLUG_CHARS}]`);
 export const SLUG_WORD_CHARS = '\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}\\p{N}';
 
 /**
+ * Unicode variation selectors (emoji VS1–VS16 U+FE00–FE0F, ideographic IVS
+ * U+E0100–E01EF): Mn-category invisibles that survive the \p{M} keep above.
+ * Both slug grammars — `sync.ts:slugifySegment` and its #4855 twin
+ * `link-extraction.ts:normalizeBasename` — strip them so an emoji folder name
+ * written with VS16 lands on the clean slug and its `[[wikilink]]` resolves.
+ */
+export const SLUG_VARIATION_SELECTORS_RE = /[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu;
+
+/**
  * Page-slug segment grammar (no anchors): word-char lead, then word-char or
  * hyphen continuation. Single source for validatePageSlug (operations.ts),
  * SlugRegistry's SLUG_RE, and the dream-cycle SUMMARY_SLUG_RE so every slug
@@ -78,15 +87,103 @@ export function hasCJK(s: string): boolean {
  */
 export function countCJKAwareWords(s: string): number {
   if (s.length === 0) return 0;
-  const cjkMatches = s.match(new RegExp(`[${CJK_SLUG_CHARS}]`, 'g'));
-  const cjkCount = cjkMatches ? cjkMatches.length : 0;
-  const nonWhitespace = s.replace(/\s/g, '').length;
-  if (nonWhitespace === 0) return 0;
-  const density = cjkCount / nonWhitespace;
-  if (density >= CJK_DENSITY_THRESHOLD) {
-    return nonWhitespace;
+  return wordCountOf(wordStats(s));
+}
+
+/**
+ * The ONE density test behind countCJKAwareWords: true when CJK chars make
+ * up at least CJK_DENSITY_THRESHOLD of the non-whitespace chars. Callers
+ * that need to branch on "would countCJKAwareWords count chars here?" (the
+ * chunker's overlap extractor) route through this so the two cannot drift.
+ */
+export function isCJKDominant(s: string): boolean {
+  return statsAreCJKDominant(wordStats(s));
+}
+
+/**
+ * Everything countCJKAwareWords needs, gathered in one pass over UTF-16
+ * code units: non-whitespace units, BMP CJK units (the CJK_SLUG_CHARS
+ * ranges), and `/\S+/g` runs. The first/last flags let two adjacent
+ * strings' stats combine in O(1) (concatWordStats), so a caller that grows
+ * a string piece by piece never recounts it.
+ */
+export interface WordStats {
+  length: number;
+  nonWhitespace: number;
+  cjk: number;
+  runs: number;
+  startsNonWhitespace: boolean;
+  endsNonWhitespace: boolean;
+}
+
+const CJK_UNIT_RANGES: ReadonlyArray<readonly [number, number]> = Array.from(
+  CJK_SLUG_CHARS.matchAll(/(.)-(.)/g),
+  m => [m[1]!.charCodeAt(0), m[2]!.charCodeAt(0)] as const,
+);
+
+const CJK_UNIT_MIN = Math.min(...CJK_UNIT_RANGES.map(([lo]) => lo));
+
+function isCJKUnit(c: number): boolean {
+  if (c < CJK_UNIT_MIN) return false;
+  for (const [lo, hi] of CJK_UNIT_RANGES) if (c >= lo && c <= hi) return true;
+  return false;
+}
+
+/** Exactly the code units JavaScript's `\s` matches. */
+function isWhitespaceUnit(c: number): boolean {
+  if (c <= 0x20) return c === 0x20 || (c >= 0x09 && c <= 0x0d);
+  if (c < 0xa0) return false;
+  return c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a)
+    || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f
+    || c === 0x3000 || c === 0xfeff;
+}
+
+export function wordStats(s: string): WordStats {
+  let nonWhitespace = 0;
+  let cjk = 0;
+  let runs = 0;
+  let prevNonWhitespace = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (isWhitespaceUnit(c)) {
+      prevNonWhitespace = false;
+      continue;
+    }
+    nonWhitespace++;
+    if (isCJKUnit(c)) cjk++;
+    if (!prevNonWhitespace) runs++;
+    prevNonWhitespace = true;
   }
-  return (s.match(/\S+/g) || []).length;
+  return {
+    length: s.length,
+    nonWhitespace,
+    cjk,
+    runs,
+    startsNonWhitespace: s.length > 0 && !isWhitespaceUnit(s.charCodeAt(0)),
+    endsNonWhitespace: prevNonWhitespace,
+  };
+}
+
+/** Stats of `a + b` from the stats of `a` and `b`. */
+export function concatWordStats(a: WordStats, b: WordStats): WordStats {
+  return {
+    length: a.length + b.length,
+    nonWhitespace: a.nonWhitespace + b.nonWhitespace,
+    cjk: a.cjk + b.cjk,
+    runs: a.runs + b.runs - (a.endsNonWhitespace && b.startsNonWhitespace ? 1 : 0),
+    startsNonWhitespace: a.length === 0 ? b.startsNonWhitespace : a.startsNonWhitespace,
+    endsNonWhitespace: b.length === 0 ? a.endsNonWhitespace : b.endsNonWhitespace,
+  };
+}
+
+export function statsAreCJKDominant(st: WordStats): boolean {
+  if (st.nonWhitespace === 0) return false;
+  return st.cjk / st.nonWhitespace >= CJK_DENSITY_THRESHOLD;
+}
+
+/** countCJKAwareWords of the string the stats describe. */
+export function wordCountOf(st: WordStats): number {
+  return statsAreCJKDominant(st) ? st.nonWhitespace : st.runs;
 }
 
 /**
@@ -96,3 +193,19 @@ export function countCJKAwareWords(s: string): number {
 export function escapeLikePattern(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
+
+/**
+ * Splits a CJK query into distinct, non-empty whitespace-delimited terms.
+ *
+ * In Korean and Japanese, word order is flexible and particles attach to nouns,
+ * so the same fact or search intent frequently appears in varying token sequences
+ * (e.g. "김대리 미팅" vs "미팅 김대리"). Splitting into individual terms allows
+ * multi-term conjunction (AND matching) across chunk text regardless of word order.
+ *
+ * Returns deduplicated terms preserving the original order of appearance.
+ */
+export function splitCJKQueryTerms(query: string): string[] {
+  const terms = query.split(/\s+/).filter(t => t.length > 0);
+  return Array.from(new Set(terms));
+}
+

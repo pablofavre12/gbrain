@@ -10,14 +10,14 @@ snapshot that was parsed, and only after every required operation succeeded.
 
 ## Outcome protocol
 
-The current protocol is v2. Its source names are versioned so rows written by
-older best-effort implementations cannot suppress a corrective replay.
+The protocol is v2. Its source names carry the version so rows written under
+any other protocol version cannot suppress a corrective replay.
 
 | Outcome | `facts.source` | Meaning |
 |---|---|---|
 | Complete | `cli:extract-conversation-facts:terminal:v2` | Every eligible segment was extracted and inserted successfully, the input remained unchanged, and the terminal write succeeded. |
 | Scanned, not extractable | `cli:extract-conversation-facts:non-extractable:v2` | A recognized input was scanned successfully but contained no eligible multi-message segment. |
-| Unfinished | no matching v2 outcome | Work is pending, failed, was not recognized, changed during extraction, or has only a legacy marker. |
+| Unfinished | no matching v2 outcome | Work is pending, failed, was not recognized, changed during extraction, or carries only a marker from another protocol version. |
 
 The non-extractable outcome is intentionally separate from completion. It does
 not claim that knowledge facts were extracted. CLI counters, cycle details, and
@@ -45,7 +45,7 @@ page-<pages.content_hash>-<effective-date>
 The effective-date suffix covers the remaining date input used by parsing. This
 identity does not depend on JavaScript's millisecond timestamp precision, so two
 writes within one PostgreSQL millisecond still produce different tokens when
-parser input changes. A legacy page with a null content hash uses a computed
+parser input changes. A page with a null content hash uses a computed
 SHA-256 fallback and is verified in-process by both extraction and doctor.
 
 ### Raw transcript sidecar
@@ -92,7 +92,7 @@ Single-page `--slug` runs use the same under-lock path.
 ## Strict extraction success
 
 The general `extractFactsFromTurn` API remains best-effort for interactive
-callers. It historically returns an empty array for both a legitimate zero-fact
+callers. It returns an empty array for both a legitimate zero-fact
 answer and several model failures.
 
 Conversation backfill instead uses `extractFactsFromTurnWithOutcome`, whose
@@ -118,6 +118,25 @@ This distinction is load-bearing. Treating a provider outage as a successful
 zero-fact response would make a transient failure durable and permanently hide
 the page from later runs.
 
+### Bounded windows (#6267)
+
+Every eligible turn reaches the extractor. A gap-separated group with at
+least two messages is eligible; inside it, windows close at 30 messages or
+when the rendered text (header included) would exceed 6,500 characters, and
+the next turn opens a new window. A turn that cannot fit alone is split at
+sentence boundaries with its speaker and timestamp repeated on every piece.
+Nothing is clipped: an unrepresentable header fails the page before any
+model call or prior-fact cleanup, and a window rendered over budget is a
+bug that surfaces as a page failure, never as a silent cut. A dense page
+therefore takes more extractor calls than before, under the same cost cap.
+
+Pages stamped complete by an earlier release saw clipped input, and their
+outcome stays valid because the page did not change. To re-extract them
+run `gbrain extract-conversation-facts --source <id> --slug <slug> --force`
+(or `--force` without `--slug` for the whole source, after a `--dry-run`
+preview of the window count); this spends model calls, so it is the
+operator's decision.
+
 ## Non-extractable authority
 
 A non-extractable marker is written only when all of the following are true:
@@ -140,7 +159,7 @@ facts that could not be removed.
 ## Checkpoints are not authority
 
 Operation checkpoints are only progress hints. They do not prove which page
-snapshot was processed, and old checkpoint entries do not include a snapshot
+snapshot was processed, and checkpoint entries do not include a snapshot
 token. When a page lacks a matching v2 outcome, the command discards that
 page's checkpoint entry and performs a delete-first full replay.
 
@@ -172,7 +191,14 @@ and snapshot verification. Force means "recompute" rather than "relax safety."
 
 ## Operator signals
 
-The result exposes separate counters:
+`pages_skipped` retains its existing aggregate meaning. Its reason-specific
+subsets distinguish `pages_skipped_unparsed`, `pages_skipped_type_mismatch`,
+`pages_skipped_insufficient_turns`, and `pages_skipped_since`; speaker-attribution
+declines retain `pages_skipped_unrecognized_speaker`. These subsets explain a
+skip without adding a second page to the aggregate. `--since` filtering is not
+a checkpoint skip, and a parse miss remains retryable.
+
+The result also exposes separate durable-outcome and failure counters:
 
 - `pages_skipped_completed`
 - `pages_skipped_non_extractable`
@@ -182,6 +208,23 @@ The result exposes separate counters:
 The CLI aggregates these across sources. The autopilot backfill phase includes
 them in phase details. `gbrain doctor` reports `completed`,
 `scanned_not_extractable`, and `backlog` independently.
+
+### Preview without model calls
+
+**Say to your agent:** *"Preview which conversations can be read, and explain
+why any are skipped."*
+
+```bash
+gbrain extract-conversation-facts --source-id default --dry-run --limit 10 --workers 1
+```
+
+Dry-run reports segmentation and skip reasons without calling the parser
+fallback, fact extractor, or embedding provider. It does not write facts,
+durable outcomes, checkpoints, receipt pages, or extraction rollups. Normal
+source checks and transient advisory-lock handling still apply. The preview
+does not estimate how many facts a later model call would return.
+
+### Verify durable outcomes
 
 Run a small canary twice:
 
@@ -222,6 +265,6 @@ bun x tsc --noEmit
 ```
 
 The focused suite covers checkpoint garbage collection, same-timestamp edits,
-edits during extraction, sidecar-only edits, legacy marker replay, provider and
+edits during extraction, sidecar-only edits, replay over non-v2 markers, provider and
 insert failures, cleanup failure, recognized non-extractable scans, retryable
 parser misses, post-filter limits, force replay, and doctor accounting.

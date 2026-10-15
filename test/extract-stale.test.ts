@@ -15,7 +15,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { runExtract } from '../src/commands/extract.ts';
+import { runExtract, extractStaleFromDB } from '../src/commands/extract.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../src/core/link-extraction.ts';
 import type { PageInput } from '../src/core/types.ts';
 
@@ -96,8 +96,10 @@ describe('engine: stale-page extraction methods', () => {
   });
 
   test('markPagesExtractedBatch: empty input is a no-op', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
     await engine.markPagesExtractedBatch([], new Date().toISOString());
-    expect(true).toBe(true); // no throw
+    expect(await stampOf('people/alice')).toBeNull();
+    expect(await engine.countStalePagesForExtraction()).toBe(1);
   });
 });
 
@@ -146,6 +148,61 @@ describe('gbrain extract --stale', () => {
     expect(await stampOf('companies/acme')).toBeNull();
     // Still stale after dry-run.
     expect(await engine.countStalePagesForExtraction()).toBe(2);
+  });
+
+  test('#3478: isolated source does not create a cross-source fallback link', async () => {
+    // $N::text::jsonb (never bare ::jsonb on a stringified param) per the
+    // JSONB invariant in CLAUDE.md.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, $2::text::jsonb)
+       ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config`,
+      ['isolated-kb', JSON.stringify({ federated: false })],
+    );
+    try {
+      await engine.putPage('people/alice', personPage('Alice'));
+      await engine.putPage(
+        'companies/private',
+        companyPage('Private', '[Alice](people/alice) advises Private.'),
+        { sourceId: 'isolated-kb' },
+      );
+
+      await runExtract(engine, ['--stale', '--source-id', 'isolated-kb']);
+
+      // The target exists only in 'default'; a non-federated source must NOT
+      // fall back across the source boundary (edge would leak isolated pages
+      // into cross-source graph reads).
+      const links = await engine.getLinks('companies/private', { sourceId: 'isolated-kb' });
+      expect(links.some(l => l.to_slug === 'people/alice')).toBe(false);
+    } finally {
+      // truncateAll clears pages but not sources — remove the fixture row so
+      // later tests in this file see the pristine sources table.
+      await engine.executeRaw(`DELETE FROM sources WHERE id = 'isolated-kb'`);
+    }
+  });
+
+  test('#3478: federated source preserves the cross-source default fallback', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, $2::text::jsonb)
+       ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config`,
+      ['shared-kb', JSON.stringify({ federated: true })],
+    );
+    try {
+      await engine.putPage('people/alice', personPage('Alice'));
+      await engine.putPage(
+        'companies/shared',
+        companyPage('Shared', '[Alice](people/alice) advises Shared.'),
+        { sourceId: 'shared-kb' },
+      );
+
+      await runExtract(engine, ['--stale', '--source-id', 'shared-kb']);
+
+      // The target exists only in default, so a created edge proves the
+      // federated fallback stayed enabled.
+      const links = await engine.getLinks('companies/shared', { sourceId: 'shared-kb' });
+      expect(links.some(l => l.to_slug === 'people/alice')).toBe(true);
+    } finally {
+      await engine.executeRaw(`DELETE FROM sources WHERE id = 'shared-kb'`);
+    }
   });
 
   test('CRITICAL (CDX-1): page edited after stamp is re-extracted', async () => {
@@ -245,15 +302,15 @@ describe('gbrain extract --stale', () => {
     // Make the link flush throw mid-sweep. The --stale path flushes
     // NON-swallowing (no try/catch), so the throw must propagate AND no page in
     // the batch may be stamped (stamp runs only AFTER a successful flush).
-    const origBatch = engine.addLinksBatch.bind(engine);
+    const origBatch = engine.replaceDerivedLinks.bind(engine);
     let threw = false;
-    (engine as unknown as { addLinksBatch: unknown }).addLinksBatch = async () => { throw new Error('__flush_boom__'); };
+    (engine as unknown as { replaceDerivedLinks: unknown }).replaceDerivedLinks = async () => { throw new Error('__flush_boom__'); };
     try {
       await runExtract(engine, ['--stale']);
     } catch (e) {
       if ((e as Error).message === '__flush_boom__') threw = true; else throw e;
     } finally {
-      (engine as unknown as { addLinksBatch: unknown }).addLinksBatch = origBatch;
+      (engine as unknown as { replaceDerivedLinks: unknown }).replaceDerivedLinks = origBatch;
     }
     expect(threw).toBe(true);
     // Pages whose edges were lost are NOT stamped fresh — they stay stale.
@@ -266,6 +323,34 @@ describe('gbrain extract --stale', () => {
     expect((await engine.getLinks('companies/acme')).some(l => l.to_slug === 'people/alice')).toBe(true);
     expect(await stampOf('companies/acme')).not.toBeNull();
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+  });
+
+  test('S4 (#6228): pages extracted before an aborting page keep their stamp; the failing page and later ones stay stale', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
+    await engine.putPage('notes/first', { type: 'note', title: 'First', compiled_truth: 'Met [Alice](people/alice).', timeline: '- **2026-01-02** | call — First call' });
+    await engine.putPage('notes/boom', { type: 'note', title: 'Boom', compiled_truth: 'Met [Alice](people/alice) again.', timeline: '' });
+    await engine.putPage('notes/after', { type: 'note', title: 'After', compiled_truth: 'Later.', timeline: '' });
+    const origBatch = engine.replaceDerivedLinks.bind(engine);
+    (engine as unknown as { replaceDerivedLinks: unknown }).replaceDerivedLinks = async (origin: { slug: string }, ...rest: unknown[]) => {
+      if (origin.slug === 'notes/boom') throw new Error('__page_boom__');
+      return (origBatch as (...a: unknown[]) => unknown)(origin, ...rest);
+    };
+    let threw = false;
+    try {
+      await extractStaleFromDB(engine, { dryRun: false, jsonMode: true, quiet: true, catchUp: true });
+    } catch (e) {
+      if ((e as Error).message === '__page_boom__') threw = true; else throw e;
+    } finally {
+      (engine as unknown as { replaceDerivedLinks: unknown }).replaceDerivedLinks = origBatch;
+    }
+    expect(threw).toBe(true);
+    expect(await stampOf('people/alice')).not.toBeNull();
+    expect(await stampOf('notes/first')).not.toBeNull();
+    expect(await engine.executeRaw(`SELECT t.summary FROM timeline_entries t JOIN pages p ON p.id = t.page_id WHERE p.slug = 'notes/first'`))
+      .toEqual([{ summary: 'First call' }]);
+    expect(await stampOf('notes/boom')).toBeNull();
+    expect(await stampOf('notes/after')).toBeNull();
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(2);
   });
 
   test('D4 race: a concurrent edit landing during the sweep is NOT masked', async () => {
@@ -360,6 +445,33 @@ describe('gbrain extract --stale', () => {
     // The gate lives in extractPageLinks opts now, not in a resolver swap —
     // the page is still stamped either way.
     expect(await stampOf('concepts/knowledge-graph')).not.toBeNull();
+  });
+
+  test('#4062 review: timeBudgetMs caps the sweep between batches (in-cycle drain stays bounded)', async () => {
+    // 26 stale pages > STALE_BATCH_SIZE (25): the first keyset batch drains
+    // 25, the 0ms budget trips, and the sweep exits with the remainder still
+    // stale — exactly how the cycle's in-line drain nibbles a big backlog
+    // instead of consuming the whole cycle.
+    for (let i = 0; i < 26; i++) {
+      await engine.putPage(`people/budget-${String(i).padStart(2, '0')}`, personPage(`Budget ${i}`));
+    }
+    const r = await extractStaleFromDB(engine, {
+      dryRun: false, jsonMode: true, includeFrontmatter: false, catchUp: false,
+      timeBudgetMs: 0,
+    });
+    expect(r.pagesProcessed).toBe(25);
+    // staleRemaining counts link-stale pages plus mention-due pages (the
+    // mention pass shares the exhausted budget, so all 26 are still due).
+    expect(r.mentions?.remaining).toBe(26);
+    expect(r.staleRemaining).toBe(1 + 26);
+
+    // Default budget (~30 min) finishes the remainder.
+    const r2 = await extractStaleFromDB(engine, {
+      dryRun: false, jsonMode: true, includeFrontmatter: false, catchUp: false,
+    });
+    expect(r2.pagesProcessed).toBe(1);
+    expect(r2.mentions?.remaining).toBe(0);
+    expect(r2.staleRemaining).toBe(0);
   });
 
 });

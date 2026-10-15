@@ -50,7 +50,7 @@ Use the explicit command:
 ```bash
 export GBRAIN_FTS_LANGUAGE=portuguese
 gbrain reindex-search-vector --dry-run    # preview: language + row counts
-gbrain reindex-search-vector --yes        # recreate triggers + backfill
+gbrain reindex-search-vector --yes        # recreate triggers + backfill + rebuild the facts keyword index
 ```
 
 The stamp survives later schema work: `initSchema()` — including the replay
@@ -106,3 +106,45 @@ command runs, or Postgres will reject the trigger recreation with
 - Keep `GBRAIN_FTS_LANGUAGE` set consistently in every environment that
   writes to the brain (CLI shells, MCP server, cron jobs) — a writer without
   the env var tokenizes new rows in `english` until the next reindex.
+- Remote title matching (MCP and other safe-chunks callers) reads the title
+  lexemes stored in `pages.search_vector`, so it follows the language those
+  vectors were built with. After a language change, run
+  `gbrain reindex-search-vector` so remote title search tokenizes like the
+  query.
+- **Interrupted reindex:** the trigger flip commits before the backfill, so a
+  `reindex-search-vector` run killed mid-way (crash, full disk, SIGKILL)
+  leaves new writes in the new language and un-backfilled rows in the old one
+  — keyword search then matches only part of the corpus. The command records
+  an in-progress marker plus a per-batch checkpoint, `gbrain doctor` fails
+  with `fts_reindex_incomplete` until the run completes, and re-running with
+  the same `GBRAIN_FTS_LANGUAGE` resumes from the checkpoint rather than
+  starting over. Budget minutes, not seconds, on brains with 100K+ chunks.
+- **CJK (Chinese / Japanese / Korean):** none of the built-in snowball
+  configurations can tokenize CJK text, so the FTS arm would return nothing
+  for CJK queries. Both engines detect CJK queries and route them to a
+  term-by-term `ILIKE` fallback with term-frequency ranking instead
+  (shared SQL in `src/core/search/cjk-keyword-sql.ts`). The fallback is correct but not
+  index-accelerated: it scans `content_chunks.chunk_text`, so latency grows
+  with corpus size. Note the routing is query-driven: any query containing
+  CJK characters takes the fallback today, even on a Postgres instance with
+  a CJK-aware extension (`pgroonga` / `zhparser`) installed. Wiring a
+  CJK-capable `GBRAIN_FTS_LANGUAGE` config past the fallback is a filed
+  follow-up.
+  <a id="cjk-keyword-budget"></a>In hybrid search the fallback keeps every term required first and, when
+  that finds fewer rows than requested, matches any term, ranking chunks by
+  how many terms they contain and then by term frequency (so `席位 升级`
+  finds pages that mention either word). Results are unchanged whenever the
+  all-terms match already fills the request. Direct keyword reads stay
+  all-terms. The hybrid keyword arm also has one time budget,
+  `search.cjk_keyword_deadline_ms` (integer milliseconds, default 3000,
+  range 500 to 30000; `gbrain config set search.cjk_keyword_deadline_ms
+  5000`). On Postgres the normal scoring gets two thirds of it; if that
+  times out, a capped retry scores at most 2,000 matching chunks (all-terms
+  matches before partial ones) in the remaining third. On PGLite, which
+  cannot interrupt a running query, a brain past 50,000 chunks always uses
+  the capped stage. When the cap or the budget cut the candidates, the search
+  reports the degraded stage `keyword_candidates_incomplete`: an incomplete
+  keyword search is not evidence that the brain has nothing, and the next
+  step is to narrow with `--source-id` (MCP `source_id`) or raise the
+  deadline. The vector arm still runs either way. Ranking quality among the
+  capped candidates has not been measured against relevance judgments.

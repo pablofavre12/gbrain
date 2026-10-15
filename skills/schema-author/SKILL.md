@@ -52,7 +52,7 @@ triggers:
   - "schema sync"
   - "schema author"
 brain_first: exempt
-writes_pages: []
+writes_pages: false
 ---
 
 # schema-author — evolve your schema pack
@@ -93,8 +93,8 @@ DON'T invoke for "where does THIS note go" (use brain-taxonomist) or
 
 ## Tutorial + vision
 
-- **Why this matters:** [`docs/what-schemas-unlock.md`](../../docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings made queryable, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) plus the structural argument for why types matter at query time. Read this before pitching schema authoring to a user — it's the doc that explains the difference between a pile of notes and a brain with structure.
-- **5-minute walkthrough:** [`docs/schema-author-tutorial.md`](../../docs/schema-author-tutorial.md) — fork the bundled pack, add a researcher type, sync, prove the T1.5 wiring via `gbrain whoknows`. Use placeholder pages so it runs against any brain without affecting real content.
+- **Why this matters:** [`docs/what-schemas-unlock.md`](https://github.com/garrytan/gbrain/blob/master/docs/what-schemas-unlock.md) — 7 killer use cases (4000 invisible meetings made queryable, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) plus the structural argument for why types matter at query time. Read this before pitching schema authoring to a user — it's the doc that explains the difference between a pile of notes and a brain with structure.
+- **5-minute walkthrough:** [`docs/schema-author-tutorial.md`](https://github.com/garrytan/gbrain/blob/master/docs/schema-author-tutorial.md) — fork the bundled pack, add a researcher type, sync, prove the T1.5 wiring via `gbrain whoknows`. Use placeholder pages so it runs against any brain without affecting real content.
 
 ## Workflow
 
@@ -177,8 +177,9 @@ Validate before sync:
 gbrain schema lint --with-db
 ```
 
-The `--with-db` flag opts into the 2 DB-aware rules
-(`extractable_empty_corpus`, `mutation_count_anomaly`) that detect
+The `--with-db` flag opts into the 4 DB-aware rules
+(`extractable_empty_corpus`, `mutation_count_anomaly`,
+`stored_type_is_alias`, `stored_type_undeclared`) that detect
 mis-declared types you'd otherwise discover only at runtime.
 
 ### Phase 5 — Sync (backfill existing pages with the new types)
@@ -218,14 +219,21 @@ expert-routed types.)
 
 ### Phase 7 — Commit (preserve the change)
 
-If the pack is in source control, commit:
+If the pack is in source control, commit and push only the pack file:
 
 ```
 cd ~/.gbrain/schema-packs/mine
-git add pack.json
-git commit -m "schema: add researcher + paper types + authored link"
-git push
+gbrain git commit-push -m "schema: add researcher + paper types + authored link" -- pack.json
 ```
+
+It takes the checkout's writer lock and merges a rejected push without
+rebasing, so it is safe when other agents share the checkout. On a non-zero
+exit: retry once on `commit_lock_busy`; on `integrate_conflict` stop and ask
+the user which version of `pack.json` wins; on `git_push_unavailable` the
+remote is unreachable (the commit is saved; rerun with `--push-only` later) or,
+when the pack repo has no remote at all, nothing was committed: commit just the
+pack locally with `git add pack.json && git commit -m "<msg>" -- pack.json`. Never fall back to
+stash, `pull --rebase` or a plain push ([outcomes](https://github.com/garrytan/gbrain/blob/master/docs/guides/shared-checkout-git.md#outcomes)).
 
 If the brain daemon is running (`gbrain serve --http`), other processes
 pick up the change within 1 second (stat-mtime TTL gate in
@@ -248,6 +256,14 @@ loadActivePack — v0.40.6.0 closed the cross-process invalidation gap).
 - **Trust:** CLI = local trust (no scope check). MCP = OAuth `admin` scope (write ops). Audit log captures `actor: mcp:<clientId8>` per mutation.
 - **Atomicity:** every mutation is wrapped in `withMutation`'s atomic write (`.tmp + fsync + rename`) + per-pack `O_CREAT|O_EXCL` lock. Crash mid-write leaves the original file untouched.
 
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Mutation codes: `PACK_READONLY` → fork first (`gbrain schema fork gbrain-base mine`); `STILL_REFERENCED` → remove the named references first; `LOCK_BUSY` → wait about 30 seconds and retry.
+- Over MCP, a mutation returns `insufficient_scope`: schema writes need the `admin` scope, which only the brain host's operator grants; tell the user.
+- The pre-write lint gate rejects a change: read the error, fix the named prefix or alias collision, and re-run; never bypass lint.
+
 ## Anti-Patterns
 
 - **Don't mutate `gbrain-base` or `gbrain-recommended`.** Fork first (`gbrain schema fork gbrain-base mine`). These are bundled packs; edits would be lost on upgrade. The mutation primitives refuse with `PACK_READONLY`.
@@ -264,7 +280,7 @@ When invoked, this skill produces structured output suitable for both human + JS
 
 **Per-mutation result (JSON):**
 ```json
-{"schema_version": 1, "pack": "mine", "path": "/Users/.../pack.json", "format": "json", "prev_sha8": "a1b2c3d4", "new_sha8": "e5f6g7h8"}
+{"schema_version": 1, "pack": "mine", "path": "~/.gbrain/schema-packs/mine/pack.json", "format": "json", "prev_sha8": "a1b2c3d4", "new_sha8": "e5f6g7h8"}
 ```
 
 **Per-batch result (from `schema_apply_mutations` MCP op):**
@@ -287,7 +303,7 @@ When invoked, this skill produces structured output suitable for both human + JS
 - Stats: total pages, typed %, untyped count, per-type breakdown, dead-prefix list
 - Sync: per-prefix `would_apply`/`applied` count + sample slugs in dry-run mode
 
-On failure, the error envelope follows the standard `StructuredAgentError` shape from `src/core/errors.ts`: `{error, code, message, details?}`. Codes from the mutation primitives: `PACK_NOT_FOUND`, `PACK_READONLY`, `PACK_CORRUPT`, `TYPE_EXISTS`, `TYPE_NOT_FOUND`, `INVALID_PRIMITIVE`, `INVALID_RESULT`, `IO_ERROR`, `STILL_REFERENCED`, `LOCK_BUSY`.
+On failure, the error envelope follows the standard `StructuredAgentError` shape: `{error, code, message, details?}`. Codes from the mutation primitives: `PACK_NOT_FOUND`, `PACK_READONLY`, `PACK_CORRUPT`, `TYPE_EXISTS`, `TYPE_NOT_FOUND`, `INVALID_PRIMITIVE`, `INVALID_RESULT`, `IO_ERROR`, `STILL_REFERENCED`, `LOCK_BUSY`.
 
 ## Failure modes
 

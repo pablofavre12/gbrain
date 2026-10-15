@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 import { anthropic } from '../src/core/ai/recipes/anthropic.ts';
+import { FACTS_EXTRACTION_MEASURED_DEFAULTS } from '../src/core/facts/extract.ts';
 
 describe('Anthropic recipe model IDs', () => {
   it('chat models use canonical Anthropic API IDs (no phantom dates)', () => {
@@ -46,6 +47,12 @@ describe('Anthropic recipe model IDs', () => {
     expect(chatModels).toContain('claude-sonnet-5');
   });
 
+  it('Fable 5.1 is chat-only and carries its 1M context window', () => {
+    expect(anthropic.touchpoints?.chat?.models ?? []).toContain('claude-fable-5-1');
+    expect(anthropic.touchpoints?.chat?.model_context_tokens?.['claude-fable-5-1']).toBe(1_000_000);
+    expect(anthropic.touchpoints?.expansion?.models ?? []).not.toContain('claude-fable-5-1');
+  });
+
   it('Sonnet 5 is listed for expansion', () => {
     expect(anthropic.touchpoints?.expansion?.models ?? []).toContain('claude-sonnet-5');
   });
@@ -59,5 +66,9 @@ describe('Anthropic recipe model IDs', () => {
       // No model should contain a date that doesn't exist on the Anthropic API
       expect(m).not.toMatch(/claude-sonnet-4-6-\d{8}/);
     }
+  });
+  it('the measured facts default is a listed chat model (#6335)', () => {
+    const model = FACTS_EXTRACTION_MEASURED_DEFAULTS.anthropic.replace(/^anthropic:/, '');
+    expect(anthropic.touchpoints?.chat?.models ?? []).toContain(model);
   });
 });

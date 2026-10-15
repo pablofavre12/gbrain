@@ -1,23 +1,10 @@
-/**
- * Regression — reconcile_forked_120_121_122 (fork band + 4).
- *
- * The v0.42.59.0 upstream sync added v120/v121/v122 at their upstream numbers.
- * But the fork's migration runner is a scalar high-water-mark
- * (`pending = version > current`, see migrate.ts runMigrations), and every
- * deployed brain is already stamped inside the fork band (schema_version 9003).
- * For such a brain, 120/121/122 are NOT > 9003 → they would be SKIPPED SILENTLY,
- * leaving v0.42.59 CODE running against a schema missing the timeline event FK
- * (v121), the facts ontology dimension (v122), and the search_path/RLS hardening
- * (v120). The reconcile_forked_120_121_122 catch-up (version 9004) exists to heal
- * exactly this: it sits above the band ceiling so it IS pending, and re-applies
- * the same DDL idempotently.
- *
- * This test reproduces the stuck-at-9003 brain and asserts the catch-up restores
- * the three upstream schema objects and advances the bookmark.
- */
+/** Legacy 9003 databases have no independent cursor. Infer 119, replay low
+ * migrations in order, then apply the remaining fork band. */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { LATEST_SCHEMA_VERSION, LATEST_UPSTREAM_SCHEMA_VERSION } from '../src/core/schema-migrations/latest.generated.ts';
+import { UPSTREAM_SCHEMA_KEY } from '../src/core/fork-migration-state.ts';
 import { runMigrations } from '../src/core/migrate.ts';
 
 describe('reconcile_forked_120_121_122 heals a brain stamped inside the fork band', () => {
@@ -46,6 +33,7 @@ describe('reconcile_forked_120_121_122 heals a brain stamped inside the fork ban
       `ALTER FUNCTION public.bump_page_generation_clock_fn() RESET search_path;`,
     );
     await engine.setConfig('version', "9003");
+    await engine.unsetConfig(UPSTREAM_SCHEMA_KEY);
 
     // Sanity: the objects really are gone and the bump fn really is un-pinned.
     const preTimeline = await engine.executeRaw<{ n: number }>(
@@ -61,8 +49,9 @@ describe('reconcile_forked_120_121_122 heals a brain stamped inside the fork ban
 
     // ── Run migrations: all fork entries added after bookmark 9003 are pending.
     const res = await runMigrations(engine);
-    expect(res.applied).toBe(4);
-    expect(res.current).toBe(9007);
+    expect(res.applied).toBeGreaterThan(4);
+    expect(await engine.getConfig(UPSTREAM_SCHEMA_KEY)).toBe(String(LATEST_UPSTREAM_SCHEMA_VERSION));
+    expect(res.current).toBe(LATEST_SCHEMA_VERSION);
 
     // ── v121 restored: timeline_entries.event_page_id + its indexes.
     const postTimeline = await engine.executeRaw<{ n: number }>(

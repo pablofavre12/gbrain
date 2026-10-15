@@ -1,6 +1,11 @@
 import { createHash, randomBytes } from 'crypto';
 import type { Page, PageInput, PageType, Chunk, SearchResult, StalePageRow } from './types.ts';
 import type { Take, TakeKind, TakeHit } from './engine.ts';
+import type { StaleTakeRow } from './takes-row-types.ts';
+// Leaf modules (no imports) — safe here without a cycle. Single source of
+// truth for the hash-ephemeral frontmatter keys shared with the importer.
+import { QUARANTINE_KEY, CONTENT_FLAG_KEY } from './quarantine.ts';
+import { EMBED_SKIP_KEY } from './embed-skip.ts';
 
 /**
  * SHA-256 hash a token/secret for storage. Never store plaintext tokens.
@@ -53,10 +58,89 @@ export function validateSlug(slug: string): string {
 }
 
 /**
+ * The extract_atoms completion marker key. The phase stamps
+ * `substring(content_hash, 1, 16)` under this key when a page has been
+ * mined; eligibility is `frontmatter->>ATOMS_SCAN_HASH_KEY <> substring
+ * (content_hash, 1, 16)`. Owned by the phase (and the trusted local CLI);
+ * untrusted remote writers must not set it (import-file.ts strips it on
+ * `remote === true` so a remote put_page cannot suppress mining).
+ */
+export const ATOMS_SCAN_HASH_KEY = 'atoms_scan_hash';
+
+/**
+ * Frontmatter keys excluded from the content hash. Timestamp-bearing keys
+ * (`captured_at`/`ingested_at`, stamped per capture call) and gate-derived
+ * sanity markers (quarantine / content_flag / embed_skip, re-derived
+ * deterministically on every import) would otherwise churn the hash on
+ * every write and defeat the import skip — full rationale at the CV8/#1699
+ * comment in `src/core/import-file.ts`.
+ */
+export const HASH_EPHEMERAL_FRONTMATTER_KEYS: readonly string[] = [
+  'captured_at',
+  'ingested_at',
+  QUARANTINE_KEY,
+  CONTENT_FLAG_KEY,
+  EMBED_SKIP_KEY,
+  // Same bug class as captured_at (CV8) and the gate markers (#1699):
+  // extract-atoms stamps `atoms_scan_hash` INTO the frontmatter as its
+  // completion marker, and eligibility compares that marker against
+  // substring(content_hash, 1, 16). Without this exclusion, writing the
+  // marker changes the very hash it is compared against, so every scanned
+  // page re-arms on the next export->sync and the LLM extraction re-mines
+  // the same sources into paraphrased near-duplicate atoms forever
+  // (paraphrases defeat content_hash_duplicates). The marker is re-derived
+  // deterministically from the body, so dropping it from the hash is safe.
+  ATOMS_SCAN_HASH_KEY,
+  // #5575 CEO-21: the lower-only `trust_tier` marker a below-owner write-through stamps. It labels the
+  // content, it is not content: page purge tombstones match (source_id, content_hash) with or without it,
+  // and an agent stamping it onto identical content is no content change. (The tier trigger still treats
+  // it as content: trust/schema.ts TRUST_EPHEMERAL_FRONTMATTER_KEYS excludes it.)
+  'trust_tier',
+];
+
+/**
  * SHA-256 hash of page content, used for import idempotency.
- * Hashes all PageInput fields to match importFromContent's hash algorithm.
+ *
+ * #3694: this is now THE canonical formula, byte-identical to the importer's
+ * (`importFromContent`). Pre-fix, this helper (used by both engines' putPage
+ * fallback) hashed a different shape — no ephemeral-key strip, no tags — so
+ * the same logical page got one hash from `putPage` and another from
+ * `gbrain sync`/import, and every putPage→sync roundtrip re-chunked +
+ * re-embedded unchanged content (real, unbounded embedding spend).
+ *
+ * Shape (field order is load-bearing — JSON.stringify serializes insertion
+ * order and the digest is over the bytes):
+ *   { title, type, compiled_truth, timeline||'', frontmatter*, tags* }
+ * where frontmatter* is a copy stripped of HASH_EPHEMERAL_FRONTMATTER_KEYS
+ * and the `tags` key, and tags* is `page.tags ?? frontmatter.tags` sorted
+ * (importer parity: parseMarkdown hoists tags out of frontmatter; putPage
+ * callers usually leave them inside — both now hash identically).
  */
 export function contentHash(page: PageInput): string {
+  const fm: Record<string, unknown> = { ...(page.frontmatter || {}) };
+  for (const k of HASH_EPHEMERAL_FRONTMATTER_KEYS) delete fm[k];
+  const rawTags = page.tags ?? fm.tags;
+  delete fm.tags;
+  const tags = Array.isArray(rawTags) ? rawTags.map(t => String(t)).sort() : [];
+  return createHash('sha256')
+    .update(JSON.stringify({
+      title: page.title,
+      type: page.type,
+      compiled_truth: page.compiled_truth,
+      timeline: page.timeline || '',
+      frontmatter: fm,
+      tags,
+    }))
+    .digest('hex');
+}
+
+/**
+ * The pre-#3694 putPage-side formula (no ephemeral strip, no tags array).
+ * Kept ONLY so the importer can recognize a DB row written by the old
+ * formula whose content is actually unchanged, stamp it with the canonical
+ * hash, and skip the pointless re-chunk/re-embed. Do not use in new code.
+ */
+export function contentHashLegacy(page: PageInput): string {
   return createHash('sha256')
     .update(JSON.stringify({
       title: page.title,
@@ -66,6 +150,23 @@ export function contentHash(page: PageInput): string {
       frontmatter: page.frontmatter || {},
     }))
     .digest('hex');
+}
+
+/**
+ * True when a page body carries no real content (null/undefined/whitespace).
+ *
+ * A routine page edit is a read-modify-write: read the page, change it, put
+ * it back. If the read intermittently returns empty (a store/consistency
+ * hiccup, or a caller that assembled content from a failed read), the "edit"
+ * is applied to nothing and `putPage` persists a blank body OVER real content
+ * — `putPage`'s ON CONFLICT sets `compiled_truth = EXCLUDED.compiled_truth`
+ * unconditionally, so the page is silently destroyed. Observed in production:
+ * a live task/notes page wiped down to just its frontmatter, caught only
+ * because the agent re-read the page and rebuilt it by hand. `isBlankBody`
+ * is the predicate `putPage` uses to refuse that destructive overwrite.
+ */
+export function isBlankBody(body: string | null | undefined): boolean {
+  return body == null || body.trim() === '';
 }
 
 /**
@@ -116,21 +217,6 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const contextualRetrievalMode = row.contextual_retrieval_mode === undefined
     ? undefined
     : (row.contextual_retrieval_mode as Page['contextual_retrieval_mode']);
-  // Author attribution (migration v9002). Three-state read mirrors provenance:
-  // absent SELECT projections compile unchanged (undefined), NULL columns map
-  // to null, populated columns carry the writer identity.
-  const lastWriteClientId = row.last_write_client_id === undefined ? undefined : (row.last_write_client_id as string | null);
-  const lastWriteClientName = row.last_write_client_name === undefined ? undefined : (row.last_write_client_name as string | null);
-  const aclSubjectIds = row.acl_subject_ids === undefined
-    ? undefined
-    : (row.acl_subject_ids as string[] | null);
-  const documentId = row.document_id === undefined ? undefined : (row.document_id as string | null);
-  const documentVersionSequence = row.document_version_sequence === undefined
-    ? undefined
-    : (row.document_version_sequence == null ? null : Number(row.document_version_sequence));
-  const documentVersionHash = row.document_version_hash === undefined
-    ? undefined
-    : (row.document_version_hash as string | null);
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -140,10 +226,15 @@ export function rowToPage(row: Record<string, unknown>): Page {
     timeline: row.timeline as string,
     frontmatter: (typeof row.frontmatter === 'string' ? JSON.parse(row.frontmatter) : row.frontmatter) as Record<string, unknown>,
     content_hash: row.content_hash as string | undefined,
+    ...(row.source_path !== undefined && { source_path: row.source_path as string | null }),
+    ...(row.knowledge_revision != null && { knowledge_revision: String(row.knowledge_revision) }),
+    ...(row.text_projection_revision !== undefined && { text_projection_revision: row.text_projection_revision as string | null }),
     // v0.29 (column added in migration v40). Old brains pre-migration return undefined.
     emotional_weight: row.emotional_weight == null ? undefined : Number(row.emotional_weight),
     created_at: new Date(row.created_at as string),
     updated_at: new Date(row.updated_at as string),
+    // Microsecond-exact ISO, projected by listPages for keyset resumption.
+    ...(row.updated_at_iso !== undefined && { updated_at_iso: String(row.updated_at_iso) }),
     ...(deletedAt !== undefined && { deleted_at: deletedAt }),
     // v0.29.1 (columns added in migration v41). Optional in SELECT projection.
     ...(effectiveDate !== undefined && { effective_date: effectiveDate }),
@@ -157,13 +248,15 @@ export function rowToPage(row: Record<string, unknown>): Page {
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
     ...(contextualRetrievalMode !== undefined && { contextual_retrieval_mode: contextualRetrievalMode }),
-    // Author attribution (migration v9002). Optional in SELECT projection.
-    ...(lastWriteClientId !== undefined && { last_write_client_id: lastWriteClientId }),
-    ...(lastWriteClientName !== undefined && { last_write_client_name: lastWriteClientName }),
-    ...(aclSubjectIds !== undefined && { acl_subject_ids: aclSubjectIds }),
-    ...(documentId !== undefined && { document_id: documentId }),
-    ...(documentVersionSequence !== undefined && { document_version_sequence: documentVersionSequence }),
-    ...(documentVersionHash !== undefined && { document_version_hash: documentVersionHash }),
+    // Three-state like the provenance columns: getPage projects it so the import
+    // skip path can compare before issuing the #4588 source_path refresh.
+    ...(row.source_path !== undefined && { source_path: row.source_path as string | null }),
+    last_write_client_id: row.last_write_client_id as string | null | undefined,
+    last_write_client_name: row.last_write_client_name as string | null | undefined,
+    acl_subject_ids: row.acl_subject_ids as string[] | null | undefined,
+    document_id: row.document_id as string | null | undefined,
+    document_version_sequence: row.document_version_sequence == null ? null : Number(row.document_version_sequence),
+    document_version_hash: row.document_version_hash as string | null | undefined,
     // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
     // can thread it through getChunks / upsertChunks without defaulting to 'default'.
     // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now
@@ -294,6 +387,17 @@ export function isUndefinedTableError(error: unknown): boolean {
   return /relation .* does not exist|no such table|undefined table/i.test(message);
 }
 
+/**
+ * SQLSTATE 22007 / 22008: a date or timestamp the database could not parse.
+ * On a read path that is the caller's input, never a degraded result or a
+ * server fault: list_pages reports it as invalid_params and the hybrid
+ * lexical arms rethrow it instead of failing open.
+ */
+export function isDatetimeInputError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === '22007' || code === '22008';
+}
+
 const _warnedKeys = new Set<string>();
 
 /**
@@ -359,7 +463,46 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     doc_comment: (row.doc_comment as string | null | undefined) ?? null,
     symbol_name_qualified: (row.symbol_name_qualified as string | null | undefined) ?? null,
     modality: (row.modality as 'text' | 'image' | undefined) ?? undefined,
+    // v244: projected UTF-8 span (bigint on Postgres); only when the SELECT carried the column.
+    ...(row.projected_byte_start !== undefined && { projected_byte_start: row.projected_byte_start == null ? null : Number(row.projected_byte_start) }),
+    ...(row.projected_byte_end !== undefined && { projected_byte_end: row.projected_byte_end == null ? null : Number(row.projected_byte_end) }),
+    // Only present when the SELECT included it (getChunks); undefined elsewhere
+    // so callers can tell "not selected" from "vector present".
+    ...(row.embedding_is_null !== undefined && { embedding_is_null: Boolean(row.embedding_is_null) }),
   };
+}
+
+/**
+ * v0.34: effective_date / effective_date_source carried through from the
+ * pages join. Same three-state read as readOptionalDate elsewhere: the
+ * field is left UNTOUCHED when the column isn't in the projection (so
+ * legacy callers see undefined), set to null when the column was selected
+ * but the page row has no date, and to YYYY-MM-DD when populated. Postgres
+ * returns Date objects via postgres.js; PGLite returns strings. Normalize
+ * to date-only ISO so downstream prompt-builders don't see noise from
+ * midnight-UTC timestamps. Shared by search rows and frozen-hit rows.
+ */
+export function applyEffectiveDate(result: SearchResult, row: Record<string, unknown>): void {
+  if ('effective_date' in row) {
+    const raw = row.effective_date;
+    if (raw === null) {
+      result.effective_date = null;
+    } else if (raw instanceof Date) {
+      result.effective_date = raw.toISOString().slice(0, 10);
+    } else if (typeof raw === 'string' && raw) {
+      // Postgres TIMESTAMPTZ already serializes as "YYYY-MM-DD ..." — slice
+      // the date portion. PGLite returns the same shape via its parser.
+      result.effective_date = raw.slice(0, 10);
+    }
+  }
+  if ('effective_date_source' in row) {
+    const raw = row.effective_date_source;
+    if (raw === null) {
+      result.effective_date_source = null;
+    } else if (typeof raw === 'string' && raw) {
+      result.effective_date_source = raw;
+    }
+  }
 }
 
 export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
@@ -382,34 +525,7 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
   if (typeof row.source_id === 'string') {
     result.source_id = row.source_id;
   }
-  // v0.34: effective_date / effective_date_source carried through from the
-  // pages join. Same three-state read as readOptionalDate elsewhere: the
-  // field is left UNTOUCHED when the column isn't in the projection (so
-  // legacy callers see undefined), set to null when the column was selected
-  // but the page row has no date, and to YYYY-MM-DD when populated. Postgres
-  // returns Date objects via postgres.js; PGLite returns strings. Normalize
-  // to date-only ISO so downstream prompt-builders don't see noise from
-  // midnight-UTC timestamps.
-  if ('effective_date' in row) {
-    const raw = row.effective_date;
-    if (raw === null) {
-      result.effective_date = null;
-    } else if (raw instanceof Date) {
-      result.effective_date = raw.toISOString().slice(0, 10);
-    } else if (typeof raw === 'string' && raw) {
-      // Postgres TIMESTAMPTZ already serializes as "YYYY-MM-DD ..." — slice
-      // the date portion. PGLite returns the same shape via its parser.
-      result.effective_date = raw.slice(0, 10);
-    }
-  }
-  if ('effective_date_source' in row) {
-    const raw = row.effective_date_source;
-    if (raw === null) {
-      result.effective_date_source = null;
-    } else if (typeof raw === 'string' && raw) {
-      result.effective_date_source = raw;
-    }
-  }
+  applyEffectiveDate(result, row);
   if (typeof row.message_id === 'string' && row.message_id.trim().length > 0) {
     result.message_id = row.message_id;
   }
@@ -490,4 +606,33 @@ export function takeHitRowToHit(row: Record<string, unknown>): TakeHit {
     weight: Number(row.weight),
     score: Number(row.score),
   };
+}
+
+/**
+ * Convert a stale-take SQL row to the numeric `StaleTakeRow` contract.
+ * Postgres returns BIGINT columns as BigInt/string values, while PGLite may
+ * already return numbers; normalize both engines at their shared boundary.
+ */
+export function staleTakeRowToRow(row: Record<string, unknown>): StaleTakeRow {
+  return {
+    take_id: Number(row.take_id),
+    page_slug: String(row.page_slug ?? ''),
+    row_num: Number(row.row_num),
+    claim: String(row.claim),
+  };
+}
+
+/**
+ * JSON replacer: `bigint` → string, matching the postgres.js wire shape (int8
+ * comes back as a string on the routed path). Lets any op-output serializer
+ * round-trip bigint columns (e.g. a `BIGSERIAL` `id`) instead of throwing
+ * `TypeError: Do not know how to serialize a BigInt`. Shared by cli.ts's
+ * local-result normalizer and the commands that stringify results themselves
+ * (`gbrain call`, the extract explain JSON view) — commands import it from
+ * here, never from the dispatcher. NOTE: no double-dash flag literals in this
+ * comment — the flag-registry generator harvests them from every module a
+ * command transitively imports, and utils.ts is imported by nearly all.
+ */
+export function bigintToStringReplacer(_key: string, value: unknown): unknown {
+  return typeof value === 'bigint' ? value.toString() : value;
 }

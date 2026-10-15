@@ -25,9 +25,11 @@
  * checks, or `kind: 'llm'` if the user wants a real-judge signal.
  */
 
+import { assertLegacySkillFilesystemWrite } from '../skillpack/writer-guard.ts';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { BrainEngine } from '../engine.ts';
+import type { OperationContext } from '../ops/contract.ts';
 import { loadBenchmark } from './benchmark.ts';
 import { D_SEL_MIN_SIZE } from './types.ts';
 import type { BenchmarkTask } from './types.ts';
@@ -80,6 +82,7 @@ export interface CapturedRollout {
 export function appendCapture(skillName: string, runId: string, row: CapturedRollout): void {
   const file = capturePath(skillName, runId);
   try {
+    assertLegacySkillFilesystemWrite(file);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, JSON.stringify(row) + '\n', 'utf8');
   } catch (err) {
@@ -104,12 +107,15 @@ export function loadHeldOut(heldOutPath: string): BenchmarkTask[] {
 }
 
 export interface HeldOutGateOpts {
+  operationContext?: OperationContext;
   engine: BrainEngine;
   candidateSkillText: string;
   baselineSkillText: string;
   heldOutTasks: BenchmarkTask[];
   targetModel: string;
   judgeModel: string;
+  /** #4119 — in-rollout-loop deadline (epoch ms); see ValidateGateOpts. */
+  deadlineMs?: number;
   abortSignal?: AbortSignal;
 }
 
@@ -134,10 +140,12 @@ export async function runHeldOutGate(opts: HeldOutGateOpts): Promise<HeldOutGate
   }
 
   const scoreOpts = {
+    operationContext: opts.operationContext,
     engine: opts.engine,
     tasks: opts.heldOutTasks,
     targetModel: opts.targetModel,
     judgeModel: opts.judgeModel,
+    ...(opts.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}),
     ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
   };
   const baselineScore = await scoreSkillOnTasks({ ...scoreOpts, skillText: opts.baselineSkillText });

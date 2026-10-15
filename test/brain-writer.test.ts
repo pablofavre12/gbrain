@@ -10,6 +10,7 @@ import {
 } from '../src/core/brain-writer.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 const fence = '---';
 
@@ -50,6 +51,21 @@ describe('autoFixFrontmatter', () => {
     const { content, fixes } = autoFixFrontmatter(input);
     expect(content).toBe(input);
     expect(fixes).toEqual([]);
+  });
+
+  // #6157: valid YAML is never rewritten. A folded continuation line that
+  // looks like `Key: "a", then "b"` used to be re-quoted, changing the value.
+  test('leaves a valid folded block scalar byte-identical (#6157)', () => {
+    const input = `${fence}\ntype: concept\ntitle: Interview notes\nclaim: >-\n  The founder said\n  Reply: "Ship it", then "measure it" twice\n${fence}\n\nbody`;
+    const { content, fixes } = autoFixFrontmatter(input);
+    expect(content).toBe(input);
+    expect(fixes).toEqual([]);
+  });
+
+  test('tag normalization never changes a parsed value (#6157)', () => {
+    const input = `${fence}\ntype: person\ntags: ["a\\"b", "yc"]\n${fence}\n\nbody`;
+    const { content } = autoFixFrontmatter(input);
+    expect(content).toBe(input);
   });
 
   test('does not corrupt closed frontmatter with an indented `#` line inside a YAML block scalar', () => {
@@ -234,7 +250,7 @@ describe('scanBrainSources (PGLite)', () => {
   let engine: PGLiteEngine;
 
   // One PGLite per file — beforeEach wipes data only. PGLite cold-start is
-  // ~20s on CI; sharing one engine across 6 tests in this block saves ~2 min.
+  // ~20s on CI; sharing one engine across 7 tests in this block saves ~2 min.
   beforeAll(async () => {
     engine = new PGLiteEngine();
     await engine.connect({});
@@ -291,6 +307,21 @@ describe('scanBrainSources (PGLite)', () => {
     expect(beta.errors_by_code.NESTED_QUOTES).toBeGreaterThanOrEqual(1);
   });
 
+  test('#5988 splits each code into imported-anyway vs held-on-import', async () => {
+    const src = join(tmp, 'mixed');
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, 'quotable.md'), `${fence}\ntype: x\ntitle: a: b\n${fence}\n\nbody`);
+    writeFileSync(join(src, 'folded.md'), `${fence}\ntype: x\ntitle: first\nsecond line\n${fence}\n\nbody`);
+    writeFileSync(join(src, 'slugged.md'), `${fence}\ntype: x\ntitle: ok\nslug: elsewhere/page\n${fence}\n\nbody`);
+    await registerSource('mixed', src);
+
+    const report = await scanBrainSources(engine, { sourceId: 'mixed' });
+    const mixed = report.per_source.find(s => s.source_id === 'mixed')!;
+    expect(mixed.recoverability_by_code?.YAML_PARSE).toEqual({ recoverable: 1, unrecoverable: 1 });
+    expect(mixed.recoverability_by_code?.SLUG_MISMATCH).toEqual({ recoverable: 0, unrecoverable: 1 });
+    expect(report.recoverability_by_code?.YAML_PARSE).toEqual({ recoverable: 1, unrecoverable: 1 });
+  });
+
   test('respects sourceId filter', async () => {
     const srcA = join(tmp, 'a');
     const srcB = join(tmp, 'b');
@@ -328,6 +359,20 @@ describe('scanBrainSources (PGLite)', () => {
     // The walk should complete without infinite-looping; at most one .md
     // entry visited (via the real path, not the symlink).
     expect(report.per_source[0]!.total).toBe(0);
+  });
+
+  test('does not parse multimodal image assets as Markdown frontmatter', async () => {
+    writeFileSync(join(tmp, 'good.md'), `${fence}\ntype: concept\ntitle: ok\n${fence}\n\nbody`);
+    writeFileSync(join(tmp, 'photo.jpg'), Buffer.from([0xff, 0xd8, 0xff, 0x00, 0x01, 0xd9]));
+    await registerSource('multimodal', tmp);
+
+    await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: 'true' }, async () => {
+      const report = await scanBrainSources(engine);
+      const source = report.per_source.find(s => s.source_id === 'multimodal')!;
+      expect(source.total).toBe(0);
+      expect(source.errors_by_code.NULL_BYTES).toBeUndefined();
+      expect(source.files_scanned).toBe(1);
+    });
   });
 
   test('AbortSignal before scan: every source marked skipped (v0.38.2.0 partial-state contract)', async () => {

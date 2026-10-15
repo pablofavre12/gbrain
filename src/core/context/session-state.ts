@@ -53,7 +53,30 @@ export interface SessionContextPatch {
    * bucket). Stored in the surfaced_slugs jsonb column (single-element).
    */
   cursorSlug?: string;
+  /** delta's facts keyset `(created_at, id)` at column precision (omit to leave unchanged). */
+  factsCursor?: { at: string; id: number | null };
+  /** `increment` adds one atomically (returned); `reset` sets 0 (omit to leave unchanged). */
+  degradedWakes?: 'increment' | 'reset';
 }
+
+/** delta's view of a session row: both arm cursors plus the incomplete-wake counter. */
+export interface DeltaSessionState {
+  last_wake_at: string | null;
+  cursor_slug: string | undefined;
+  facts_cursor_at: string | null;
+  facts_cursor_id: number | null;
+  degraded_wakes: number;
+}
+
+/**
+ * delta reads distinguish ABSENT (no row: a first wake) from UNAVAILABLE (the
+ * read failed). Treating a failed read as absence would re-initialize the
+ * session at now and silently drop everything since its checkpoint.
+ */
+export type DeltaSessionRead =
+  | { status: 'absent' }
+  | { status: 'loaded'; state: DeltaSessionState }
+  | { status: 'unavailable'; error: string };
 
 /** 'local' sentinel for the trusted CLI/hook path; the auth client id otherwise. */
 export function resolveClientId(clientId?: string | null): string {
@@ -64,14 +87,6 @@ export function resolveClientId(clientId?: string | null): string {
 
 function normSession(sessionId: string): string {
   return String(sessionId).slice(0, ID_MAX_LEN);
-}
-
-/** Normalize a DB timestamp text to ISO 8601 so downstream cursor comparisons
- * are format-stable (PGLite's ::text cast returns local-tz text, not ISO). */
-function toIso(v: string | null): string | null {
-  if (!v) return null;
-  const t = Date.parse(v);
-  return Number.isFinite(t) ? new Date(t).toISOString() : v;
 }
 
 function toStringArray(v: unknown): string[] {
@@ -100,7 +115,11 @@ export async function getSessionContextState(
       surfaced_slugs: unknown;
       last_wake_at: string | null;
     }>(
-      `SELECT standing_entities, surfaced_slugs, last_wake_at::text AS last_wake_at
+      // ISO UTC at the column's microsecond precision (not ::text — PGLite
+      // renders local-tz text, and a JS Date round-trip would re-round the
+      // keyset cursor to milliseconds, re-delivering same-millisecond pages).
+      `SELECT standing_entities, surfaced_slugs,
+              to_char(last_wake_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS last_wake_at
        FROM session_context_state
        WHERE source_id = $1 AND client_id = $2 AND session_id = $3`,
       [sourceId, resolveClientId(clientId), normSession(sessionId)],
@@ -110,10 +129,49 @@ export async function getSessionContextState(
     return {
       standing_entities: toStringArray(r.standing_entities),
       surfaced_slugs: toStringArray(r.surfaced_slugs),
-      last_wake_at: toIso(r.last_wake_at ?? null),
+      last_wake_at: r.last_wake_at ?? null,
     };
   } catch {
     return null;
+  }
+}
+
+const ISO_US = (col: string) => `to_char(${col} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+
+export async function readDeltaSessionState(
+  engine: BrainEngine,
+  sourceId: string,
+  clientId: string | null | undefined,
+  sessionId: string,
+): Promise<DeltaSessionRead> {
+  try {
+    const rows = await engine.executeRaw<{
+      surfaced_slugs: unknown;
+      last_wake_at: string | null;
+      facts_cursor_at: string | null;
+      facts_cursor_id: string | number | null;
+      degraded_wakes: string | number | null;
+    }>(
+      `SELECT surfaced_slugs, ${ISO_US('last_wake_at')} AS last_wake_at,
+              ${ISO_US('facts_cursor_at')} AS facts_cursor_at, facts_cursor_id, degraded_wakes
+       FROM session_context_state
+       WHERE source_id = $1 AND client_id = $2 AND session_id = $3`,
+      [sourceId, resolveClientId(clientId), normSession(sessionId)],
+    );
+    if (!rows.length) return { status: 'absent' };
+    const r = rows[0];
+    return {
+      status: 'loaded',
+      state: {
+        last_wake_at: r.last_wake_at ?? null,
+        cursor_slug: toStringArray(r.surfaced_slugs)[0],
+        facts_cursor_at: r.facts_cursor_at ?? null,
+        facts_cursor_id: r.facts_cursor_id == null ? null : Number(r.facts_cursor_id),
+        degraded_wakes: Number(r.degraded_wakes ?? 0),
+      },
+    };
+  } catch (e) {
+    return { status: 'unavailable', error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -136,21 +194,30 @@ export async function upsertSessionContextState(
   clientId: string | null | undefined,
   sessionId: string,
   patch: SessionContextPatch,
-): Promise<void> {
+): Promise<{ ok: true; degradedWakes: number } | { ok: false; error: string }> {
   try {
     const replaceStanding = Array.isArray(patch.standingEntities);
     const replaceCursorSlug = typeof patch.cursorSlug === 'string';
-    await engine.executeRaw(
+    const rows = await engine.executeRaw<{ degraded_wakes: string | number }>(
       `INSERT INTO session_context_state
-         (source_id, client_id, session_id, standing_entities, surfaced_slugs, last_wake_at, updated_at)
-       VALUES ($1, $2, $3, $4::text::jsonb, $5::text::jsonb, $6, now())
+         (source_id, client_id, session_id, standing_entities, surfaced_slugs, last_wake_at,
+          facts_cursor_at, facts_cursor_id, degraded_wakes, updated_at)
+       VALUES ($1, $2, $3, $4::text::jsonb, $5::text::jsonb, $6::text::timestamptz, $9::text::timestamptz, $10::bigint,
+               CASE WHEN $11::text = 'increment' THEN 1 ELSE 0 END, now())
        ON CONFLICT (source_id, client_id, session_id) DO UPDATE SET
          standing_entities = CASE WHEN $7::boolean THEN EXCLUDED.standing_entities
                                   ELSE session_context_state.standing_entities END,
          surfaced_slugs    = CASE WHEN $8::boolean THEN EXCLUDED.surfaced_slugs
                                   ELSE session_context_state.surfaced_slugs END,
          last_wake_at      = COALESCE(EXCLUDED.last_wake_at, session_context_state.last_wake_at),
-         updated_at        = now()`,
+         facts_cursor_at   = COALESCE(EXCLUDED.facts_cursor_at, session_context_state.facts_cursor_at),
+         facts_cursor_id   = CASE WHEN EXCLUDED.facts_cursor_at IS NULL THEN session_context_state.facts_cursor_id
+                                  ELSE EXCLUDED.facts_cursor_id END,
+         degraded_wakes    = CASE $11::text WHEN 'increment' THEN session_context_state.degraded_wakes + 1
+                                            WHEN 'reset' THEN 0
+                                            ELSE session_context_state.degraded_wakes END,
+         updated_at        = now()
+       RETURNING degraded_wakes`,
       [
         sourceId,
         resolveClientId(clientId),
@@ -160,10 +227,144 @@ export async function upsertSessionContextState(
         patch.lastWakeAt ?? null,
         replaceStanding,
         replaceCursorSlug,
+        patch.factsCursor?.at ?? null,
+        patch.factsCursor ? patch.factsCursor.id : null,
+        patch.degradedWakes ?? 'keep',
       ],
     );
+    return { ok: true, degradedWakes: Number(rows[0]?.degraded_wakes ?? 0) };
+  } catch (e) {
+    /* fail-open: a state-write failure never blocks the read path; delta surfaces it as `session_state` */
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * One brain-link banked by the compaction-boundary harvest (Cathedral 5).
+ * `seg` is the content hash of the harvested corpus segment — the completion
+ * key the OpenClaw assemble poll matches on (a stale non-empty manifest can't
+ * satisfy a poll for a specific checkpoint). `n` is the ledger ordinal of the
+ * checkpoint that banked the link (metadata only, never a filename component).
+ */
+export interface CheckpointLink {
+  slug: string;
+  title: string;
+  /** ISO timestamp the link was banked. */
+  at: string;
+  n: number;
+  seg: string;
+}
+
+/** Manifest cap: newest-first, dedup-by-slug on append. */
+export const CHECKPOINT_MANIFEST_CAP = 20;
+
+function toCheckpointLinks(v: unknown): CheckpointLink[] {
+  let arr: unknown = v;
+  if (typeof arr === 'string') {
+    try {
+      arr = JSON.parse(arr);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(arr)) return [];
+  return arr.filter(
+    (x): x is CheckpointLink =>
+      !!x &&
+      typeof x === 'object' &&
+      typeof (x as CheckpointLink).slug === 'string' &&
+      typeof (x as CheckpointLink).title === 'string' &&
+      typeof (x as CheckpointLink).at === 'string' &&
+      typeof (x as CheckpointLink).n === 'number' &&
+      typeof (x as CheckpointLink).seg === 'string',
+  );
+}
+
+/**
+ * Read the session's checkpoint manifest. Distinguishes a CONFIRMED answer
+ * from a failed read (adversarial review): `[]` means the row/manifest is
+ * genuinely absent or empty; `null` means the read errored (engine down,
+ * pre-v132 schema). Callers on the render path treat null as [] (fail-open);
+ * `appendCheckpointManifest` treats null as abort (a merge seeded from a
+ * failed read would overwrite-truncate the standing manifest), and the
+ * assemble poll only SETTLES on a confirmed answer.
+ */
+export async function getCheckpointManifest(
+  engine: BrainEngine,
+  sourceId: string,
+  clientId: string | null | undefined,
+  sessionId: string,
+): Promise<CheckpointLink[] | null> {
+  try {
+    const rows = await engine.executeRaw<{ checkpoint_manifest: unknown }>(
+      `SELECT checkpoint_manifest
+       FROM session_context_state
+       WHERE source_id = $1 AND client_id = $2 AND session_id = $3`,
+      [sourceId, resolveClientId(clientId), normSession(sessionId)],
+    );
+    if (!rows.length) return [];
+    return toCheckpointLinks(rows[0].checkpoint_manifest);
   } catch {
-    /* fail-open: a state-write failure must never block the recall read path */
+    return null;
+  }
+}
+
+/**
+ * Append checkpoint links to the manifest: newest-first, dedup-by-slug (an
+ * existing slug's entry is refreshed and moved to the front), capped at
+ * CHECKPOINT_MANIFEST_CAP. Read-modify-write is safe in practice — the serve
+ * harvest FIFO is single-in-flight and the OpenClaw rung-3 writer only runs
+ * when serve is unreachable; a benign race loses at most one append (the
+ * manifest is an optimization like the rest of this table). jsonb binds via
+ * `$N::text::jsonb`.
+ *
+ * Returns true only on a CONFIRMED publish (adversarial review): a failed
+ * READ aborts without writing — merging into `[]` from a transient read error
+ * would overwrite-truncate up to CAP−1 standing links — and a failed write
+ * returns false so the harvest keeps its receipt (and skips `.ingested`)
+ * instead of deleting the only durable copy of the links. Never throws.
+ */
+export async function appendCheckpointManifest(
+  engine: BrainEngine,
+  sourceId: string,
+  clientId: string | null | undefined,
+  sessionId: string,
+  links: Array<{ slug: string; title: string }>,
+  meta: { seg: string; n: number; at?: string },
+): Promise<boolean> {
+  if (!links.length) return true;
+  try {
+    const existing = await getCheckpointManifest(engine, sourceId, clientId, sessionId);
+    if (existing === null) return false;
+    const at = meta.at ?? new Date().toISOString();
+    const fresh: CheckpointLink[] = links.map((l) => ({
+      slug: l.slug.slice(0, ID_MAX_LEN),
+      // Collapse whitespace: titles render as single lines in the pack /
+      // assemble block — an embedded newline from ingested content must not
+      // inject extra lines into model context.
+      title: l.title.replace(/\s+/g, ' ').trim().slice(0, 300),
+      at,
+      n: meta.n,
+      seg: meta.seg.slice(0, ID_MAX_LEN),
+    }));
+    const freshSlugs = new Set(fresh.map((l) => l.slug));
+    const merged = [...fresh, ...existing.filter((l) => !freshSlugs.has(l.slug))].slice(
+      0,
+      CHECKPOINT_MANIFEST_CAP,
+    );
+    await engine.executeRaw(
+      `INSERT INTO session_context_state
+         (source_id, client_id, session_id, checkpoint_manifest, updated_at)
+       VALUES ($1, $2, $3, $4::text::jsonb, now())
+       ON CONFLICT (source_id, client_id, session_id) DO UPDATE SET
+         checkpoint_manifest = EXCLUDED.checkpoint_manifest,
+         updated_at          = now()`,
+      [sourceId, resolveClientId(clientId), normSession(sessionId), JSON.stringify(merged)],
+    );
+    return true;
+  } catch {
+    /* fail-open: a manifest-write failure must never THROW into the harvest */
+    return false;
   }
 }
 

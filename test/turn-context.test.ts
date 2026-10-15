@@ -7,9 +7,15 @@
  * in the module under test).
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import {
+  resetGateway,
+  __setChatTransportForTests,
+  __setEmbedTransportForTests,
+} from '../src/core/ai/gateway.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   assembleTurnContext,
+  assembleDeltaContext,
   TURN_CONTEXT_ENVELOPE,
   TURN_CONTEXT_DEFAULT_MAX_BYTES,
 } from '../src/core/context/turn-context.ts';
@@ -33,6 +39,15 @@ import {
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
+  // This file's corpus writes fire embed attempts iff the module-global
+  // gateway looks configured AND keyed. A shard-mate can leave it configured
+  // with a fake test key — the preload's beforeEach only restores when the
+  // gateway is UNCONFIGURED, so that state persists and put_page 401s against
+  // real OpenAI (the shard-8 flake). Reset back to the preload baseline
+  // (real process.env → keyless degrade on CI) regardless of shard-mates.
+  resetGateway();
+  __setChatTransportForTests(null);
+  __setEmbedTransportForTests(null);
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -202,6 +217,35 @@ describe('assembleTurnContext', () => {
     expect(r.text.startsWith(TURN_CONTEXT_ENVELOPE)).toBe(true);
   });
 
+  test('hot facts already injected this session are not re-injected', async () => {
+    // Every prompt used to repeat the whole digest; the repeats stay in the
+    // transcript and are re-read on every later turn.
+    await seedFact('WORLD-FACT standup moved to 9am', 'world');
+    await seedFact('WORLD-FACT deploy freeze on friday', 'world');
+    const first = await assembleTurnContext(engine, { sourceId: 'default', window: [] });
+    expect(first.factsCount).toBe(2);
+
+    __resetHotMemoryCacheForTests();
+    await seedFact('WORLD-FACT new office opens in june', 'world');
+    const next = await assembleTurnContext(engine, {
+      sourceId: 'default',
+      window: [{ role: 'user', text: 'no entities here, just vibes' }],
+      priorContextText: first.text,
+    });
+    expect(next.factsCount).toBe(1);
+    expect(next.text).toContain('WORLD-FACT new office opens in june');
+    expect(next.text).not.toContain('standup moved to 9am');
+    expect(next.text).not.toContain('deploy freeze on friday');
+  });
+
+  test('a changed confidence score does not make an injected fact new again', async () => {
+    await seedFact('WORLD-FACT standup moved to 9am', 'world');
+    const prior = `${TURN_CONTEXT_ENVELOPE}\n\n## Hot memory (recent facts)\n- WORLD-FACT standup moved to 9am [people/alice-example] (0.42)`;
+    const r = await assembleTurnContext(engine, { sourceId: 'default', window: [], priorContextText: prior });
+    expect(r.factsCount).toBe(0);
+    expect(r.text).toBe('');
+  });
+
   test('nothing to inject → empty text, zero counts, no degradation', async () => {
     const r = await assembleTurnContext(engine, {
       sourceId: 'default',
@@ -214,14 +258,69 @@ describe('assembleTurnContext', () => {
   });
 });
 
+describe('assembleDeltaContext read failures', () => {
+  test('a failed pages arm is reported while healthy facts are returned', async () => {
+    await seedFact('WORLD-FACT remains available', 'world');
+    const partialEngine = {
+      listPages: async () => { throw new Error('private storage detail'); },
+      listFactsKeyset: (...args: Parameters<BrainEngine['listFactsKeyset']>) => engine.listFactsKeyset(...args),
+    } as unknown as BrainEngine;
+
+    const result = await assembleDeltaContext(partialEngine, {
+      sourceId: 'default',
+      since: new Date(0).toISOString(),
+    });
+
+    expect(result.deltaPages).toEqual([]);
+    expect(result.facts?.map((fact) => fact.fact)).toContain('WORLD-FACT remains available');
+    expect(result.degradedReason).toBe('pages');
+    expect(result.degradedReason).not.toContain('private storage detail');
+  });
+
+  test('a failed facts arm is reported while healthy pages are returned', async () => {
+    await seedPage('notes/delta-readable', 'Readable page', 'A changed page.');
+    const partialEngine = {
+      listPages: (...args: Parameters<BrainEngine['listPages']>) => engine.listPages(...args),
+      listFactsKeyset: async () => { throw new Error('private storage detail'); },
+    } as unknown as BrainEngine;
+
+    const result = await assembleDeltaContext(partialEngine, {
+      sourceId: 'default',
+      since: new Date(0).toISOString(),
+    });
+
+    expect(result.deltaPages?.map((page) => page.slug)).toContain('notes/delta-readable');
+    expect(result.facts).toEqual([]);
+    expect(result.degradedReason).toBe('facts');
+    expect(result.degradedReason).not.toContain('private storage detail');
+  });
+
+  test('both failed read arms are reported together as a degraded empty result', async () => {
+    const partialEngine = {
+      listPages: async () => { throw new Error('private page detail'); },
+      listFactsKeyset: async () => { throw new Error('private fact detail'); },
+    } as unknown as BrainEngine;
+
+    const result = await assembleDeltaContext(partialEngine, {
+      sourceId: 'default',
+      since: new Date(0).toISOString(),
+    });
+
+    expect(result.deltaPages).toEqual([]);
+    expect(result.facts).toEqual([]);
+    expect(result.degradedReason).toBe('pages,facts');
+    expect(result.degradedReason).not.toContain('private');
+  });
+});
+
 describe('session cache isolation [CX2-11]', () => {
-  function metaCtx(sessionId?: string): OperationContext {
+  function metaCtx(sessionId?: string, remote = true): OperationContext {
     return {
       engine,
       config: {} as GBrainConfig,
       logger: { info: () => {}, warn: () => {}, error: () => {} },
       dryRun: false,
-      remote: true,
+      remote,
       sourceId: 'default',
       sessionId,
       takesHoldersAllowList: ['world'],
@@ -244,29 +343,37 @@ describe('session cache isolation [CX2-11]', () => {
     expect((b!.brain_hot_memory as { session_id: string }).session_id).toBe('sess-b');
   });
 
-  test('cache entries are per-session: bumping one session leaves the other cached', async () => {
+  test('trusted local cache entries are per-session: bumping one session leaves the other cached', async () => {
     await seedFact('SESSION-A-FACT original', 'world', { session: 'sess-a' });
     await seedFact('SESSION-B-FACT original', 'world', { session: 'sess-b' });
 
     // Prime both cache entries.
-    await getBrainHotMemoryMeta('get_stats', metaCtx('sess-a'));
-    await getBrainHotMemoryMeta('get_stats', metaCtx('sess-b'));
+    await getBrainHotMemoryMeta('get_stats', metaCtx('sess-a', false));
+    await getBrainHotMemoryMeta('get_stats', metaCtx('sess-b', false));
 
     // New session-A fact is invisible until session A's entry is bumped.
     await seedFact('SESSION-A-FACT fresher', 'world', { session: 'sess-a' });
-    const cachedA = await getBrainHotMemoryMeta('get_stats', metaCtx('sess-a'));
+    const cachedA = await getBrainHotMemoryMeta('get_stats', metaCtx('sess-a', false));
     const cachedAFacts = (cachedA!.brain_hot_memory as { facts: Array<{ fact: string }> }).facts.map((f) => f.fact);
     expect(cachedAFacts).not.toContain('SESSION-A-FACT fresher'); // still cached
 
     bumpHotMemoryCache('default', 'sess-a');
-    const freshA = await getBrainHotMemoryMeta('get_stats', metaCtx('sess-a'));
+    const freshA = await getBrainHotMemoryMeta('get_stats', metaCtx('sess-a', false));
     const freshAFacts = (freshA!.brain_hot_memory as { facts: Array<{ fact: string }> }).facts.map((f) => f.fact);
     expect(freshAFacts).toContain('SESSION-A-FACT fresher');
 
     // Session B's cached entry was untouched by the session-A bump.
-    const stillB = await getBrainHotMemoryMeta('get_stats', metaCtx('sess-b'));
+    const stillB = await getBrainHotMemoryMeta('get_stats', metaCtx('sess-b', false));
     const stillBFacts = (stillB!.brain_hot_memory as { facts: Array<{ fact: string }> }).facts.map((f) => f.fact);
     expect(stillBFacts).toEqual(['SESSION-B-FACT original']);
+  });
+  test('remote hot memory rebuilds on each read so live page ACL revocation takes effect', async () => {
+    await seedPage('people/alice-example', 'Alice Example', 'Public until revoked.');
+    await seedFact('SESSION-A-FACT initially public', 'world', { session: 'sess-a' });
+    const ctx = metaCtx('sess-a');
+    expect(JSON.stringify(await getBrainHotMemoryMeta('get_stats', ctx))).toContain('initially public');
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:alice'] WHERE source_id='default' AND slug='people/alice-example'");
+    expect(JSON.stringify(await getBrainHotMemoryMeta('get_stats', ctx)) ?? '').not.toContain('initially public');
   });
 });
 

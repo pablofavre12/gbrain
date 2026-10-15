@@ -28,6 +28,8 @@ import { serializeMarkdown } from '../core/markdown.ts';
 import { importFromContent } from '../core/import-file.ts';
 import { writePageThrough, type WriteThroughResult } from '../core/write-through.ts';
 import { randomBytes } from 'crypto';
+import { legacyNestedErrorDocument } from '../core/agent-output.ts';
+import { CapFlagError, mergeCapFlag, parseCapFlag, type CapFlag } from '../core/budget/cap-flag.ts';
 
 export interface BrainstormCliArgs {
   question?: string;
@@ -35,8 +37,10 @@ export interface BrainstormCliArgs {
   save?: boolean;
   yes: boolean;
   limit?: number;
-  /** Cost ceiling in USD; aborts pre-run if estimate exceeds. Default $5. */
-  maxCost?: number;
+  /** Cost ceiling in USD (`--max-usd`, legacy `--max-cost`); null = off; undefined = the $5 default. */
+  maxCost?: number | null;
+  /** The cap flag spelling the user typed. */
+  maxCostFlag?: string;
   /** Hard cap on far-set prefix sampling. Default 50. */
   maxFarSet?: number;
   /** When true, abort mid-run if running spend exceeds 5× estimate. */
@@ -58,6 +62,7 @@ export interface BrainstormCliArgs {
 export function parseBrainstormArgs(args: string[]): BrainstormCliArgs {
   const out: BrainstormCliArgs = { json: false, yes: false, help: false };
   const positional: string[] = [];
+  let cap: CapFlag | undefined;
   let i = 0;
   while (i < args.length) {
     const arg = args[i];
@@ -79,14 +84,16 @@ export function parseBrainstormArgs(args: string[]): BrainstormCliArgs {
         return out;
       }
       out.limit = n;
-    } else if (arg === '--max-cost') {
-      const v = args[++i];
-      const n = v ? parseFloat(v) : NaN;
-      if (!Number.isFinite(n) || n <= 0) {
-        out.error = `--max-cost requires a positive number in USD (got ${v})`;
+    } else if (arg === '--max-usd' || arg === '--max-cost') {
+      try {
+        cap = mergeCapFlag(cap, parseCapFlag(arg, args[++i]));
+      } catch (err) {
+        if (!(err instanceof CapFlagError)) throw err;
+        out.error = err.message;
         return out;
       }
-      out.maxCost = n;
+      out.maxCost = cap.usd;
+      out.maxCostFlag = cap.flag;
     } else if (arg === '--max-far-set') {
       const v = args[++i];
       const n = v ? parseInt(v, 10) : NaN;
@@ -150,7 +157,11 @@ Options:
   --no-save                       Don't save; print only
   --yes, -y                       Skip the 10s cost-preview wait (TTY only)
   --limit N                       Override the far-bank size (default 6 brainstorm / 12 LSD)
-  --max-cost USD                  Abort if estimated cost exceeds USD (default 5)
+  --max-usd USD|off               Abort if estimated cost exceeds USD (default 5;
+                                  --max-cost is the legacy spelling). off runs
+                                  uncapped. A model with no price runs under the
+                                  default with a warning; an explicit cap refuses
+                                  it until you register its rate (gbrain pricing set)
   --max-far-set N                 Cap domain bank prefix sampling (default 50)
   --strict-budget                 Abort if running cost exceeds 5× the estimate
   --judge-model MODEL             Override the judge LLM (larger-context for big runs)
@@ -185,7 +196,11 @@ Options:
   --save                          Persist to wiki/ideas/<date>-lsd-<slug>.md (default OFF)
   --yes, -y                       Skip the 10s cost-preview wait (TTY only)
   --limit N                       Override the far-bank size (default 12)
-  --max-cost USD                  Abort if estimated cost exceeds USD (default 5)
+  --max-usd USD|off               Abort if estimated cost exceeds USD (default 5;
+                                  --max-cost is the legacy spelling). off runs
+                                  uncapped. A model with no price runs under the
+                                  default with a warning; an explicit cap refuses
+                                  it until you register its rate (gbrain pricing set)
   --max-far-set N                 Cap domain bank prefix sampling (default 50)
   --strict-budget                 Abort if running cost exceeds 5× the estimate
   --judge-model MODEL             Override the judge LLM (larger-context for big runs)
@@ -264,14 +279,24 @@ async function runBrainstormCli(
   // catch. Without this CLI formatter, the typed error reaches main()'s
   // generic catch which prints `e.message` only — losing the structured
   // `.hint` field that's the whole point of the orchestrator-level wrap.
+  // Save policy: brainstorm defaults to save-on; lsd defaults to save-off.
+  // CLI --save / --no-save overrides the default. The slug is minted BEFORE
+  // the run so the orchestrator can bank it in the checkpoint: a `--resume`
+  // after a judge failure then hands back the slug the failed run saved
+  // under, and the re-scored page overwrites it instead of forking a second
+  // page under a fresh nonce.
+  const shouldSave = parsed.save ?? profile.default_save;
+  const freshSlug = buildIdeaSlug(parsed.question, profile.label);
   let result;
   try {
     result = await runBrainstorm(engine, config, {
       question: parsed.question,
       profile: effectiveProfile,
       skipCostPreview: skipPreview,
+      ideaSlug: shouldSave ? freshSlug : undefined,
       // v0.39.0.0 T10 cost-cap surface — wired in master, preserved here.
       maxCostUsd: parsed.maxCost,
+      maxCostFlag: parsed.maxCostFlag,
       maxFarSet: parsed.maxFarSet,
       strictBudget: parsed.strictBudget,
       judgeModel: parsed.judgeModel,
@@ -284,7 +309,7 @@ async function runBrainstormCli(
       if (parsed.json) {
         // Agents reading --json get the structured envelope (matches
         // serializeError shape from src/core/errors.ts).
-        console.log(JSON.stringify({ error: err.envelope }, null, 2));
+        console.log(JSON.stringify(legacyNestedErrorDocument(err.envelope), null, 2));
       } else {
         console.error(`Error [${err.envelope.code}]: ${err.envelope.message}`);
         if (err.envelope.hint) console.error(`  Hint: ${err.envelope.hint}`);
@@ -305,16 +330,13 @@ async function runBrainstormCli(
   const md = formatBrainstormMarkdown(result, { onlyPassed: true, includeMeta: true });
   console.log(md);
 
-  // Save policy: brainstorm defaults to save-on; lsd defaults to save-off.
-  // CLI --save / --no-save overrides the default.
-  const shouldSave = parsed.save ?? profile.default_save;
   if (shouldSave) {
-    const slug = buildIdeaSlug(parsed.question, profile.label);
+    const slug = result.idea_slug ?? freshSlug;
     const title = `${profile.label === 'lsd' ? 'LSD' : 'Brainstorm'}: ${parsed.question.slice(0, 100)}`;
     // Build ONE frontmatter object and render via the canonical serializer so
     // the saved file round-trips through `gbrain sync` byte-for-byte. Include
-    // filtered ideas (onlyPassed:false) so a future --retry-judge has the full
-    // set to re-score.
+    // filtered ideas (onlyPassed:false) so a judge-failed run still shows every
+    // idea; `--resume <run_id>` re-scores and overwrites this same page.
     const fmObj = buildBrainstormFrontmatterObject(result);
     const body = formatBrainstormMarkdown(result, { onlyPassed: false, includeMeta: true });
     const content = serializeMarkdown(fmObj, body, '', { type: 'note', title, tags: [] });

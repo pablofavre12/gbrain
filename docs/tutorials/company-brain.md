@@ -1,13 +1,23 @@
 # Tutorial: Extend your personal brain into a company brain
 
+Already have a company Markdown repository and only want to index it? Start with
+[connecting an existing company brain](../guides/company-brain-ingestion.md).
+That local workflow offers an offline demo, read-only inspection, and a verified
+import into a separate initialized company brain without requiring the hosted
+team deployment described below. Its source policy keeps sync keyless and
+writeback-free; the personal-brain reuse and automatic enrichment steps in this
+tutorial are a different workflow, not follow-up steps for that import.
+
 This tutorial picks up where the [personal brain tutorial](personal-brain.md) leaves off. You already have a working agent (OpenClaw on Render, talking to you on Telegram, with GBrain as memory and Supabase storing embeddings). Now you want your whole team to use it as shared institutional memory, with each person seeing only what they're allowed to see.
 
 **Time:** about 90 more minutes on top of the personal-brain install.
 **Cost:** under $100 a month sustained for a 25-person company.
 
+> **Want a team brain without operating one?** [gbrain.io](https://gbrain.io/?ref=company-brain) is hosted GBrain built for exactly this: one brain the whole team prompts together, accounts connected once with a permission level for each AI, and pricing per workspace rather than per person. Keep reading to deploy and run it yourself.
+
 If you haven't done the personal-brain install yet, [start there first](personal-brain.md). Come back when you've got the agent responding to you on Telegram. This tutorial assumes that's already working.
 
-I'm Garry Tan. I built GBrain to run my own AI agents at Y Combinator. After a couple of months of multi-user features landing (parallel sync across team sources, per-user OAuth scoping, leak-free isolation across every read path), it's finally usable as a company brain too. This is the recipe I'd run if I were standing it up for a 10-50 person company today.
+I'm Garry Tan. I built GBrain to run my own AI agents at Y Combinator. It runs as a company brain too: parallel sync across team sources, per-user OAuth scoping, leak-free isolation across every read path. This is the recipe I'd run if I were standing it up for a 10-50 person company today.
 
 ---
 
@@ -40,13 +50,21 @@ It is also **not** a thin-client-everywhere setup. Your personal agent stays as 
 
 The personal-brain install uses Supabase as the embeddings layer but the GBrain runtime itself might be using PGLite (single-machine) depending on which path you took. For a company brain, you want a real Postgres for the runtime too. If your personal-brain install is already on Postgres or Supabase end-to-end, skip to Part 3.
 
-If you're on PGLite, migrate:
+If you're on PGLite, move the brain. Run from the agent host machine, same one you set up in the personal-brain tutorial, with the Supabase transaction-pooler URL in `GBRAIN_TARGET_URL`:
 
 ```bash
-gbrain migrate --to supabase
+gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --json
 ```
 
-This copies every page, chunk, embedding, link, and config over to your Supabase project. Run from the agent host machine, same one you set up in the personal-brain tutorial. Takes a few minutes per 10K pages.
+That prints the plan (what moves, what stays on this machine, estimated time) and exits 3 without changing anything. After you agree, run the command it prints:
+
+```bash
+gbrain migrate --to postgres --url-env GBRAIN_TARGET_URL --yes --expect <plan_hash>
+```
+
+Every page, fact, take, version, embedding, link, token and OAuth client moves with its history, and the run verifies every table before switching over. It ends with the target's `gbrain doctor` result. Full walkthrough and recovery: [Move a PGLite brain to Postgres](../guides/move-to-postgres.md).
+
+**Say to your agent:** *"Move my brain to Supabase so the team can share it. Show me the plan first."*
 
 Verify:
 
@@ -93,7 +111,7 @@ There are two ways to scope teammates' access. They suit different deployment sh
 
 **Model A: separate sources with OAuth scoping (recommended for true multi-user with different AI clients).** What this tutorial walks you through. Each teammate gets their own OAuth client, which carries `--source` + `--federated-read` flags. The brain refuses cross-source reads at the SQL layer; isolation is database-enforced. Each teammate can run their own MCP-aware client (Claude Code, Cursor, their own OpenClaw, etc.) and the scoping holds.
 
-**Model B: one source, directory-based per-person scoping (simpler for one-agent-serves-everyone setups).** The shape I actually run in production: a single source called `default`, with a `partners/<slug>/` convention inside it (e.g. `partners/alice-example/`, `partners/bob-example/`). Each partner gets their own subdirectory holding their personal pages: `partners/alice-example/USER.md`, `partners/alice-example/concepts/`, `partners/alice-example/sources/`, etc. This is the right model when ONE agent (yours) serves everyone over Telegram or a single shared interface. It's simpler ops, no per-user OAuth. **Write scoping within the shared source can be server-enforced:** register each per-person client with `--bound-slug-prefixes partners/alice-example/` and every slug-mutating write outside that prefix is rejected with `permission_denied` (v0.42.72.0+). Without the binding, the scoping is convention-only (the agent polices itself). Read scoping stays source-granular in both models — within a shared source, everyone entitled to the source can read every folder.
+**Model B: one source, directory-based per-person scoping (simpler for one-agent-serves-everyone setups).** The shape I actually run in production: a single source called `default`, with a `partners/<slug>/` convention inside it (e.g. `partners/alice-example/`, `partners/bob-example/`). Each partner gets their own subdirectory holding their personal pages: `partners/alice-example/USER.md`, `partners/alice-example/concepts/`, `partners/alice-example/sources/`, etc. This is the right model when ONE agent (yours) serves everyone over Telegram or a single shared interface. It's simpler ops, no per-user OAuth. **Write scoping within the shared source can be server-enforced:** register each per-person client with `--bound-slug-prefixes partners/alice-example/` and every slug-mutating write outside that prefix is rejected with `permission_denied`. Without the binding, the scoping is convention-only (the agent polices itself). Read scoping stays source-granular in both models — within a shared source, everyone entitled to the source can read every folder.
 
 For most company-brain installs (10+ teammates each with their own AI client), Model A is the right starting point. If you're running the fat-agent-serves-everyone pattern from the personal-brain tutorial, Model B is genuinely simpler. You can also mix: separate sources for the obviously-different ones (customer notes vs internal-only) AND a `partners/<slug>/` convention inside the shared source for per-person workspace.
 
@@ -166,6 +184,8 @@ For development, tunnel the local server out via ngrok:
 ngrok http 3131 --domain your-brain.ngrok.app
 ```
 
+If the brain runs on your own computer rather than a server, `gbrain mcp expose` publishes it over HTTPS on your Tailscale tailnet (`--funnel` for agents that run in a vendor's cloud), keeps it running as a user service, and needs no `--bind 0.0.0.0`; see [use your brain from anywhere over MCP](../guides/remote-mcp.md).
+
 For production, put your server behind a real hostname with a real TLS certificate. Let's call your final URL `https://brain.acme-co.com` for the rest of this tutorial.
 
 Re-run the server with the public URL so the OAuth discovery metadata matches what clients hit:
@@ -210,7 +230,7 @@ Each `register-client` command prints a `client_id` and a `client_secret`. Save 
 A note on the flags:
 
 - `--scopes "read write"` (space-separated, quoted — the OAuth wire format; a comma-separated list is rejected at registration) lets the client query the brain and write new pages. You can omit `write` for read-only clients (executive summaries, dashboards). The `admin` scope is needed for operational commands like `gbrain remote doctor` and is usually reserved for your own admin client.
-- `--source` controls write authority. A client can only write to one source. Within that source, your folder convention from Part 3 keeps each person's writes in their own subfolder — and you can make that server-enforced with `--bound-slug-prefixes alice-example/` (v0.42.72.0+): every slug-mutating write op (put_page, delete_page, tags, links, timeline, revert, raw data) outside the bound prefixes is rejected with `permission_denied`. Update the binding later with `gbrain auth rescope-client <id> --bound-slug-prefixes <p1,p2|none>`. **Adding a binding to an existing client narrows it in ways you should expect:** ops that write by something other than a slug (`extract_entities`, `extract_facts`, `forget_fact`, `ontology_propose`, `sources_add`/`sources_remove`) and `POST /ingest` become unavailable to that client, and `put_page`'s automatic fact extraction is skipped — all because none of them can be confined to a prefix. Reads are unaffected. See [the qm-harness guide](../integrations/qm-harness.md) for the full model.
+- `--source` controls write authority. A client can only write to one source. Within that source, your folder convention from Part 3 keeps each person's writes in their own subfolder — and you can make that server-enforced with `--bound-slug-prefixes alice-example/`: every slug-mutating write op (put_page, delete_page, tags, links, timeline, revert, raw data) outside the bound prefixes is rejected with `permission_denied`. Update the binding later with `gbrain auth rescope-client <id> --bound-slug-prefixes <p1,p2|none>`. **Adding a binding to an existing client narrows it in ways you should expect:** ops that write by something other than a slug (`extract_entities`, `extract_facts`, `forget_fact`, `ontology_propose`, `sources_add`/`sources_remove`) and `POST /ingest` become unavailable to that client, and `put_page`'s automatic fact extraction is skipped — all because none of them can be confined to a prefix. Reads are unaffected. See [the qm-harness guide](../integrations/qm-harness.md) for the full model.
 - `--federated-read` controls read scope. A client can read from one or more sources.
 
 ### Verify the scoping actually scopes
@@ -247,6 +267,49 @@ gbrain search "performance review"
 Bob should see the performance-review notes from `internal`, plus anything related from `shared`. He shouldn't see anything that lives only in `customers`.
 
 If both queries return correctly scoped results, isolation is working. (There is no per-query "act as client X" flag — the thin-client config decides which credential the CLI uses; only the client secret can be overridden at call time via `GBRAIN_REMOTE_CLIENT_SECRET`.)
+
+### Multi-agent: one brain, many agents (`gbrain agent register`)
+
+The raw `register-client` flow above is the per-teammate primitive. When the client you're onboarding is an **AI agent harness** (a teammate's Claude Code, a coding agent working a project repo, your OpenClaw), there's a packaged one-command path: `gbrain agent register` mints the scoped OAuth client, mints a 30-day access token, and prints the exact wiring block for the harness — all in one step. It runs on the brain host and is a trusted local operation — not a delegation mechanism. (When to use which path lives in [the onboarding decision table](../guides/agent-to-gbrain.md#onboarding-paths--the-decision-table) — link there, it's the single copy.)
+
+Two presets cover the common shapes, with semantics worth knowing honestly:
+
+- **`daily-driver`** — a personal assistant agent: writes to one source, reads broadly. The read grant is a **snapshot** of all non-archived sources at registration time, excluding other agents' `*-workspace` scratch sources (name one explicitly in `--federated-read` to share it) — a source you add next month is NOT automatically readable; re-grant with `gbrain auth rescope-client <client_id> --federated-read <updated list>`.
+- **`coding-agent`** — a write-isolated project agent: its writes land in an auto-created, DB-only `<name>-workspace` source (so a misbehaving agent can't scribble on your wiki), and it reads only the project sources you name via `--federated-read` (required — a coding agent that can read nothing but its own scratch space is a misconfiguration).
+
+Both presets start the client on the **full** tool surface; its grant (scopes, sources and write fence) still bounds what it can do. A harness that caps its tool count can register with `--surface starter`, or narrow a specific client later with `gbrain auth rescope-client <client_id> --surface starter`.
+
+A worked example — a coding agent for alice-example's widget project, wired into Claude Code:
+
+```bash
+# On the brain host. proj-widget is the project source it may read
+# (create it first with `gbrain sources add proj-widget` if needed).
+gbrain agent register aurora-coder \
+  --harness claude-code \
+  --preset coding-agent \
+  --federated-read proj-widget,shared \
+  --url https://brain.acme-co.com/mcp
+```
+
+The output prints the client id, the resolved scoping (write source `aurora-coder-workspace`, federated reads, surface tier, token expiry), and a paste-ready block for the harness. Credentials print redacted by default; re-run with `--show-token` when you're ready to paste, or use `--json` for provisioning scripts. A `daily-driver` for yourself looks like `gbrain agent register nova-daily --harness claude-code --preset daily-driver --url https://brain.acme-co.com/mcp`.
+
+Verify the new agent's scoping the same way you verified teammates above — a thin-client install acting as that client (`--force` overwrites the scratch config from the previous check):
+
+```bash
+# On a machine that is NOT the brain host (or the same scratch shell)
+gbrain init --mcp-only --force \
+  --issuer-url https://brain.acme-co.com \
+  --mcp-url https://brain.acme-co.com/mcp \
+  --oauth-client-id <aurora-coder's client_id> \
+  --oauth-client-secret <aurora-coder's client_secret>
+
+gbrain whoami
+gbrain search "widget launch plan"
+```
+
+`gbrain whoami` should name the aurora-coder client; the search should return results only from `proj-widget`, `shared`, and its own workspace.
+
+**Renewal.** The minted access token defaults to a 30-day TTL (registration always writes a per-client TTL — the server default for CLI-minted tokens is one hour, which would be useless in a pasted config). When a token expires, rotate with `gbrain agent register --reissue <client_id> --harness claude-code --url https://brain.acme-co.com/mcp`: it rotates the client secret, mints a fresh token, and reprints the block. Rotation is not revocation — outstanding access tokens stay valid until they expire; revoke the client (`gbrain auth revoke-client <client_id>`) to kill them immediately.
 
 ---
 
@@ -412,7 +475,7 @@ The thin-client install creates a local config that knows how to talk to your br
 
 **2. Their AI client, connected directly to `https://brain.acme-co.com/mcp`.** Each client has its own connection shape; the per-client pages in [`docs/mcp/`](../mcp/) are the reference:
 
-- **Claude Code / Codex** — one command from anywhere `gbrain` is installed: `gbrain connect https://brain.acme-co.com/mcp --token <token> --install` (see [CLAUDE_CODE.md](../mcp/CLAUDE_CODE.md) / [CODEX.md](../mcp/CODEX.md)). Note the credential type: `gbrain connect` for these two agents uses **bearer tokens** (`gbrain auth create <name>`), which are full-access. That's fine for you as the admin; for source-scoped teammates, the scoped credential is their OAuth client — use it via the thin-client CLI above and the OAuth-capable clients below.
+- **Claude Code / Codex** — the scoped path is `gbrain agent register <name> --harness claude-code|codex --url https://brain.acme-co.com/mcp` run on the brain host (the Part 5 multi-agent subsection): it mints a source-scoped OAuth client plus a 30-day token and prints the exact paste block for the harness. The `gbrain connect https://brain.acme-co.com/mcp --token <token> --install` lane (see [CLAUDE_CODE.md](../mcp/CLAUDE_CODE.md) / [CODEX.md](../mcp/CODEX.md)) also works but uses **bearer tokens** (`gbrain auth create <name>`), which are full-access unless minted with `--scopes` — fine for you as the admin, wrong for source-scoped teammates.
 - **Claude Desktop** — remote servers are added through the GUI: **Settings > Integrations**, URL `https://brain.acme-co.com/mcp`. Do **not** put a remote server in `claude_desktop_config.json`; that file only works for local stdio servers and fails silently for remote ones. See [CLAUDE_DESKTOP.md](../mcp/CLAUDE_DESKTOP.md).
 - **ChatGPT** ([CHATGPT.md](../mcp/CHATGPT.md)) and **Perplexity** ([PERPLEXITY.md](../mcp/PERPLEXITY.md)) — both speak OAuth to the server directly, so per-teammate scoping carries into those tools. Perplexity uses the same `client_credentials` clients you registered in Part 5. ChatGPT needs an `authorization_code` (PKCE) client — register one per teammate with the same `--source` / `--federated-read` flags.
 - **OpenClaw / Hermes forks** — if the teammate's own agent runs on a machine with a full local gbrain install, it can use local stdio (`gbrain serve`) against its own brain and reach yours over HTTP MCP like any other remote client.
@@ -493,17 +556,23 @@ OAuth source scoping only guards the HTTP MCP path. If the brain's Postgres and 
 
 ## Part 13: Cost and speed expectations
 
-Real numbers from the published benchmark, running the default stack (GBrain with ZeroEntropy for embedding + reranker):
+Historical numbers from the published benchmark snapshot (2026-05-23,
+v0.40.6.0) were measured on a retired hosted embedding stack, not the current
+Voyage default. Provider identifiers are redacted; original attribution is
+preserved at Git revision `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29`
+(retained on 2026-09-23). The measurements below are unchanged and do not
+establish a supported replacement's latency or throughput. The later
+LongMemEval result is separately dated and labeled.
 
-- **Embedding cost:** $0.05 per million tokens. For comparison, GBrain configured with OpenAI is $0.13 (2.6× more expensive), Voyage is $0.18 (3.6× more).
+- **Embedding cost:** the default (`voyage:voyage-4`) is $0.06 per million tokens; the snapshot's retired hosted stack is $0.05. For comparison, GBrain configured with OpenAI is $0.13.
 - **Ingest speed:** about 22 seconds for a small test corpus of 164 pages on the host machine. For a 10K-page corpus, expect about 20 minutes the first time, then most syncs are incremental and finish in seconds.
 - **Query latency:** about 122 ms median for a `gbrain search`. For comparison, the same query through GBrain with OpenAI takes about 282 ms.
 - **Synthesized-answer latency:** a few seconds, dominated by the Anthropic API.
-- **Retrieval quality:** on the public LongMemEval benchmark, GBrain hits 97.60% recall at the top 5 retrieved sessions, beating the previous published state of the art at 96.6%. On the in-house BrainBench corpus of relational queries, GBrain beats commodity vector retrieval by 38 percentage points, because the graph layer surfaces relationships that vector similarity alone misses.
+- **Retrieval quality:** on the public LongMemEval benchmark (S split, cleaned revision, 470 scored questions), GBrain measures 95.53% session-level `recall_all@5` on its release default path (`voyage:rerank-2.5` on, autocut off) and 93.40% with the reranker off: every gold session inside the top 5 retrieved sessions, retrieval only, no reader model (measured 2026-09-06 at v0.48.4.0 by `gbrain eval longmemeval`; receipts in the sibling gbrain-evals repo and `docs/eval-bench.md`).
 
 Full methodology and per-run receipt JSONs live in [the gbrain-evals repo](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-23-v0.40.6.0-snapshot.md).
 
-For a 25-person company at sustained use, expect about $35 a month in embeddings (ZeroEntropy at $0.05/million tokens), $50 a month in Anthropic calls for the synthesized-answer queries, plus your hosting bill. Under $100 a month for the AI side at most companies your size.
+For a 25-person company at sustained use, expect about $40 a month in embeddings (the default `voyage-4` at $0.06/million tokens), $50 a month in Anthropic calls for the synthesized-answer queries, plus your hosting bill. Under $100 a month for the AI side at most companies your size.
 
 ---
 
@@ -515,7 +584,7 @@ Check `gbrain auth list` on the host and confirm their client has `--source` set
 
 ### "Sync is slow and feels stuck"
 
-The first sync embeds every page, which takes time. Check `gbrain sources status` for the live page count. If it's climbing you're not stuck, you're just embedding. If you've got a 10K-page corpus and ZeroEntropy is being throttled, the per-source parallel sync looks like progress on three sources at once rather than one source moving fast.
+The first sync embeds every page, which takes time. Check `gbrain sources status` for the live page count. If it's climbing you're not stuck, you're just embedding. If you've got a 10K-page corpus and your embedding provider is throttling you, the per-source parallel sync looks like progress on three sources at once rather than one source moving fast.
 
 ### "I see a page I shouldn't see"
 

@@ -22,6 +22,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import type { ChunkInput } from '../src/core/types.ts';
@@ -31,11 +32,16 @@ import {
   applyEmbeddingMigration,
   completeEmbeddingMigration,
   reconcilePageSignatures,
+  verifyMigrationComplete,
+  readMigrationStatus,
+  countFalseStampedChunks,
   migrationSignature,
   MIGRATION_STATE_KEY,
   MIGRATION_COMPLETED_KEY,
 } from '../src/core/embedding-migration.ts';
+import { invalidateStaleSignatureEmbeddingsGuarded } from '../src/core/embedding-invalidation.ts';
 import { estimateCostFromChars } from '../src/core/embedding-pricing.ts';
+import { AUDIT_ROW_SOURCES } from '../src/core/facts/audit-sources.ts';
 import { operations } from '../src/core/operations.ts';
 
 let engine: PGLiteEngine;
@@ -66,7 +72,7 @@ async function seedEmbedded(slug: string, text: string, signature: string | null
   const chunks: ChunkInput[] = [
     { chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth', token_count: 4, embedding: undefined },
   ];
-  await engine.upsertChunks(slug, chunks);
+  await installFixtureChunks(engine, slug, chunks);
   await engine.executeRaw(
     `UPDATE content_chunks
         SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[$1::int]), ',') || ']')::vector
@@ -96,6 +102,71 @@ async function seedUnembedded(slug: string, text: string): Promise<void> {
     { chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth', token_count: 4, embedding: undefined },
   ]);
 }
+
+describe('embedding migration excludes soft-deleted pages', () => {
+  test.each(['guarded', 'raw'] as const)('%s signature invalidation preserves tombstone vectors and invalidates live vectors', async (mode) => {
+    await seedEmbedded('deleted-drift', 'retained vector', 'old:model:1');
+    await seedEmbedded('live-drift', 'stale vector', 'old:model:1');
+    await engine.softDeletePage('deleted-drift', { sourceId: 'default' });
+    const readVector = (slug: string) => engine.executeRaw<{ embedding: string | null }>(
+      `SELECT cc.embedding::text AS embedding FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+       WHERE p.slug = $1 AND p.source_id = 'default'`, [slug]);
+    const retained = await readVector('deleted-drift');
+    expect(retained[0]!.embedding).not.toBeNull();
+    const opts = { signature: 'new:model:1' };
+    const invalidated = mode === 'guarded'
+      ? await invalidateStaleSignatureEmbeddingsGuarded(engine, opts)
+      : await engine.invalidateStaleSignatureEmbeddings(opts);
+    expect(invalidated).toBe(1);
+    expect(await readVector('deleted-drift')).toEqual(retained);
+    expect(await readVector('live-drift')).toEqual([{ embedding: null }]);
+  });
+
+  test('content drift invalidates only live chunks and preserves deleted chunk metadata', async () => {
+    for (const slug of ['deleted-content-drift', 'live-content-drift']) {
+      await seedUnembedded(slug, 'current text');
+      const [{ dim }] = await engine.executeRaw<{ dim: number }>(
+        "SELECT atttypmod AS dim FROM pg_attribute WHERE attrelid='content_chunks'::regclass AND attname='embedding' AND attnum>0");
+      await engine.executeRaw(`UPDATE content_chunks SET embedding=('[' || array_to_string(array_fill(0.0::real,ARRAY[$1::int]),',') || ']')::vector,
+        embedded_text_hash=md5('old text'),embedded_at='2020-01-01T00:00:00Z'
+        WHERE page_id=(SELECT id FROM pages WHERE slug=$2 AND source_id='default')`, [dim, slug]);
+    }
+    await engine.softDeletePage('deleted-content-drift', { sourceId: 'default' });
+    const readDeleted = () => engine.executeRaw(`SELECT embedding::text,embedded_text_hash,embedded_at FROM content_chunks
+      WHERE page_id=(SELECT id FROM pages WHERE slug='deleted-content-drift' AND source_id='default')`);
+    const before = await readDeleted();
+    expect(await engine.invalidateContentDriftEmbeddings()).toBe(1);
+    expect(await readDeleted()).toEqual(before);
+    expect(await engine.executeRaw(`SELECT embedding FROM content_chunks WHERE page_id=(SELECT id FROM pages
+      WHERE slug='live-content-drift' AND source_id='default')`)).toEqual([{ embedding: null }]);
+  });
+
+  test('counts and both cursor orders ignore tombstones while preserving their recoverable chunks', async () => {
+    await seedUnembedded('tombstone', 'deleted chunk');
+    await engine.softDeletePage('tombstone', { sourceId: 'default' });
+    await seedUnembedded('live', 'live');
+    await seedUnembedded('later-tombstone', 'later deleted');
+    await engine.softDeletePage('later-tombstone', { sourceId: 'default' });
+    const updatedAt = '2020-01-02T03:04:05.000Z';
+    await engine.executeRaw("UPDATE pages SET updated_at = $1::timestamptz WHERE slug = 'live' AND source_id = 'default'", [updatedAt]);
+    for (const scope of [{}, { sourceId: 'default' }]) {
+      expect(await engine.countStaleChunks(scope)).toBe(1);
+      expect(await engine.countStaleChunks({ ...scope, signature: 'new:model:1024', includeNullSignature: true })).toBe(1);
+      expect(await engine.sumStaleChunkChars(scope)).toBe(4);
+      for (const orderBy of ['page_id', 'updated_desc'] as const) {
+        const rows = await engine.listStaleChunks({ ...scope, orderBy, batchSize: 1 });
+        expect(rows.map(row => row.slug)).toEqual(['live']);
+        const last = rows[0]!;
+        const rest = await engine.listStaleChunks({ ...scope, orderBy, batchSize: 1,
+          afterPageId: last.page_id, afterChunkIndex: last.chunk_index,
+          ...(orderBy === 'updated_desc' ? { afterUpdatedAt: updatedAt } : {}) });
+        expect(rest).toHaveLength(0);
+      }
+    }
+    expect((await engine.getPage('tombstone', { sourceId: 'default', includeDeleted: true }))?.deleted_at).not.toBeNull();
+    expect(await engine.executeRaw("SELECT count(*)::int AS n FROM content_chunks WHERE page_id=(SELECT id FROM pages WHERE slug='tombstone')")).toEqual([{ n: 1 }]);
+  });
+});
 
 describe('resolveMigrationTarget', () => {
   test('requires provider:model shape', () => {
@@ -170,12 +241,12 @@ describe('#3391 includeNullSignature widening', () => {
 describe('planEmbeddingMigration', () => {
   test('counts everything not in the target space, splits out NULL-signature chunks, prices it', async () => {
     await seedEmbedded('legacy', 'abcde', null);                                 // 5 chars
-    await seedEmbedded('current', 'fghij', `zeroentropyai:zembed-1:${colDim}`);  // 5 chars
+    await seedEmbedded('current', 'fghij', `fixture-provider:embedding-v1:${colDim}`);  // 5 chars
     await seedUnembedded('pending', 'klmnop');                                   // 6 chars
 
     const plan = await planEmbeddingMigration(engine, {
       to: 'openai:text-embedding-3-small',
-      fromModel: 'zeroentropyai:zembed-1',
+      fromModel: 'fixture-provider:embedding-v1',
       fromDims: colDim,
     });
 
@@ -210,13 +281,13 @@ describe('planEmbeddingMigration', () => {
   });
 
   test('reranker on the outgoing provider triggers the warning', async () => {
-    await engine.setConfig('search.reranker.model', 'zeroentropyai:zerank-2');
+    await engine.setConfig('search.reranker.model', 'fixture-provider:reranker-v1');
     const plan = await planEmbeddingMigration(engine, {
       to: 'openai:text-embedding-3-small',
-      fromModel: 'zeroentropyai:zembed-1',
+      fromModel: 'fixture-provider:embedding-v1',
       fromDims: 1280,
     });
-    expect(plan.reranker_warning).toContain('zeroentropyai:zerank-2');
+    expect(plan.reranker_warning).toContain('fixture-provider:reranker-v1');
   });
 });
 
@@ -312,6 +383,17 @@ describe('applyEmbeddingMigration', () => {
     expect(await embeddingColWidth('facts')).toBe(target);
   });
 
+  test('#4252: a dim change keeps the facts btree indexes that read the embedding column (v237 idx_facts_unembedded)', async () => {
+    const target = colDim === 512 ? 256 : 512;
+    const factIndexes = async () => (await engine.executeRaw<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'facts' AND indexname = 'idx_facts_unembedded'`)).map(r => r.indexname);
+    expect(await factIndexes()).toEqual(['idx_facts_unembedded']);
+    const plan = await planEmbeddingMigration(engine, { to: 'openai:text-embedding-3-small', dim: target });
+    expect((await applyEmbeddingMigration(engine, plan)).status).toBe('applied');
+    expect(await embeddingColWidth('facts')).toBe(target);
+    expect(await factIndexes()).toEqual(['idx_facts_unembedded']);
+  });
+
   test('post-transition the query cache can actually STORE a row at the new width', async () => {
     const target = colDim === 512 ? 256 : 512;
     const plan = await planEmbeddingMigration(engine, {
@@ -362,6 +444,21 @@ describe('applyEmbeddingMigration', () => {
       { chunk_index: 0, chunk_text: 'fghij', chunk_source: 'compiled_truth', token_count: 4 },
       { chunk_index: 1, chunk_text: 'not embedded', chunk_source: 'compiled_truth', token_count: 4 },
     ]);
+    // The drain stamps chunk.model with the model that actually embedded each
+    // chunk; reconcile only stamps pages whose chunks ALL carry the target
+    // model (a foreign-model chunk means the page is NOT in the new space).
+    // Mirror the post-drain state the batch-boundary shape actually leaves.
+    await engine.executeRaw(
+      `UPDATE content_chunks SET model = 'openai:text-embedding-3-small'
+        WHERE page_id IN (SELECT id FROM pages WHERE slug IN ('done','partial') AND source_id = 'default')`,
+    );
+    // 'foreign' — every chunk embedded, but by a DIFFERENT model (a non-locked
+    // writer raced the drain): must NOT get the new stamp.
+    await seedEmbedded('foreign', 'klmno', 'old:model:1');
+    await engine.executeRaw(
+      `UPDATE content_chunks SET model = 'other:writer-model'
+        WHERE page_id = (SELECT id FROM pages WHERE slug = 'foreign' AND source_id = 'default')`,
+    );
 
     const plan = await planEmbeddingMigration(engine, {
       to: 'openai:text-embedding-3-small', dim: colDim,
@@ -371,10 +468,11 @@ describe('applyEmbeddingMigration', () => {
 
     const sig = `openai:text-embedding-3-small:${colDim}`;
     const rows = await engine.executeRaw<{ slug: string; embedding_signature: string | null }>(
-      `SELECT slug, embedding_signature FROM pages WHERE slug IN ('done','partial') ORDER BY slug`,
+      `SELECT slug, embedding_signature FROM pages WHERE slug IN ('done','partial','foreign') ORDER BY slug`,
     );
     expect(rows.find(r => r.slug === 'done')?.embedding_signature).toBe(sig);
     expect(rows.find(r => r.slug === 'partial')?.embedding_signature).toBe('old:model:1');
+    expect(rows.find(r => r.slug === 'foreign')?.embedding_signature).toBe('old:model:1');
   });
 
   test('completeEmbeddingMigration clears the state marker and stamps completion', async () => {
@@ -384,6 +482,174 @@ describe('applyEmbeddingMigration', () => {
     expect(await engine.getConfig(MIGRATION_STATE_KEY)).toBeFalsy();
     const done = JSON.parse((await engine.getConfig(MIGRATION_COMPLETED_KEY))!);
     expect(done.to_model).toBe('openai:text-embedding-3-small');
+  });
+});
+
+describe('#4305 false target stamps + #4306 embed_skip-safe invalidation', () => {
+  const TARGET = 'openai:text-embedding-3-small';
+
+  /**
+   * Page with one chunk embedded at column width under an EXPLICIT chunk
+   * model, optional page signature + frontmatter (the embed_skip shapes).
+   */
+  async function seedModeled(
+    slug: string,
+    text: string,
+    opts: { model: string; signature?: string; frontmatter?: Record<string, unknown>; embedded?: boolean },
+  ): Promise<void> {
+    await engine.putPage(slug, {
+      type: 'note', title: slug, compiled_truth: `# ${slug}`,
+      ...(opts.frontmatter ? { frontmatter: opts.frontmatter } : {}),
+    });
+    await installFixtureChunks(engine, slug, [
+      { chunk_index: 0, chunk_text: text, chunk_source: 'compiled_truth', token_count: 4, model: opts.model },
+    ]);
+    if (opts.embedded !== false) {
+      await engine.executeRaw(
+        `UPDATE content_chunks
+            SET embedding = ('[' || array_to_string(array_fill(0.0::real, ARRAY[$1::int]), ',') || ']')::vector,
+                model = $3
+          WHERE page_id = (SELECT id FROM pages WHERE slug = $2 AND source_id = 'default')`,
+        [colDim, slug, opts.model],
+      );
+    }
+    if (opts.signature) await engine.setPageEmbeddingSignature(slug, { signature: opts.signature });
+  }
+
+  async function chunkState(slug: string): Promise<{ embedded: number; nulls: number }> {
+    const rows = await engine.executeRaw<{ embedded: number; nulls: number }>(
+      `SELECT count(*) FILTER (WHERE cc.embedding IS NOT NULL)::int AS embedded,
+              count(*) FILTER (WHERE cc.embedding IS NULL)::int AS nulls
+         FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = $1 AND p.source_id = 'default'`,
+      [slug],
+    );
+    return { embedded: Number(rows[0]?.embedded ?? 0), nulls: Number(rows[0]?.nulls ?? 0) };
+  }
+
+  test('#4305: plan, verify and --status all see chunks hidden behind a false target stamp', async () => {
+    const sig = migrationSignature(TARGET, colDim);
+    // Page stamped WITH the target signature while its chunk still carries the
+    // old provider's model — pre-fix the whole toolchain reported converged.
+    await seedModeled('false-stamp', 'abcde', { model: 'voyage:voyage-3-large', signature: sig });
+
+    expect((await countFalseStampedChunks(engine, TARGET, colDim)).chunks).toBe(1);
+
+    const plan = await planEmbeddingMigration(engine, { to: TARGET, dim: colDim });
+    expect(plan.false_stamped_chunks).toBe(1);
+    expect(plan.chunks_to_embed).toBe(1); // pre-fix: 0 (the #4305 symptom)
+    expect(plan.total_chars).toBe(5);
+
+    const verify = await verifyMigrationComplete(engine, { toModel: TARGET, toDims: colDim }, {
+      filePlane: { model: TARGET, dims: colDim },
+    });
+    expect(verify.complete).toBe(false); // pre-fix: true
+    expect(verify.blockers.join(' ')).toMatch(/false stamp/);
+    expect(verify.details.false_stamped_chunks).toBe(1);
+
+    await engine.setConfig('embedding_model', TARGET);
+    await engine.setConfig('embedding_dimensions', String(colDim));
+    const status = await readMigrationStatus(engine);
+    expect(status.stale_vs_target.false_stamped).toBe(1);
+  });
+
+  test('#4305: bare-model-tail rows are NOT flagged (no surprise paid re-embed on pre-#3461 rows)', async () => {
+    const sig = migrationSignature(TARGET, colDim);
+    // Old rows stored the model without the provider prefix; the stamp is
+    // honest for them — flagging would trigger a surprise full re-embed.
+    await seedModeled('bare-tail', 'abcde', { model: 'text-embedding-3-small', signature: sig });
+    expect((await countFalseStampedChunks(engine, TARGET, colDim)).chunks).toBe(0);
+    const plan = await planEmbeddingMigration(engine, { to: TARGET, dim: colDim });
+    expect(plan.false_stamped_chunks).toBe(0);
+    expect(plan.chunks_to_embed).toBe(0);
+  });
+
+  test('#4305: apply clears the false stamp and re-invalidates the page', async () => {
+    const sig = migrationSignature(TARGET, colDim);
+    await seedModeled('false-stamp', 'abcde', { model: 'voyage:voyage-3-large', signature: sig });
+
+    const plan = await planEmbeddingMigration(engine, { to: TARGET, dim: colDim });
+    const res = await applyEmbeddingMigration(engine, plan);
+    expect(res.status).toBe('applied');
+    if (res.status !== 'applied') throw new Error('unreachable');
+    expect(res.invalidated).toBe(1); // pre-fix: 0 (page skipped by its stamp)
+
+    const rows = await engine.executeRaw<{ embedding_signature: string | null }>(
+      `SELECT embedding_signature FROM pages WHERE slug = 'false-stamp' AND source_id = 'default'`,
+    );
+    expect(rows[0]?.embedding_signature).toBeNull();
+    expect(await chunkState('false-stamp')).toEqual({ embedded: 0, nulls: 1 });
+    // The standard NULL-embedding cursor now owns the re-embed.
+    expect(await engine.countStaleChunks()).toBe(1);
+  });
+
+  test('#4306: invalidation preserves embed_skip pages\' retained vectors', async () => {
+    const sig = migrationSignature(TARGET, colDim);
+    // Embedded BEFORE the embed_skip marker appeared (the content-sanity
+    // oversize shape) — pre-fix apply NULLed it and no selector could ever
+    // re-embed it: permanent loss.
+    await seedModeled('skip', 'retained', {
+      model: 'voyage:voyage-3-large',
+      frontmatter: { embed_skip: { reason: 'oversized' } },
+    });
+    await seedModeled('plain', 'stale', { model: 'voyage:voyage-3-large' });
+
+    const plan = await planEmbeddingMigration(engine, { to: TARGET, dim: colDim });
+    const res = await applyEmbeddingMigration(engine, plan);
+    expect(res.status).toBe('applied');
+    if (res.status !== 'applied') throw new Error('unreachable');
+    expect(res.invalidated).toBe(1); // 'plain' only — pre-fix: 2
+
+    expect(await chunkState('skip')).toEqual({ embedded: 1, nulls: 0 });
+    expect(await chunkState('plain')).toEqual({ embedded: 0, nulls: 1 });
+    expect(await engine.countStaleChunks({ signature: sig, includeNullSignature: true })).toBe(1);
+  });
+
+  test('#4306: guarded helper skips embed_skip on the signature-drift path too', async () => {
+    await seedModeled('skip-drift', 'retained', {
+      model: 'voyage:voyage-3-large',
+      signature: 'old:model:1',
+      frontmatter: { embed_skip: { reason: 'oversized' } },
+    });
+    const n = await invalidateStaleSignatureEmbeddingsGuarded(engine, { signature: 'new:model:1' });
+    expect(n).toBe(0); // engine method pre-fix: 1 (the destroyed-vector shape)
+    expect(await chunkState('skip-drift')).toEqual({ embedded: 1, nulls: 0 });
+  });
+
+  test('#4306: verify reports embed_skip NULL chunks without blocking completion', async () => {
+    // The already-damaged shape: an embed_skip page whose chunks were NULLed
+    // by a pre-fix run. Nothing re-embeds it by design — completion must not
+    // wedge on it, but the verdict must SAY it.
+    await seedModeled('skip-null', 'lost', {
+      model: 'voyage:voyage-3-large',
+      frontmatter: { embed_skip: { reason: 'oversized' } },
+      embedded: false,
+    });
+    const verify = await verifyMigrationComplete(engine, { toModel: TARGET, toDims: colDim }, {
+      filePlane: { model: TARGET, dims: colDim },
+    });
+    expect(verify.details.embed_skip_null_chunks).toBe(1);
+    expect(verify.blockers.join(' ')).not.toMatch(/embed_skip/);
+    expect(verify.complete).toBe(true);
+
+    const status = await readMigrationStatus(engine);
+    expect(status.embed_skip_null_chunks).toBe(1);
+  });
+});
+
+describe('#4875 facts_pending excludes audit checkpoint rows', () => {
+  test('terminal / non-extractable / legacy checkpoints are not a pending embedding backlog', async () => {
+    const seed = (source: string, extra = '') => engine.executeRaw(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, source, confidence${extra ? ', ' + extra : ''})
+       VALUES ('default', 'e', $1, 'fact', 'private', 'medium', $1, 1.0${extra ? ', now()' : ''})`,
+      [source],
+    );
+    await seed('test');                       // the one real pending fact
+    for (const s of AUDIT_ROW_SOURCES) await seed(s); // checkpoints, never embedded
+    await seed('expired-real', 'expired_at'); // expired rows already excluded
+
+    const status = await readMigrationStatus(engine);
+    expect(status.facts_pending).toBe(1);
   });
 });
 
@@ -420,5 +686,73 @@ describe('migrate_embeddings op contract', () => {
   test('signature helper matches currentEmbeddingSignature shape', () => {
     expect(migrationSignature('openai:text-embedding-3-small', 1536))
       .toBe('openai:text-embedding-3-small:1536');
+  });
+});
+
+describe('runSchemaTransition retained column and index regressions', () => {
+  test('preserves embedding_image and embedding_multimodal dimensions after text migration', async () => {
+    await seedEmbedded('transition-image-width', 'fixture body', null);
+    const target = colDim === 512 ? 256 : 512;
+    const plan = await planEmbeddingMigration(engine, { to: 'openai:text-embedding-3-small', dim: target });
+    expect(await applyEmbeddingMigration(engine, plan)).toMatchObject({ status: 'applied', schema_transitioned: true });
+    const rows = await engine.executeRaw<{ column_name: string; col_type: string }>(
+      `SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS col_type
+         FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'content_chunks'
+          AND a.attname IN ('embedding', 'embedding_image', 'embedding_multimodal')
+          AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attname`,
+    );
+    const byName = new Map(rows.map(r => [r.column_name, r.col_type]));
+    expect(byName.get('embedding')).toBe(`vector(${target})`);
+    expect(byName.get('embedding_image')).toBe('vector(1024)');
+    expect(byName.get('embedding_multimodal')).toBe('vector(1024)');
+  });
+
+  test('restores the partial WHERE predicate on idx_chunks_embedding_image', async () => {
+    await seedEmbedded('transition-image-index', 'fixture body', null);
+    const target = colDim === 512 ? 256 : 512;
+    const plan = await planEmbeddingMigration(engine, { to: 'openai:text-embedding-3-small', dim: target });
+    expect(await applyEmbeddingMigration(engine, plan)).toMatchObject({ status: 'applied', schema_transitioned: true });
+    const rows = await engine.executeRaw<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes WHERE schemaname = 'public'
+        AND tablename = 'content_chunks' AND indexname = 'idx_chunks_embedding_image'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].indexdef).toMatch(/WHERE\s+\(?embedding_image IS NOT NULL\)?/i);
+  });
+
+  test('preserves both partial stale indexes on content_chunks.embedding (#4252)', async () => {
+    await seedEmbedded('transition-stale-index', 'fixture body', null);
+    await engine.executeRaw(`CREATE INDEX IF NOT EXISTS idx_chunks_embedding_null
+      ON content_chunks (page_id, chunk_index) WHERE embedding IS NULL`);
+    const target = colDim === 512 ? 256 : 512;
+    const plan = await planEmbeddingMigration(engine, { to: 'openai:text-embedding-3-small', dim: target });
+    expect(await applyEmbeddingMigration(engine, plan)).toMatchObject({ status: 'applied', schema_transitioned: true });
+    const rows = await engine.executeRaw<{ indexname: string; indexdef: string }>(
+      `SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'
+        AND tablename = 'content_chunks'
+        AND indexname IN ('idx_chunks_embedding_null', 'content_chunks_stale_idx') ORDER BY indexname`,
+    );
+    const byName = new Map(rows.map(r => [r.indexname, r.indexdef]));
+    expect([...byName.keys()]).toEqual(['content_chunks_stale_idx', 'idx_chunks_embedding_null']);
+    expect(byName.get('content_chunks_stale_idx')).toMatch(/WHERE\s+\(?embedding IS NULL\)?/i);
+    expect(byName.get('idx_chunks_embedding_null')).toMatch(/WHERE\s+\(?embedding IS NULL\)?/i);
+  });
+
+  test('skips the image index cleanly when both multimodal columns are absent', async () => {
+    await seedEmbedded('transition-no-image', 'fixture body', null);
+    await engine.executeRaw('ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_image');
+    await engine.executeRaw('ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_multimodal');
+    const target = colDim === 512 ? 256 : 512;
+    const plan = await planEmbeddingMigration(engine, { to: 'openai:text-embedding-3-small', dim: target });
+    expect(await applyEmbeddingMigration(engine, plan)).toMatchObject({ status: 'applied', schema_transitioned: true });
+    expect(await embeddingColWidth('content_chunks')).toBe(target);
+    const rows = await engine.executeRaw<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes WHERE schemaname = 'public'
+        AND tablename = 'content_chunks' AND indexname = 'idx_chunks_embedding_image'`,
+    );
+    expect(rows.length).toBe(0);
   });
 });

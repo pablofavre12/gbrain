@@ -15,7 +15,7 @@ import { describe, test, expect } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { applyThinClientSourceScope, parseOpArgs } from '../src/cli.ts';
+import { applyThinClientSourceScope, parseOpArgs } from '../src/cli/main.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -76,10 +76,10 @@ describe('applyThinClientSourceScope (#2098)', () => {
     });
   });
 
-  test('an op-owned --source target is preserved even without source_id', async () => {
+  test('an op-owned --source target is preserved alongside source_id', async () => {
     await withEnv({ GBRAIN_SOURCE: undefined }, () => {
       const op = operationsByName.add_tag;
-      expect('source_id' in op.params).toBe(false);
+      expect('source_id' in op.params).toBe(true);
       const params = { slug: 'x', tag: 'y', source: 'wiki' };
       applyThinClientSourceScope(op, params, '/');
       expect(params.source).toBe('wiki');

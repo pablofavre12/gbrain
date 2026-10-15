@@ -1,3 +1,4 @@
+import type { PageReadPolicy } from '../core/types.ts';
 /**
  * gbrain whoknows — "Who should I talk to about X?"
  *
@@ -38,10 +39,11 @@
 import type { BrainEngine } from '../core/engine.ts';
 import type { PageType, SearchResult } from '../core/types.ts';
 import { hybridSearch } from '../core/search/hybrid.ts';
+import { INTERNAL_BREADTH_SEARCH_OPTS } from '../core/search/internal-breadth.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 
-export interface WhoknowsOpts {
+export interface WhoknowsOpts extends PageReadPolicy {
   topic: string;
   limit?: number;
   explain?: boolean;
@@ -191,12 +193,16 @@ export async function findExperts(
   //    v0.34.1 (#861, D3): thread source-scope so an authenticated MCP
   //    client only ranks experts within its accessible sources.
   const results: SearchResult[] = await hybridSearch(engine, opts.topic, {
+    ...INTERNAL_BREADTH_SEARCH_OPTS,
     types,
     limit: innerLimit,
     salience: 'off',
     recency: 'off',
     sourceId: opts.sourceId,
     sourceIds: opts.sourceIds,
+    excludePrivate: opts.excludePrivate,
+    requireSafeChunks: opts.requireSafeChunks,
+    takesHoldersAllowList: opts.takesHoldersAllowList,
   });
 
   if (results.length === 0) return [];
@@ -212,19 +218,20 @@ export async function findExperts(
   }
   const candidates = Array.from(byKey.values());
 
-  // 3. Batch-fetch salience + effective_date per (slug, source_id) ref.
+  // 3. Enrich by exact page identity, then recheck admission. Salience is an
+  // optional ranking signal; dates also prove the current page is readable.
   const refs = candidates.map((c) => ({
     slug: c.slug,
     source_id: c.source_id ?? 'default',
   }));
-  const [salienceMap, dateMap] = await Promise.all([
-    engine.getSalienceScores(refs).catch(() => new Map<string, number>()),
-    engine.getEffectiveDates(refs).catch(() => new Map<string, Date>()),
-  ]);
+  const salienceMap = await engine.getSalienceScores(refs, opts).catch(() => new Map<string, number>());
+  // Admission must happen AFTER optional work: that work can race a source or
+  // visibility edit. This read is required for trusted local callers too.
+  const dateMap = await engine.getEffectiveDates(refs, opts);
 
   // 4. Build the ranking-function input shape.
   const now = Date.now();
-  const inputs = candidates.map((c) => {
+  const inputs = candidates.filter(c => dateMap.has(`${c.source_id ?? 'default'}::${c.slug}`)).map((c) => {
     const sourceId = c.source_id ?? 'default';
     const key = `${sourceId}::${c.slug}`;
     const salienceRaw = salienceMap.get(key);
@@ -313,6 +320,10 @@ export async function runWhoknows(
     return;
   }
   if ('error' in parsed) {
+    if (args.includes('--json')) {
+      const { exitCliError, usageError } = await import('../cli/cli-error.ts');
+      exitCliError(usageError(`gbrain whoknows: ${parsed.error}`, 'Pass the topic as the positional argument, e.g. gbrain whoknows "lab automation" --json.'), 'whoknows', { json: true });
+    }
     console.error(`gbrain whoknows: ${parsed.error}`);
     console.error(HELP);
     process.exit(2);

@@ -26,7 +26,7 @@ const ROTATE_BYTES = 10 * 1024 * 1024;
 export interface VerbUsageEvent {
   ts: string;
   verb: string;
-  surface: 'verbs' | 'full';
+  surface: 'verbs' | 'starter' | 'full';
   remote: boolean;
   ok: boolean;
   latency_ms: number;
@@ -34,6 +34,11 @@ export interface VerbUsageEvent {
   source_id: string;
   budget_dropped?: number;
   entity_found?: boolean;
+  /** `remember` outcome (inserted|duplicate|superseded) — additive, stamped
+   * by dispatch. Counts ALL MCP callers of the verb, ambient or explicit —
+   * doctor's memory_writeback check labels it exactly that way (OV-A11):
+   * a per-call ambient/explicit distinction does not exist on the wire. */
+  remember_status?: string;
 }
 
 let _pathOverride: string | null = null;

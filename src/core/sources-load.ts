@@ -16,6 +16,8 @@
  * implementations even though both run identical SQL through `executeRaw`.
  * A shared helper hits the bar at lower cost.
  */
+import { existsSync } from 'fs';
+import { isAbsolute } from 'path';
 import type { BrainEngine } from './engine.ts';
 
 export interface SourceRow {
@@ -142,7 +144,8 @@ export function parseSourceConfig(config: unknown): Record<string, unknown> {
     const shape = recoveredArray ? 'historical JSON array' : `${layers}-layer nested JSON string`;
     console.warn(
       `[gbrain] source config was stored as a ${shape}; ` +
-      `it will be repaired on the next config write. Run 'gbrain doctor' to find affected sources.`,
+      `it will be repaired on the next config-column write (e.g. 'gbrain sources federate' / 'unfederate'). ` +
+      `Run 'gbrain doctor' to find affected sources.`,
     );
   }
   return value ?? {};
@@ -154,10 +157,71 @@ export function sourceConfigHasRemoteUrl(config: unknown): boolean {
   return typeof remoteUrl === 'string' && remoteUrl.trim().length > 0;
 }
 
+function sourceHasRecoverableManagedClone(config: unknown): boolean {
+  const cfg = parseSourceConfig(config);
+  const remoteUrl = cfg.remote_url;
+  if (typeof remoteUrl !== 'string' || remoteUrl.trim().length === 0) return false;
+  return cfg.managed_clone === true;
+}
+
+/**
+ * Warning for a legacy source path that cannot be interpreted safely from a
+ * daemon context. Relative paths are ambiguous; absent absolute paths belong to
+ * another machine or an unmounted checkout unless the row is an owned remote
+ * clone that sync can safely recover by re-cloning.
+ */
+export function sourceLocalPathSkipWarning(
+  sourceId: string,
+  localPath: string,
+  pathExists: (path: string) => boolean = existsSync,
+  config: unknown = {},
+): string | null {
+  const relative = relativeSourceLocalPathSkipWarning(sourceId, localPath);
+  if (relative) return relative;
+  if (pathExists(localPath)) return null;
+  if (sourceHasRecoverableManagedClone(config)) return null;
+  return (
+    `[autopilot] skipping source '${sourceId}': local_path ` +
+    `'${localPath}' does not exist on this machine. Clone/register this ` +
+    `source locally, or let the machine that owns that checkout sync it.`
+  );
+}
+
+export function relativeSourceLocalPathSkipWarning(sourceId: string, localPath: string): string | null {
+  if (isAbsolute(localPath)) return null;
+  return (
+    `[autopilot] skipping source '${sourceId}': relative local_path ` +
+    `'${localPath}' cannot be resolved from a daemon. Re-register with an ` +
+    `absolute --path or run 'gbrain sync --source ${sourceId}' once to self-heal.`
+  );
+}
+
 /** True iff the source's config.federated field is the literal boolean true. */
 export function isSourceFederated(config: unknown): boolean {
   const parsed = parseSourceConfig(config);
   return parsed.federated === true;
+}
+
+/**
+ * Three-way federation state for display (CLI `sources list`, etc.).
+ *
+ * `isSourceFederated` collapses to a boolean for the inclusion check (does
+ * this source show up in OTHER anchors' unqualified reads?), which is
+ * correctly strict — 'unset' behaves like 'isolated' there. But 'unset' and
+ * 'isolated' are NOT interchangeable for display: only an explicit
+ * `federated: false` (`sources unfederate` / `--no-federated`) opts a source
+ * out of cross-source read mixing in both directions. A source that has
+ * simply never set the flag still widens its OWN unqualified reads to
+ * include the federated set (the #1434 sole-source convenience, pinned
+ * behavior — see test/local-federated-search-scope.test.ts and
+ * test/unfederate-read-scope-2928.test.ts). Labeling it "isolated" overstates
+ * what the flag actually does.
+ */
+export function sourceFederationState(config: unknown): 'federated' | 'isolated' | 'unset' {
+  const raw = parseSourceConfig(config).federated;
+  if (raw === true) return 'federated';
+  if (raw === false) return 'isolated';
+  return 'unset';
 }
 
 /**

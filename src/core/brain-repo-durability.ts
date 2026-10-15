@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite, hasFilesystemPublication, managedFilesystemRootFor } from './persistence/filesystem-guard.ts';
 /**
  * brain-repo-durability.ts — auto-harden a brain's git working tree (v0.42.44).
  *
@@ -6,7 +7,7 @@
  * sessions edit a stale tree. The moment gbrain is given a PAT + a GitHub URL
  * for a brain repo, `hardenBrainRepo` makes durability work, idempotently:
  *
- *   1. pull current state (divergence-safe rebase; skip-on-dirty)
+ *   1. pull current state (fast-forward or in-memory merge; skip-on-dirty)
  *   2. repo-scoped credential wiring (reuse an existing helper if present)
  *   3. LOCAL untracked post-commit hook (best-effort background auto-push)
  *   4. committed `scripts/brain-commit-push.sh` (the DURABILITY GUARANTEE —
@@ -17,9 +18,9 @@
  *
  * Trust boundary (this is gbrain's FIRST push path + FIRST secret storage):
  *  - The hook is LOCAL + untracked so a pulled commit can't rewrite executed
- *    code next to the PAT. Both hook and helper render from ONE bash template
- *    (PUSH_RETRY) — DRY at the TS source level, NOT by the hook sourcing a
- *    repo-controlled script.
+ *    code next to the PAT. Since #6530 both hook and helper delegate to
+ *    `gbrain git commit-push` (src/core/git/commit-push.ts); the hook runs the
+ *    absolute CLI path captured at harden time, never the committed helper.
  *  - Credential is repo-scoped (local git config), token redacted everywhere
  *    via shell-redact's exact-value scrubber, store file 0600.
  *
@@ -28,21 +29,30 @@
  */
 
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync, appendFileSync,
 } from 'fs';
 import { join, dirname, relative, isAbsolute } from 'path';
-import { execFileSync, execSync } from 'child_process';
+import { execFileSync, execSync } from './spawn.ts';
+import { execFileBounded } from './bounded-child-exec.ts';
 import {
-  GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
-  type PullOutcome, type PushProbeResult,
+  GIT_ENV, divergenceSafePull, detectDefaultBranch, pushProbe,
+  type PullOutcome, type PullStrategy, type PushProbeResult,
 } from './git-remote.ts';
 import { findResolverFile, RESOLVER_FILENAMES } from './resolver-filenames.ts';
 import { redactSecretsInText } from './minions/handlers/shell-redact.ts';
 import { ensureGbrainHome, resolveGbrainHome } from './gbrain-home.ts';
 import { binaryOnPath } from './execution-env.ts';
-// Static import → bundled into the --compile binary so the taxonomy never drifts
-// and needs no runtime skills/ directory.
+import { loadFilingRules, type FilingRulesDoc } from './filing-audit.ts';
+import { classifyGitCheckout } from './git-checkout.ts';
+import { OperationError, opError } from './ops/contract.ts';
+import { readFix } from './ops/op-fix.ts';
+// Bundled into the --compile binary as the fallback taxonomy for repos that
+// don't ship their own — see resolveFilingRules().
 import filingRulesDoc from '../../skills/_brain-filing-rules.json';
+import { gitChildEnv } from './git-env.ts';
+import { commitAndPush, commitPathsLocked, readIntegrateConflict } from './git/commit-push.ts';
+
+export { execFileBounded, type BoundedExecOptions } from './bounded-child-exec.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -71,6 +81,7 @@ export interface HardenOpts {
   repoPath: string;
   sourceId: string;
   branch?: string;          // default: detectDefaultBranch
+  pullStrategy?: PullStrategy; // sources.config.pull_strategy (#5429); default rebase
   pat?: string;             // already-loaded token; never logged
   installCron?: boolean;    // default true
   verify?: boolean;         // default true
@@ -152,54 +163,59 @@ export function maintainPushLog(): void {
   } catch { /* best-effort */ }
 }
 
-// ── Shared bash push-retry template (DRY at the TS source — D7) ──────────────
-// Rendered into BOTH the (committed) helper and the (local, untracked) hook so
-// there is one source of truth without the hook executing repo-controlled code.
-const PUSH_RETRY = `# --- gbrain durability push-retry (generated; one source of truth) ---
-brain_push() {
-  _branch="$1"
-  # CX2-8: GBRAIN_HOME is a PARENT dir (matches config.ts semantics — .gbrain appended)
-  _log="\${GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log"
-  mkdir -p "$(dirname "$_log")" 2>/dev/null || true
-  # S3#10: the push log may capture remote errors — never group/other readable.
-  [ -e "$_log" ] || { : >"$_log" 2>/dev/null && chmod 600 "$_log" 2>/dev/null; } || true
-  _gd="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
-  # Serialize concurrent pushes (commit bursts) so they coalesce instead of a
-  # rebase-retry herd. No-op if flock is unavailable.
-  if command -v flock >/dev/null 2>&1; then
-    exec 9>"$_gd/gbrain-push.lock"
-    flock -w 30 9 || { echo "$(date -u +%FT%TZ) [push] lock-timeout $_branch" >>"$_log"; return 0; }
-  fi
-  if git push origin "HEAD:$_branch" >>"$_log" 2>&1; then
-    echo "$(date -u +%FT%TZ) [push] ok $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
-  fi
-  echo "$(date -u +%FT%TZ) [push] rejected; rebase-pull $_branch" >>"$_log"
-  if git pull --rebase origin "$_branch" >>"$_log" 2>&1 && git push origin "HEAD:$_branch" >>"$_log" 2>&1; then
-    echo "$(date -u +%FT%TZ) [push] ok-after-rebase $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
-  fi
-  git rebase --abort >/dev/null 2>&1 || true
-  echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch @ $(git rev-parse --short HEAD 2>/dev/null) could not reach origin. Run: gbrain sources pull <id> && git push" >>"$_log"
-  return 1
-}`;
+// ── Helper + hook templates (#6530) ─────────────────────────────────────────
+// Both delegate to `gbrain git commit-push` (src/core/git/commit-push.ts):
+// a short commit lock plus a separate push lock per checkout, path-scoped commits, remote commits merged in
+// memory, the checkout advanced fast-forward only. Neither ever runs
+// `pull --rebase`, `stash` or `reset` in the shared tree. The banners above
+// stay byte-identical: they are the ownership markers isDurabilityHardened,
+// installLocalHook and unharden match (changing one would silently turn off
+// write-through commits on every hardened repo). The protocol revision lives
+// on its own `# gbrain-protocol:` line.
 
-function renderPostCommitHook(): string {
+export const DURABILITY_PROTOCOL = 2;
+const PROTOCOL_LINE = `# gbrain-protocol: ${DURABILITY_PROTOCOL}`;
+
+/** The protocol revision a rendered hook/helper declares; 1 for pre-#6530 files (no line). */
+export function durabilityProtocolOf(text: string): number {
+  const m = /^# gbrain-protocol: (\d+)$/m.exec(text);
+  return m ? Number(m[1]) : 1;
+}
+
+function shq(v: string): string {
+  return `'${v.replace(/'/g, `'\\''`)}'`;
+}
+
+function renderPostCommitHook(cli: string): string {
   return `#!/usr/bin/env bash
 ${HOOK_BANNER}
-# LOCAL + untracked — NEVER commit this file. Best-effort background auto-push so
-# agent writes don't sit local-only. The real guarantee is ${HELPER_REL}.
-# Bypass: git commit --no-verify.
-set -euo pipefail
+${PROTOCOL_LINE}
+# LOCAL + untracked — NEVER commit this file. Best-effort background push so
+# commits don't sit local-only. Runs the gbrain CLI captured at harden time
+# (never the committed helper), which takes the checkout's commit lock,
+# merges remote commits in memory and never moves files under local edits.
+# The fail-loud guarantee is ${HELPER_REL}. Bypass: git commit --no-verify.
+set -uo pipefail
+unset $(git rev-parse --local-env-vars) 2>/dev/null || true
 
-_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+# The committing process (gbrain git commit-push / ${HELPER_REL}) publishes itself.
+[ -n "\${BRAIN_COMMIT_LOCK_HELD:-}" ] && exit 0
+
+_log="\${GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log"
+mkdir -p "$(dirname "$_log")" 2>/dev/null || true
+[ -e "$_log" ] || { : >"$_log" 2>/dev/null && chmod 600 "$_log" 2>/dev/null; } || true
+_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || echo HEAD)"
 if [ "$_branch" = "HEAD" ]; then
-  echo "$(date -u +%FT%TZ) [push] detached HEAD; skip" >> "\${GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log" 2>/dev/null || true
+  echo "$(date -u +%FT%TZ) [push] detached HEAD; skip" >>"$_log" 2>/dev/null || true
   exit 0
 fi
-
-${PUSH_RETRY}
-
-# Detach so the commit returns instantly; all output goes to the log.
-( brain_push "$_branch" ) </dev/null >/dev/null 2>&1 &
+_cli=${shq(cli)}
+if [ ! -x "$_cli" ]; then
+  echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch @ $(git rev-parse --short HEAD 2>/dev/null) gbrain CLI missing at $_cli. Run: gbrain sources harden <id>" >>"$_log" 2>/dev/null || true
+  exit 0
+fi
+# Detach so the commit returns instantly; the CLI logs its own outcome.
+( "$_cli" git commit-push --push-only --require-clean ) </dev/null >/dev/null 2>&1 &
 disown 2>/dev/null || true
 exit 0
 `;
@@ -208,47 +224,108 @@ exit 0
 function renderCommitPushHelper(): string {
   return `#!/usr/bin/env bash
 ${HELPER_BANNER}
-# THE DURABILITY GUARANTEE: add -> commit -> push, atomically. Refuses to exit 0
-# without a confirmed push. Usage:
+${PROTOCOL_LINE}
+# THE DURABILITY GUARANTEE: commit the named paths and push, safely, in a
+# checkout other agents share. Refuses to exit 0 without a confirmed push.
 #   scripts/brain-commit-push.sh "message" <path> [path ...]
-#   scripts/brain-commit-push.sh --push-only [branch]
+#   scripts/brain-commit-push.sh --push-only
+#   scripts/brain-commit-push.sh --pull
+# Delegates to \`gbrain git commit-push\` (lock, path-scoped commit, in-memory
+# merge, fast-forward-only checkout). Without a capable gbrain it only commits
+# the paths under the lock and pushes; a rejected push fails loudly. It never
+# runs pull --rebase, stash or reset. Guide: docs/guides/shared-checkout-git.md
 set -euo pipefail
+unset $(git rev-parse --local-env-vars) 2>/dev/null || true
 
-${PUSH_RETRY}
-
-_branch="$(git rev-parse --abbrev-ref HEAD)"
-if [ "\${1:-}" = "--push-only" ]; then
-  brain_push "\${2:-$_branch}"; exit $?
+_managed_git="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+if [ -e "$_managed_git/gbrain-managed.json" ] || [ -e .gbrain-managed ]; then
+  echo "writer_coordinator_required: submit managed changes through persistence" >&2; exit 1
 fi
 
-_msg="\${1:?usage: brain-commit-push.sh <message> <path> [paths...]}"; shift || true
+_gbrain_cli() {
+  local c
+  for c in "$(command -v gbrain 2>/dev/null || true)" "$(git config --local --get gbrain.cliPath 2>/dev/null || true)"; do
+    [ -n "$c" ] && [ -x "$c" ] && "$c" git commit-push --help >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
 
-# EXPLICIT paths only — never a blind 'git add -A' (would risk committing
-# secrets, temp files, or unrelated edits).
-if [ "$#" -eq 0 ]; then
-  echo "refusing blind 'git add -A' — pass explicit path(s) to commit" >&2; exit 2
+_branch="$(git symbolic-ref --quiet --short HEAD)" || { echo "detached HEAD: check out a branch first" >&2; exit 1; }
+_run() {
+  local rc=0
+  "$_cli" git commit-push "$@" || rc=$?
+  if [ "$rc" -eq 4 ]; then
+    echo "PUSH FAILED — commit is local-only, NEEDS ATTENTION (see \${GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log)" >&2
+  fi
+  exit "$rc"
+}
+if _cli="$(_gbrain_cli)"; then
+  case "\${1:-}" in
+    --push-only) if [ -n "\${2:-}" ]; then _run --push-only --branch "$2"; else _run --push-only; fi ;;
+    --pull) _run --pull ;;
+  esac
+  _msg="\${1:?usage: brain-commit-push.sh <message> <path> [paths...]}"; shift
+  [ "$#" -gt 0 ] || { echo "refusing a repo-wide commit: pass explicit path(s)" >&2; exit 2; }
+  _run -m "$_msg" -- "$@"
 fi
-# COMMIT BEFORE PULL (#2426): the old order (fetch + pull --rebase, THEN stage)
-# aborted on any dirty tree — 'cannot pull with rebase: You have unstaged
-# changes' — so the helper could never commit a MODIFIED page (exactly the
-# write-through case). Stage + commit first; brain_push below already handles
-# a remote that advanced (push -> rejected -> pull --rebase -> push).
-git add -- "$@"
-if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
-git commit -m "$_msg"
 
-if brain_push "$_branch"; then exit 0; fi
-echo "PUSH FAILED — commit is local-only, NEEDS ATTENTION (see ${'$'}{GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log)" >&2
+# ── Fallback: no gbrain that knows \`git commit-push\` on this machine ──────────
+_branch="$(git symbolic-ref --quiet --short HEAD)" || { echo "detached HEAD: check out a branch first" >&2; exit 1; }
+echo "[brain-commit-push] gbrain git commit-push unavailable; using the minimal locked commit + push" >&2
+_log="\${GBRAIN_HOME:-$HOME}/.gbrain/brain-push.log"
+mkdir -p "$(dirname "$_log")" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+  exec 8>"$(git rev-parse --git-path brain-commit.lock)"
+  flock -w "\${GBRAIN_COMMIT_LOCK_WAIT_SECONDS:-\${GBRAIN_PUSH_LOCK_WAIT_SECONDS:-60}}" 8 || { echo "commit_lock_busy: another writer holds the commit lock" >&2; exit 1; }
+  exec 9>"$(git rev-parse --git-path gbrain-push.lock)"
+  flock -w "\${GBRAIN_COMMIT_LOCK_WAIT_SECONDS:-\${GBRAIN_PUSH_LOCK_WAIT_SECONDS:-60}}" 9 || { echo "commit_lock_busy: another writer holds the push lock" >&2; exit 1; }
+  export BRAIN_COMMIT_LOCK_HELD=1
+else
+  echo "[brain-commit-push] flock not found: committing without the writer lock (install gbrain or flock)" >&2
+fi
+case "\${1:-}" in
+  --pull)
+    git fetch --no-tags origin "$_branch"
+    exec git -c core.hooksPath=/dev/null merge --ff-only --no-autostash "origin/$_branch" ;;
+  --push-only) ;;
+  *)
+    _msg="\${1:?usage: brain-commit-push.sh <message> <path> [paths...]}"; shift
+    [ "$#" -gt 0 ] || { echo "refusing a repo-wide commit: pass explicit path(s)" >&2; exit 2; }
+    git add -A -- "$@"
+    if git diff --cached --quiet -- "$@"; then echo "nothing to commit"; else git commit --only -m "$_msg" -- "$@"; fi ;;
+esac
+_head="$(git rev-parse HEAD)"
+if git push origin "$_head:refs/heads/$_branch" >>"$_log" 2>&1; then
+  echo "$(date -u +%FT%TZ) [push] ok $_branch $(git rev-parse --short "$_head")" >>"$_log"; exit 0
+fi
+echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch @ $(git rev-parse --short "$_head") push rejected; run gbrain git commit-push --push-only" >>"$_log"
+echo "PUSH FAILED — the commit is local-only. Install gbrain, then run: gbrain git commit-push --push-only (it merges remote commits safely). Never git pull --rebase here." >&2
 exit 4
 `;
 }
 
 // ── Managed AGENTS/RESOLVER block (taxonomy from filing rules; no drift) ─────
 
-function renderTaxonomyLines(): string {
+/**
+ * Resolve the filing-rules taxonomy for `repoPath`: prefer the repo's own
+ * `skills/_brain-filing-rules.json`, then `_brain-filing-rules.json` at the
+ * repo root, else the bundled default. Fails open — a missing or malformed
+ * repo file must never break `sources harden`.
+ */
+function resolveFilingRules(repoPath: string): FilingRulesDoc {
+  for (const dir of [join(repoPath, 'skills'), repoPath]) {
+    try {
+      const rules = loadFilingRules(dir);
+      if (rules) return rules;
+    } catch { /* malformed — fall through to the bundled default */ }
+  }
+  return filingRulesDoc as FilingRulesDoc;
+}
+
+function renderTaxonomyLines(rules: FilingRulesDoc): string {
   const seen = new Set<string>();
   const lines: string[] = [];
-  for (const r of (filingRulesDoc as any).rules ?? []) {
+  for (const r of rules.rules ?? []) {
     const dir = String(r.directory || '').trim();
     if (!dir || seen.has(dir)) continue;
     seen.add(dir);
@@ -257,35 +334,73 @@ function renderTaxonomyLines(): string {
   return lines.join('\n');
 }
 
-function renderManagedBlock(): string {
+/**
+ * The classic rules tell agents to run the push helper after every write and
+ * its `--pull` mode before writing (#6530: never `git pull --rebase`). On a managed canonical worktree
+ * (#5808) both route agents around the persistence owner, so the block has a
+ * managed variant: page writes through gbrain, non-page files with plain git,
+ * never pull or rebase the checkout. `gbrain sources writer git-durability
+ * <source> --enable` (and `--pat-file`) regenerates it there.
+ */
+function renderManagedBlock(repoPath: string, managed?: { sourceId: string }): string {
+  const rules = resolveFilingRules(repoPath);
+  const regeneratedBy = managed ? `gbrain sources writer git-durability ${managed.sourceId} --enable` : 'gbrain sources harden';
+  const writeRules = managed ? `2. **Page writes go through gbrain, never through git.** This checkout is the
+   managed canonical worktree of gbrain source \`${managed.sourceId}\`: the persistence
+   owner writes each page file, commits only the page paths it wrote and pushes
+   HEAD after every page write. Save pages with the gbrain tools (\`put_page\`,
+   \`edit_page\`, \`remember\`, \`capture\`); do not run the classic commit-and-push
+   helper, \`git add -A\` or \`git commit\` for pages. Confirm a write landed with
+   \`gbrain sources writer status ${managed.sourceId} --json\` (its receipts and parked
+   effects), and that links resolve with \`gbrain check-resolvable\`.
+
+3. **Never pull, rebase or reset this checkout.** The owner publishes from local
+   HEAD and never pulls, so a pull, rebase, reset or checkout of page paths moves
+   files under it. To bring in remote commits run
+   \`gbrain sources refresh ${managed.sourceId}\`. Files that are not pages (this file,
+   \`MEMORY.md\`, daily notes) are yours: \`git add\` and \`git commit\` them with plain
+   git; they reach the remote on the owner's next push, or push them by hand
+   with \`git push\` (never \`--force\`).` : `2. **Every write is committed AND pushed — push is never deferred.** After any
+   persistent write, run \`scripts/brain-commit-push.sh "<msg>" <path>\` (or
+   \`gbrain git commit-push -m "<msg>" -- <path>\`). It commits only the paths you
+   name, takes this checkout's writer lock, merges remote commits without
+   touching other agents' files, and FAILS LOUDLY if the push doesn't land. Then
+   confirm links resolve with \`gbrain check-resolvable\`. On \`integrate_conflict\`
+   stop and ask the user; on \`commit_lock_busy\` retry once. The post-commit hook
+   is only a best-effort fallback — the helper is the guarantee.
+
+3. **Bring in remote commits safely; never rebase this checkout.** Other agents
+   share it. Run \`scripts/brain-commit-push.sh --pull\` (or
+   \`gbrain git commit-push --pull\`) at session start and before each batch of
+   writes (a cron also pulls every ~30 min). Never run \`git pull --rebase\`,
+   \`git stash\`, \`--autostash\`, \`git reset --hard\` or \`git push --force\` here, and
+   never delete \`.git/rebase-merge\` without first saving its autostash with
+   \`git stash store\` (docs/guides/shared-checkout-git.md#stuck-rebase).`;
   return `${AGENTS_BEGIN}
-<!-- gbrain durability rules. This block is regenerated by \`gbrain sources harden\`.
+<!-- gbrain durability rules. This block is regenerated by \`${regeneratedBy}\`.
      Do not index as user knowledge; do not edit between the markers. -->
 ## Brain durability rules (always on)
 
 1. **Deterministic filing — never use /tmp as storage.** Every persistent output
    goes to its taxonomy path (canonical, from \`skills/_brain-filing-rules.json\`):
-${renderTaxonomyLines()}
+${renderTaxonomyLines(rules)}
    Writing to /tmp, scratch dirs, or outside the repo is forbidden for anything
    meant to persist.
 
-2. **Every write is committed AND pushed — push is never deferred.** After any
-   persistent write, run \`scripts/brain-commit-push.sh "<msg>" <path>\` (it commits,
-   pushes, and FAILS LOUDLY if the push doesn't land), then confirm links resolve
-   with \`gbrain check-resolvable\`. Do not move on until the push succeeded. The
-   post-commit hook is only a best-effort fallback — the helper is the guarantee.
-
-3. **Pull before you touch anything.** Run \`git fetch && git pull --rebase\` at
-   session start and again before each batch of writes, so a long-lived session
-   never edits a stale tree (a cron also pulls every ~30 min).
+${writeRules}
 ${AGENTS_END}`;
 }
 
+/** #5808: the managed variant of the block, rewritten in place by the Git-durability admin verb; the operator commits it. */
+export function patchManagedDurabilityBlock(repoPath: string, sourceId: string, dryRun: boolean): { status: StepStatus; detail: string } {
+  return patchResolverFile(repoPath, dryRun, { sourceId });
+}
+
 /** Patch the active resolver file with the managed block (idempotent). */
-function patchResolverFile(repoPath: string, dryRun: boolean): { status: StepStatus; detail: string } {
+function patchResolverFile(repoPath: string, dryRun: boolean, managed?: { sourceId: string }): { status: StepStatus; detail: string } {
   const existing = findResolverFile(repoPath);
   const target = existing ?? join(repoPath, RESOLVER_FILENAMES[1]); // default AGENTS.md
-  const block = renderManagedBlock();
+  const block = renderManagedBlock(repoPath, managed);
   const name = relative(repoPath, target) || target;
 
   let current = '';
@@ -319,24 +434,31 @@ function patchResolverFile(repoPath: string, dryRun: boolean): { status: StepSta
 function gitDirPath(repoPath: string, rel: string): string {
   try {
     const p = execFileSync('git', ['-C', repoPath, 'rev-parse', '--git-path', rel], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     if (p) return isAbsolute(p) ? p : join(repoPath, p);
   } catch { /* fall through to the classic layout */ }
   return join(repoPath, '.git', rel);
 }
 
+function pathContains(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
 function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
   let hooksPath = '';
   try {
     hooksPath = execFileSync('git', ['-C', repoPath, 'config', '--get', 'core.hooksPath'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch { /* unset — normal */ }
   if (hooksPath) {
     const dir = isAbsolute(hooksPath) ? hooksPath : join(repoPath, hooksPath);
-    // A hooksPath outside .git/ (e.g. .githooks) is a TRACKED location.
-    const tracked = !dir.includes(`${join('.git', '')}`) && !dir.endsWith('.git/hooks');
+    // A hooksPath in the working tree but outside the git dir (e.g. .githooks)
+    // is a TRACKED location. Classify by path containment, never by a '.git'
+    // substring, which matches '.githooks' and checkouts like 'site.github.io'.
+    const tracked = pathContains(repoPath, dir) && !pathContains(gitDirPath(repoPath, ''), dir);
     return { dir, tracked };
   }
   return { dir: gitDirPath(repoPath, 'hooks'), tracked: false };
@@ -359,11 +481,15 @@ function ensureExcluded(repoPath: string, relPath: string): void {
 function installLocalHook(repoPath: string, dryRun: boolean): { status: StepStatus; detail: string } {
   const { dir, tracked } = resolveHooksDir(repoPath);
   const hookPath = join(dir, 'post-commit');
-  const script = renderPostCommitHook();
+  const script = renderPostCommitHook(resolveGbrainCliPath());
 
   if (existsSync(hookPath)) {
     const cur = readFileSync(hookPath, 'utf-8');
     if (cur.includes(HOOK_BANNER)) {
+      if (durabilityProtocolOf(cur) > DURABILITY_PROTOCOL) {
+        return { status: 'needs_attention', detail: `${relative(repoPath, hookPath)} was written by a newer gbrain (protocol ${durabilityProtocolOf(cur)}); upgrade gbrain instead of downgrading it` };
+      }
+      if (tracked && !dryRun) ensureExcluded(repoPath, relative(repoPath, hookPath));
       if (cur === script) return { status: 'ok', detail: `${relative(repoPath, hookPath)} already current` };
       if (dryRun) return { status: 'fixed', detail: `would refresh ${relative(repoPath, hookPath)} (dry-run)` };
       writeFileSync(hookPath, script); chmodSync(hookPath, 0o755);
@@ -408,28 +534,172 @@ export function isDurabilityHardened(repoPath: string): boolean {
 }
 
 /**
+ * #6210: the durability probe never reads a failure as "not hardened". A
+ * failed probe is `git_unavailable` and the caller keeps its Git effect
+ * unfinished; only a directory that is positively not a Git checkout
+ * (`classifyGitCheckout`) or a hook file that is absent reads as false.
+ */
+function durabilityProbeFailure(detail: string): OperationError {
+  return opError('git_unavailable', 'Cannot determine whether native Git durability is enabled.',
+    `${detail} This does not show that durability is off, so the Git effect stays unfinished and retries; nothing was committed or pushed for it yet. Check that the checkout is readable and that git works there (git status in the checkout), then read the owner's effect status.`,
+    { fix: readFix('Shows the canonical owner and its pending Git effects, read-only.', { argv: ['gbrain', 'sources', 'writer', 'status', '--json'] }) });
+}
+
+/** A git probe that does not block the event loop. Exit 1 is an unset key for `config --get`; every other failure throws. */
+async function gitProbe(repoPath: string, args: string[]): Promise<string> {
+  const { error, stdout } = await execFileBounded('git', ['-C', repoPath, ...args],
+    { timeout: 10_000, env: gitChildEnv({ ...GIT_ENV, LC_ALL: 'C', LANGUAGE: 'C' }) });
+  if (!error) return stdout.trim();
+  if (error.code === 1 && args[0] === 'config' && args[1] === '--get') return '';
+  const status = typeof error.code === 'number' ? `exit ${error.code}` : typeof error.code === 'string' && /^[A-Z_]+$/.test(error.code) ? error.code : 'no exit status';
+  throw durabilityProbeFailure(`git ${args.slice(0, 2).join(' ')} failed (${status}).`);
+}
+
+/**
+ * {@link isDurabilityHardened} for long-running owners: the same two git
+ * probes, run concurrently as child processes the event loop does not wait on.
+ * Rejects with `git_unavailable` when it cannot tell (#6210).
+ */
+export async function isDurabilityHardenedAsync(repoPath: string): Promise<boolean> {
+  const checkout = classifyGitCheckout(repoPath);
+  if (checkout === 'not_git') return false;
+  if (checkout === 'unknown') throw durabilityProbeFailure('The checkout directory, or a parent directory, could not be read.');
+  const [hooksPath, gitHooks] = await Promise.all([gitProbe(repoPath, ['config', '--get', 'core.hooksPath']),
+    gitProbe(repoPath, ['rev-parse', '--git-path', 'hooks'])]);
+  const reported = hooksPath || gitHooks;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoPath is a registered local worktree root and the hooks path comes from git itself, resolved exactly as resolveHooksDir/gitDirPath do
+  const dir = !reported ? join(repoPath, '.git', 'hooks') : isAbsolute(reported) ? reported : join(repoPath, reported);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- fixed hook filename inside the git-reported hooks directory, as in isDurabilityHardened
+  const hookPath = join(dir, 'post-commit');
+  let hook: string;
+  try {
+    hook = readFileSync(hookPath, 'utf-8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw durabilityProbeFailure(`The post-commit hook could not be read (${typeof code === 'string' && /^E[A-Z]+$/.test(code) ? code : 'read error'}).`);
+  }
+  return hook.includes(HOOK_BANNER);
+}
+
+/**
  * #2426: best-effort commit of a single write-through artifact so DB writes
  * reach git (the post-commit hook then background-pushes). Pre-fix,
  * write-through `.md` accumulated uncommitted forever: it never reached the
  * remote, froze `last_sync_at` (HEAD never moved), and a later `sync --full`
  * delete-reconcile treated the never-committed pages as disposable.
  *
- * Path-limited (`git commit -- <path>`) so unrelated staged/dirty edits are
- * never swept into the commit. Never throws; returns false on any failure
- * (index.lock contention, nothing changed, detached states) — the DB row and
- * the on-disk file remain the durable sinks either way.
+ * #6530: commits only `<path>` (`commit --only`), under the checkout's commit
+ * lock when it frees within a short budget; a writer that holds it longer
+ * (a push on a slow network) does not stall the page write, and the commit
+ * still lands path-scoped (the shared checkout only ever fast-forwards, so it
+ * cannot be reverted by that writer). index.lock contention is retried
+ * briefly. Never throws; returns false when nothing was committed — the DB
+ * row and the on-disk file remain the durable sinks either way.
+ *
+ * `git add -- <path>` stages a removal as readily as an edit, so
+ * `deletePageThrough` reuses this helper with `action: 'delete write-through'`
+ * — same hardening gate, same explicit-path discipline, distinct subject line.
  */
-export function commitWriteThroughFile(repoPath: string, absPath: string, slug: string): boolean {
+export function commitWriteThroughFile(
+  repoPath: string,
+  absPath: string,
+  slug: string,
+  action: 'write-through' | 'delete write-through' = 'write-through',
+): boolean {
   try {
     const rel = relative(repoPath, absPath);
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) return false;
-    const gitOpts = { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } } as const;
-    execFileSync('git', ['-C', repoPath, 'add', '--', rel], gitOpts);
-    execFileSync('git', ['-C', repoPath, 'commit', '-m', `gbrain: write-through ${slug}`, '--', rel], gitOpts);
-    return true;
+    return commitPathsLocked(repoPath, [absPath], `gbrain: ${action} ${slug}`, { lockWaitMs: WRITE_THROUGH_LOCK_WAIT_MS }) !== null;
   } catch {
     return false;
   }
+}
+
+const WRITE_THROUGH_LOCK_WAIT_MS = 2_000;
+
+// ── Push-state query (D14) ───────────────────────────────────────────────────
+
+export type PushLogStatus = 'ok' | 'needs_attention' | 'unknown';
+
+export interface PushLogOutcome {
+  status: PushLogStatus;
+  detail: string;
+  /** UTC timestamp parsed from the log line, when found. */
+  at?: string;
+}
+
+const PUSH_LOG_OK = /^(\S+) \[push\] (?:ok|ok-after-rebase|ok-after-merge|ok-already-on-remote) (\S+)\b/;
+const PUSH_LOG_LOCAL_ONLY = /^(\S+) \[push\] (?:LOCAL-ONLY|CONFLICT), NEEDS ATTENTION: (\S+) /;
+
+export type PushLogKind = 'ok' | 'ok-after-merge' | 'nothing' | 'local-only' | 'conflict' | 'lock-timeout' | 'checkout-lagging';
+
+/**
+ * #6530: one `brain-push.log` line per `gbrain git commit-push` outcome, in the
+ * grammar {@link getLastPushOutcome} parses (put_page's `lastPushStatus`).
+ * `checkout-lagging` is informational: the push landed. Best-effort.
+ */
+export function appendPushLog(kind: PushLogKind, branch: string, sha: string, detail?: string): void {
+  try {
+    const at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const short = sha ? sha.slice(0, 7) : '-';
+    const clean = (detail ?? '').replace(/\s+/g, ' ').slice(0, 200);
+    const line = kind === 'ok' ? `[push] ok ${branch} ${short}`
+      : kind === 'ok-after-merge' ? `[push] ok-after-merge ${branch} ${short}`
+      : kind === 'nothing' ? `[push] ok-already-on-remote ${branch} ${short}`
+      : kind === 'lock-timeout' ? `[push] lock-timeout ${branch}`
+      : kind === 'checkout-lagging' ? `[push] checkout-lagging ${branch} ${short} ${clean}`
+      : kind === 'conflict' ? `[push] CONFLICT, NEEDS ATTENTION: ${branch} local and remote changed the same file. Run: gbrain git commit-push --push-only --resolve <path>=ours|theirs`
+      : `[push] LOCAL-ONLY, NEEDS ATTENTION: ${branch} @ ${short} could not reach the remote. Run: gbrain git commit-push --push-only`;
+    const p = pushLogPath();
+    mkdirSync(dirname(p), { recursive: true });
+    if (!existsSync(p)) writeFileSync(p, '', { mode: 0o600 });
+    appendFileSync(p, `${at} ${line}\n`);
+  } catch { /* best-effort */ }
+}
+const PUSH_LOG_LOCK_TIMEOUT = /^(\S+) \[push\] lock-timeout (\S+)\b/;
+
+/**
+ * Best-effort read of the most recently logged push outcome for `branch`,
+ * from the shared hook log ($GBRAIN_HOME/brain-push.log). The push itself
+ * runs detached in the background (see `renderPostCommitHook`), so nothing
+ * synchronous ever learns whether a given commit's own push landed — this is
+ * the queryable substitute: "as of the last thing the hook logged for this
+ * branch, were pushes landing?"
+ *
+ * The log is host-wide and keyed only by branch name, not repo path, so two
+ * different hardened repos sharing a branch name (e.g. both on `main`) share
+ * this signal. That's an acceptable approximation for a liveness check, not
+ * a per-repo guarantee. With `repo`, an unresolved integrate_conflict recorded
+ * in that checkout (#6530) wins over the log.
+ */
+export function getLastPushOutcome(branch: string, repo?: string): PushLogOutcome {
+  const conflict = repo ? readIntegrateConflict(repo) : null;
+  if (conflict && conflict.branch === branch) {
+    return { status: 'needs_attention', at: conflict.at,
+      detail: `unresolved integrate_conflict on ${branch} (${conflict.paths.join(', ')}): run gbrain git commit-push --push-only --expect-remote ${String(conflict.remote).slice(0, 12)} --resolve <path>=ours|theirs` };
+  }
+  const log = pushLogPath();
+  if (!existsSync(log)) return { status: 'unknown', detail: 'no push attempts logged yet' };
+
+  let lines: string[];
+  try {
+    lines = readFileSync(log, 'utf-8').split('\n');
+  } catch (e) {
+    return { status: 'unknown', detail: `push log unreadable: ${(e as Error).message}` };
+  }
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line) continue;
+    let m = line.match(PUSH_LOG_OK);
+    if (m && m[2] === branch) return { status: 'ok', detail: line.trim(), at: m[1] };
+    m = line.match(PUSH_LOG_LOCAL_ONLY);
+    if (m && m[2] === branch) return { status: 'needs_attention', detail: line.trim(), at: m[1] };
+    m = line.match(PUSH_LOG_LOCK_TIMEOUT);
+    if (m && m[2] === branch) return { status: 'needs_attention', detail: line.trim(), at: m[1] };
+  }
+  return { status: 'unknown', detail: `no push attempt logged yet for branch '${branch}'` };
 }
 
 // ── Committed helper ────────────────────────────────────────────────────────
@@ -437,6 +707,9 @@ export function commitWriteThroughFile(repoPath: string, absPath: string, slug: 
 function installHelper(repoPath: string, dryRun: boolean): { status: StepStatus; detail: string } {
   const helperPath = join(repoPath, HELPER_REL);
   const script = renderCommitPushHelper();
+  if (existsSync(helperPath) && durabilityProtocolOf(readFileSync(helperPath, 'utf-8')) > DURABILITY_PROTOCOL) {
+    return { status: 'needs_attention', detail: `${HELPER_REL} was written by a newer gbrain (protocol ${durabilityProtocolOf(readFileSync(helperPath, 'utf-8'))}); upgrade gbrain instead of downgrading it` };
+  }
   if (existsSync(helperPath) && readFileSync(helperPath, 'utf-8') === script) {
     // Ensure exec bit even when content is current — but not in dry-run: a
     // preview must not mutate permissions (#3736).
@@ -455,19 +728,19 @@ function gitConfigGet(repoPath: string, key: string, localOnly = false): string 
   try {
     const scope = localOnly ? ['--local'] : [];
     return execFileSync('git', ['-C', repoPath, 'config', ...scope, '--get', key], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch { return ''; }
 }
 function gitConfigSet(repoPath: string, key: string, value: string): void {
   execFileSync('git', ['-C', repoPath, 'config', key, value], {
-    stdio: 'ignore', timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+    stdio: 'ignore', timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
   });
 }
 function gitConfigUnset(repoPath: string, key: string): void {
   try {
     execFileSync('git', ['-C', repoPath, 'config', '--unset-all', key], {
-      stdio: 'ignore', timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: 'ignore', timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     });
   } catch { /* not set */ }
 }
@@ -475,7 +748,7 @@ function gitConfigUnset(repoPath: string, key: string): void {
 function remoteHost(repoPath: string): string {
   try {
     const url = execFileSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     return new URL(url).hostname || 'github.com';
   } catch { return 'github.com'; }
@@ -759,17 +1032,17 @@ function isGitRepo(repoPath: string): boolean {
 function resolveRepoRoot(path: string): string {
   try {
     return execFileSync('git', ['-C', path, 'rev-parse', '--show-toplevel'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch {
     throw new Error(`not a git repo: ${path}`);
   }
 }
 
-function currentBranch(repoPath: string): string {
+export function currentBranch(repoPath: string): string {
   try {
     return execFileSync('git', ['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch { return 'HEAD'; }
 }
@@ -777,7 +1050,7 @@ function currentBranch(repoPath: string): string {
 function headSha(repoPath: string): string {
   try {
     return execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
   } catch { return ''; }
 }
@@ -787,6 +1060,7 @@ function pullDetail(o: PullOutcome): { status: StepStatus; detail: string } {
     case 'up_to_date': return { status: 'ok', detail: 'already up to date with origin' };
     case 'advanced': return { status: 'fixed', detail: `advanced ${o.from.slice(0, 7)}→${o.to.slice(0, 7)}` };
     case 'skipped_dirty': return { status: 'skipped', detail: 'working tree dirty — pull skipped (in-progress edits preserved)' };
+    case 'skipped_busy': return { status: 'skipped', detail: 'another writer holds the commit lock — pull skipped; the next run catches up' };
     case 'conflict_aborted': return { status: 'needs_attention', detail: o.detail };
   }
 }
@@ -796,6 +1070,18 @@ function pullDetail(o: PullOutcome): { status: StepStatus; detail: string } {
  * already-hardened repo produces all ok/skipped and NO new commit.
  */
 export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityReport> {
+  // #5182: a managed canonical worktree gets no hook, cron or helper here — the
+  // owner's recorded git_durability setting decides, and its verb installs
+  // the credential. Name that verb instead of the bare coordinator refusal.
+  const managed = managedFilesystemRootFor(opts.repoPath);
+  if (managed && !hasFilesystemPublication(opts.repoPath)) {
+    const sourceId = managed.sourceId ?? opts.sourceId;
+    throw opError('writer_coordinator_required',
+      `${opts.repoPath} is the managed canonical worktree of source ${sourceId}; its Git durability is an owner setting, not a hook.`,
+      `Run gbrain sources writer git-durability ${sourceId} --enable${opts.pat ? ' --pat-file <path>' : ''} (add --dry-run to preview). The owner commits and pushes page writes itself; no pull cron or post-commit hook is installed on a managed root.`,
+      { fix: readFix('Shows the owner and whether it commits and pushes page writes, read-only.', { argv: ['gbrain', 'sources', 'writer', 'status', sourceId, '--json'] }) });
+  }
+  if (!opts.dryRun) assertManagedFilesystemWrite(opts.repoPath);
   const { sourceId } = opts;
   const dryRun = !!opts.dryRun;
   const installCron = opts.installCron !== false;
@@ -820,9 +1106,11 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
   // Refuse on detached HEAD — pushing to a wrong ref is worse than not pushing.
   if (currentBranch(repoPath) === 'HEAD') {
     push('pull', { status: 'needs_attention', detail: 'detached HEAD — checkout a branch before hardening' });
+  } else if (dryRun) {
+    push('pull', { status: 'skipped', detail: `dry-run — would fetch origin/${branch} and fast-forward (or merge in memory)` });
   } else {
     // 1. pull current state
-    try { push('pull', pullDetail(divergenceSafePull(repoPath, branch))); }
+    try { push('pull', pullDetail(divergenceSafePull(repoPath, branch, { strategy: opts.pullStrategy }))); }
     catch (e) { push('pull', { status: 'needs_attention', detail: `fetch/pull failed: ${(e as Error).message.slice(0, 140)}` }); }
   }
 
@@ -830,8 +1118,18 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
   if (opts.pat) push('credential', wireRepoCredential(repoPath, opts.pat, dryRun));
   else push('credential', { status: 'skipped', detail: 'no PAT provided — relying on existing git auth' });
 
-  // 3. local untracked hook
+  // 3. local untracked hook (+ #6530 local git config: the CLI path the
+  // helper falls back to, and autostash off / pull.ff=only so a stray
+  // `git pull` in the shared checkout refuses instead of stashing others' work)
   push('hook', installLocalHook(repoPath, dryRun));
+  if (!dryRun) {
+    try {
+      gitConfigSet(repoPath, 'gbrain.cliPath', resolveGbrainCliPath());
+      gitConfigSet(repoPath, 'rebase.autoStash', 'false');
+      gitConfigSet(repoPath, 'merge.autoStash', 'false');
+      gitConfigSet(repoPath, 'pull.ff', 'only');
+    } catch { /* best-effort: the helper still resolves gbrain from PATH */ }
+  }
   // 4. committed helper
   push('helper', installHelper(repoPath, dryRun));
   // 5. resolver/AGENTS rules
@@ -867,23 +1165,19 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
 }
 
 function commitScaffolding(repoPath: string, branch: string, redact: (s: string) => string): { status: StepStatus; detail: string } | null {
-  // Stage only the durability artifacts we manage — never a blind add.
+  // Only the durability artifacts we manage, through the shared-checkout
+  // protocol (#6530): commit --only those paths under the commit lock, push,
+  // merge remote commits in memory if the push is rejected. The commit carries
+  // the lock marker, so the freshly installed post-commit hook stands down and
+  // this push is the only one (#3925).
   const paths: string[] = [HELPER_REL];
   const resolver = findResolverFile(repoPath);
   if (resolver) paths.push(relative(repoPath, resolver));
   try {
-    execFileSync('git', ['-C', repoPath, 'add', '--', ...paths], { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } });
-    const staged = execFileSync('git', ['-C', repoPath, 'diff', '--cached', '--name-only'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
-    }).toString().trim();
-    if (!staged) return { status: 'ok', detail: 'scaffolding already committed' };
-    execFileSync('git', ['-C', repoPath, 'commit', '-m', 'chore(gbrain): install brain durability scaffolding'], {
-      stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV },
-    });
-    execFileSync('git', ['-C', repoPath, ...['-c', 'http.followRedirects=false'], 'push', 'origin', `HEAD:${branch}`], {
-      stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, env: { ...process.env, ...GIT_ENV_AUTH },
-    });
-    return { status: 'fixed', detail: 'committed + pushed durability scaffolding' };
+    const r = commitAndPush({ repo: repoPath, paths, cwd: repoPath, message: 'chore(gbrain): install brain durability scaffolding' });
+    if (r.branch !== branch) return { status: 'needs_attention', detail: `checkout is on ${r.branch}, not ${branch}` };
+    if (r.outcome === 'nothing_to_commit') return { status: 'ok', detail: 'scaffolding already committed' };
+    return { status: 'fixed', detail: `committed + pushed durability scaffolding${r.checkout === 'lagging' ? ` (checkout lagging: ${r.lagging_reason})` : ''}` };
   } catch (e) {
     return { status: 'needs_attention', detail: redact(`scaffolding commit/push failed: ${(e as Error).message.slice(0, 140)}`) };
   }
@@ -893,7 +1187,7 @@ function headMatchesOrigin(repoPath: string, branch: string): boolean {
   try {
     const local = headSha(repoPath);
     const remote = execFileSync('git', ['-C', repoPath, 'rev-parse', `origin/${branch}`], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: gitChildEnv({ ...GIT_ENV }),
     }).toString().trim();
     return !!local && local === remote;
   } catch { return false; }

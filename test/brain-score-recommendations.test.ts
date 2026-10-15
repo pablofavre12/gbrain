@@ -36,7 +36,7 @@ describe('embeddingProviderConfigured (recipe-aware helper)', () => {
 
   test('behavior-change: voyage judged by VOYAGE_API_KEY, not an OpenAI key', () => {
     // New (correct) behavior — pre-fix doctor judged voyage by whether any
-    // openai/ZE key existed.
+    // openai/Voyage key existed.
     expect(embeddingProviderConfigured('voyage:voyage-3', (k) => k === 'VOYAGE_API_KEY')).toBe(true);
     expect(embeddingProviderConfigured('voyage:voyage-3', (k) => k === 'OPENAI_API_KEY')).toBe(false);
   });
@@ -59,7 +59,6 @@ describe('embeddingProviderConfigured (recipe-aware helper)', () => {
   // would make the provider look "configured" and dispatch a doomed embed job.
   test('HOSTED_EMBED_KEY_CONFIG only maps gateway-propagated config keys', () => {
     expect(HOSTED_EMBED_KEY_CONFIG.OPENAI_API_KEY).toBe('openai_api_key');
-    expect(HOSTED_EMBED_KEY_CONFIG.ZEROENTROPY_API_KEY).toBe('zeroentropy_api_key');
     // #2662: buildGatewayConfig now folds voyage_api_key → VOYAGE_API_KEY,
     // so this producer-facing map must recognize it as gateway-propagated.
     expect(HOSTED_EMBED_KEY_CONFIG.VOYAGE_API_KEY).toBe('voyage_api_key');
@@ -134,6 +133,8 @@ function makeHealth(overrides: Partial<BrainHealth> = {}): BrainHealth {
     brain_score: 100,
     dead_links: 0,
     link_coverage: 1.0,
+    entity_page_count: 10,
+    entity_types_status: 'resolved',
     timeline_coverage: 1.0,
     most_connected: [],
     embed_coverage_score: 35,
@@ -169,7 +170,7 @@ describe('computeRecommendations', () => {
     expect(recs.find((r) => r.id === 'embed.stale')).toBeUndefined();
   });
 
-  test('stale pages + dead links produce sync + backlinks + extract', () => {
+  test('stale pages + dead links produce backlinks + DB extraction without filesystem sync', () => {
     const health = makeHealth({
       stale_pages: 25,
       dead_links: 8,
@@ -177,26 +178,27 @@ describe('computeRecommendations', () => {
     });
     const recs = computeRecommendations(health, { repoPath: '/brain', embeddingProviderConfigured: true });
     const ids = recs.map((r) => r.id);
-    expect(ids).toContain('sync.repo');
+    expect(ids).not.toContain('sync.repo');
     expect(ids).toContain('backlinks.fix');
-    expect(ids).toContain('extract.all');
+    expect(ids).toContain('extract.stale');
   });
 
-  test('extract.all depends on sync.repo (D14: stable ids)', () => {
+  test('extract.stale can clear extraction watermarks without a sync dependency', () => {
     const health = makeHealth({ stale_pages: 10 });
     const recs = computeRecommendations(health, { repoPath: '/brain', embeddingProviderConfigured: true });
-    const extract = recs.find((r) => r.id === 'extract.all');
-    expect(extract?.depends_on).toContain('sync.repo');
+    const extract = recs.find((r) => r.id === 'extract.stale');
+    expect(extract?.params).toEqual({ stale: true });
+    expect(extract?.depends_on).toEqual([]);
   });
 
-  test('embed.stale depends on sync.repo when sync also needed', () => {
+  test('embed.stale is not blocked by unrelated extraction watermarks', () => {
     const health = makeHealth({
       stale_pages: 10,
       missing_embeddings: 100,
     });
     const recs = computeRecommendations(health, { repoPath: '/brain', embeddingProviderConfigured: true });
     const embed = recs.find((r) => r.id === 'embed.stale');
-    expect(embed?.depends_on).toContain('sync.repo');
+    expect(embed?.depends_on).toEqual([]);
   });
 
   test('embed.stale has no sync dependency when nothing stale', () => {
@@ -342,5 +344,39 @@ describe('estimateAnthropicCost', () => {
   test('returns positive for known model', () => {
     const cost = estimateAnthropicCost('claude-sonnet-4-6', 10);
     expect(cost).toBeGreaterThan(0);
+  });
+});
+
+describe('D12 — NULL-signature cohort widens embed.stale', () => {
+  const makeHealth = (over: Partial<import('../src/core/types.ts').BrainHealth> = {}) => ({
+    page_count: 100, embed_coverage: 1, stale_pages: 0, orphan_pages: 0,
+    dead_links: 0, missing_embeddings: 0, link_count: 50, link_coverage: 1,
+    timeline_coverage: 1, most_connected: [], brain_score: 90,
+    ...over,
+  }) as import('../src/core/types.ts').BrainHealth;
+
+  test('cohort > 0 with zero missing embeddings still fires embed.stale, widened + costed', () => {
+    const recs = computeRecommendations(makeHealth(), {
+      embeddingModel: 'openai:text-embedding-3-small',
+      embeddingDimensions: 1536,
+      embeddingProviderConfigured: true,
+      nullSignatureCohort: 563,
+    });
+    const rec = recs.find((r) => r.id === 'embed.stale');
+    expect(rec).toBeDefined();
+    expect((rec!.params as { includeNullSignature?: boolean }).includeNullSignature).toBe(true);
+    expect(rec!.est_usd_cost).toBeGreaterThan(0); // the cohort is real spend
+    expect(rec!.rationale).toContain('563');
+    expect(rec!.rationale).toContain('no recorded embedding signature');
+  });
+
+  test('no cohort ⇒ params unchanged (no includeNullSignature key, idempotency stable)', () => {
+    const recs = computeRecommendations(makeHealth({ missing_embeddings: 10 }), {
+      embeddingModel: 'openai:text-embedding-3-small',
+      embeddingDimensions: 1536,
+      embeddingProviderConfigured: true,
+    });
+    const rec = recs.find((r) => r.id === 'embed.stale')!;
+    expect('includeNullSignature' in (rec.params as Record<string, unknown>)).toBe(false);
   });
 });

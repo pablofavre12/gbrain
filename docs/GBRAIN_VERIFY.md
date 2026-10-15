@@ -2,14 +2,24 @@
 
 > **One-command equivalent:** `gbrain bootstrap verify` runs the whole install
 > contract (round-trip, graph floor, and more) automatically and exits non-zero
-> on failure — it is the modern first thing to run after any install. See
+> on failure — it is the first thing to run after any install. See
 > [docs/guides/bootstrap.md](guides/bootstrap.md). This runbook is the
 > **manual, deep-verification** companion: use it when `bootstrap verify` fails
 > and you need to isolate which layer broke, or when you want to understand
 > what "healthy" looks like check by check.
 
+> **Something feels off, or a gbrain call failed?** Start with the
+> [agent operator protocol](protocol/AGENT_OPERATOR_v1.md): the error's `code`
+> and `fix.next` say what happened, who acts and how to verify; `gbrain errors
+> <code>` explains a code offline, and the
+> [troubleshooting symptom table](guides/troubleshooting.md#symptom-table)
+> covers symptoms that are not a single error. Then use the checks below.
+
 Run these checks after install to confirm every part of GBrain is working.
 Each check includes the command, expected output, and what to do if it fails.
+When `gbrain doctor` reports `timeline_history`, `derived_visibility` or
+unsealed pages, use [`gbrain repair`](guides/repair.md); when a write is
+refused with a named reason, see [write refusal reasons](guides/write-refusals.md).
 
 The most important check is #4 (live sync). "Sync ran" is not the same as
 "sync worked." A sync that silently skips pages because of a pooler bug is
@@ -35,6 +45,44 @@ gbrain doctor --json
 
 **If it fails:** The doctor output includes specific fix instructions for each
 check. See `skills/setup/SKILL.md` Error Recovery table.
+
+### 1a. Migration Plan and DB Probe
+
+**Command:**
+
+```bash
+gbrain apply-migrations --list      # per-version status: applied / partial / wedged / pending / future
+gbrain apply-migrations --dry-run   # what a real run would apply or resume
+```
+
+Both surfaces are read-only — they never run orchestrators or schema
+migrations, even when combined with `--yes`. Each prints a `Database:` probe
+line above the plan, so an unreachable database is distinguishable from a
+clean one:
+
+- `Database: connected, schema vN (latest M)` — the pre-flight probe
+  connected. N behind M means schema migrations are pending; a plain run with
+  `--yes` applies them.
+- `Database: UNREACHABLE (<reason>)` — the pre-flight connect failed. The
+  reason is scrubbed through both credential redactors (URL userinfo +
+  connection-info), so it is safe to paste into issues and CI logs.
+- `Database: not probed (<reason>)` — no probe was attempted. Normal on
+  PGLite (`pglite manages schema in-process`): the orchestrators handle the
+  schema lifecycle internally there, and the probe would briefly hold the
+  single-writer lock.
+
+**Expected:** `Database: connected, schema vN (latest N)` on Postgres, or
+`Database: not probed (pglite manages schema in-process)` on PGLite, followed
+by `All migrations up to date.`
+
+**If it fails:** an unreachable database does not stop a default run —
+orchestrator migrations still run their filesystem-only phases. Scripts and
+CI that need a hard signal add `--require-db`: with it, `--list` and
+`--dry-run` exit 1 when the probe failed, and a real run prints the probe
+line and aborts with exit 1 before any orchestrator runs. The observational
+sibling is `gbrain doctor --no-migrate`, which connects probe-only so a
+clean-or-behind schema is reported on as-is instead of being auto-migrated
+before the health checks run.
 
 ---
 
@@ -122,8 +170,10 @@ gbrain stats
 gbrain embed --stale
 ```
 
-If `OPENAI_API_KEY` is not set, embeddings can't be generated. Keyword search
-still works without embeddings, but hybrid/semantic search won't.
+Without a key for the configured embedding provider (`VOYAGE_API_KEY` for the
+default `voyage:voyage-4`, `OPENAI_API_KEY` for OpenAI models), embeddings can't
+be generated. Keyword search still works without embeddings, but
+hybrid/semantic search won't.
 
 ### 4c. End-to-End Test
 
@@ -134,9 +184,13 @@ This is the real test. Edit a brain page, push, wait, search.
 ```bash
 # Example: fix a line in alice-example's page
 cd /data/brain
-# Make a small edit to any .md file
-git add -A && git commit -m "test: verify live sync" && git push
+# Make a small edit to one .md file, then commit and push only that file
+gbrain git commit-push -m "test: verify live sync" -- people/alice-example.md
 ```
+
+It must exit 0 and print `pushed <sha> to origin/<branch>`. On any other
+result, stop the test and follow [outcomes](guides/shared-checkout-git.md#outcomes)
+(retry once on `commit_lock_busy`; ask the user on `integrate_conflict`).
 
 2. Wait for the next sync cycle (cron interval or `--watch` poll).
 
@@ -168,10 +222,12 @@ gbrain stats
 
 **Expected:** Embedded chunk count matches (or is close to) total chunk count.
 
-**If zero or very low:** `OPENAI_API_KEY` may be missing or invalid. Check:
+**If zero or very low:** the embedding provider key (`VOYAGE_API_KEY` for the
+default model, `OPENAI_API_KEY` for OpenAI models) may be missing or invalid.
+Check:
 
 ```bash
-echo $OPENAI_API_KEY | head -c 10
+echo $VOYAGE_API_KEY | head -c 10   # or $OPENAI_API_KEY
 ```
 
 If blank, set the key. Then:
@@ -179,6 +235,41 @@ If blank, set the key. Then:
 ```bash
 gbrain embed --stale
 ```
+
+### 5a. Fact and take vectors
+
+Chunk coverage says nothing about facts and takes, which are searched by vector
+too (fact dedup and consolidation, `think`, `takes search --semantic`).
+
+**Command:**
+
+```bash
+gbrain doctor --json
+```
+
+**Expected:** the `fact_take_vectors` check is `ok`. On a keyless brain
+(embeddings disabled) it reports "not applicable" and stays `ok`.
+
+**If it warns** (code `stale_vectors`): its `details` count, per source, facts
+and takes with no vector for their current text under the brain's embedding
+model, and `details.fix` lists the exact commands. Takes are repaired by the
+ordinary stale pass:
+
+```bash
+gbrain embed --stale
+```
+
+Facts are repaired per source, after a preview (paid provider calls need
+explicit authorization):
+
+```bash
+gbrain embed --facts --stale --source <source-id> --dry-run --json
+gbrain embed --facts --stale --source <source-id> --yes --max-cost-usd 1
+```
+
+If the check says the vectors were not verified (code `vectors_not_verified`),
+run `gbrain migrate embeddings --status` to see which model and width the brain
+records.
 
 ---
 
@@ -197,8 +288,9 @@ system context. See `skills/setup/SKILL.md` Phase D.
 
 ## 7. Knowledge Graph Wired
 
-The v0.12.0 graph layer needs to be populated for existing brains. New writes are
-auto-linked, but historical pages need a one-time backfill.
+The graph layer needs to be populated for brains with pre-existing content. New
+writes are auto-linked, but pages imported before the graph existed need a
+one-time backfill.
 
 **Command:**
 
@@ -236,10 +328,10 @@ heuristics won't find them — file an issue with a sample page.
 
 ---
 
-## 8. JSONB Frontmatter Integrity (v0.12.2)
+## 8. JSONB Frontmatter Integrity
 
-Postgres-backed brains created before v0.12.2 had double-encoded JSONB columns
-(`frontmatter->>'key'` returned NULL, GIN indexes were inert). `gbrain upgrade`
+A Postgres-backed brain can carry double-encoded JSONB columns
+(`frontmatter->>'key'` returns NULL, GIN indexes are inert). `gbrain upgrade`
 runs `gbrain repair-jsonb` automatically via the `v0_12_2` orchestrator.
 Verify the repair succeeded.
 
@@ -261,7 +353,8 @@ without `--dry-run`:
 gbrain repair-jsonb
 ```
 
-Idempotent. PGLite brains always report 0 (unaffected by the original bug).
+Idempotent. PGLite brains always report 0 (the embedded engine never
+double-encodes).
 
 **Bonus check** — the doctor's dedicated JSONB scan agrees:
 
@@ -301,7 +394,7 @@ gbrain check-update --json
 # 7. Knowledge graph populated (links + timeline > 0)
 gbrain stats | grep -E 'links|timeline'
 
-# 8. JSONB integrity (v0.12.2 — Postgres only, PGLite always 0)
+# 8. JSONB integrity (Postgres only, PGLite always 0)
 gbrain repair-jsonb --dry-run --json
 ```
 

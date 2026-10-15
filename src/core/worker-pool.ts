@@ -60,7 +60,7 @@
  * The helper checks `err.tag` against `MUST_ABORT_ERROR_TAGS` BEFORE
  * dispatching to onError. Matched errors: set aborted=true, call
  * AbortController.abort() (propagates to in-flight onItem via
- * `signal`), rethrow. This makes "cap is a hard ceiling" a structural
+ * `signal`), join the remaining workers, rethrow. This makes "cap is a hard ceiling" a structural
  * property of the helper, not a per-caller convention.
  *
  * Future tagged classes (UnrecoverableError, etc.) add their tag to
@@ -80,6 +80,7 @@
 /** Tagged error classes that bypass `onError` and hard-abort the pool. */
 export const MUST_ABORT_ERROR_TAGS: ReadonlySet<string> = new Set([
   'BUDGET_EXHAUSTED', // src/core/budget/budget-tracker.ts BudgetExhausted.tag
+  'SPEND_GROUP_REFUSED', // src/core/minions/spend-authorization.ts group refusals (exhaustion, pressure, no_pricing)
 ]);
 
 /**
@@ -171,6 +172,11 @@ export interface SlidingPoolResult {
  * Empty `items` returns immediately with zeroed result. Worker count
  * is clamped to `[1, items.length]` so we never spawn more workers
  * than work.
+ *
+ * A must-abort error from an item (BudgetExhausted etc.) stops claiming,
+ * aborts the local signal so sibling workers finish their current item and
+ * stop, waits for every worker, then rethrows the error. No worker is left
+ * running detached after the pool has reported failure.
  */
 export async function runSlidingPool<T>(opts: SlidingPoolOpts<T>): Promise<SlidingPoolResult> {
   const items = opts.items;
@@ -207,6 +213,10 @@ export async function runSlidingPool<T>(opts: SlidingPoolOpts<T>): Promise<Slidi
   // that put an `await` between the `nextIdx` read and write OR import
   // `worker_threads` alongside this module.
   let nextIdx = 0;
+  // First must-abort error. Recorded by the worker that saw it, rethrown
+  // after every worker has finished its current item. (A holder object: TS
+  // does not see assignments made inside the worker closure.)
+  const mustAbort: { failure: { error: unknown } | null } = { failure: null };
 
   async function worker(workerIdx: number): Promise<void> {
     while (true) {
@@ -226,14 +236,16 @@ export async function runSlidingPool<T>(opts: SlidingPoolOpts<T>): Promise<Slidi
         opts.onProgress?.(result.processed, total);
       } catch (err) {
         // D13: must-abort error classes (BudgetExhausted, etc.) bypass
-        // onError and hard-abort the pool. Rethrowing propagates up
-        // through Promise.all; the local abort signals other workers.
+        // onError and hard-abort the pool: the local abort signals the
+        // other workers, every worker finishes its current item, and the
+        // error is rethrown after the join (see the function doc).
         if (isMustAbortError(err)) {
           result.aborted = true;
           result.errored++;
           result.failures.push({ idx, label: labelFn(item), error: err });
+          if (!mustAbort.failure) mustAbort.failure = { error: err };
           localAbort.abort();
-          throw err;
+          return;
         }
         result.errored++;
         result.failures.push({ idx, label: labelFn(item), error: err });
@@ -255,7 +267,7 @@ export async function runSlidingPool<T>(opts: SlidingPoolOpts<T>): Promise<Slidi
   } finally {
     if (opts.signal) opts.signal.removeEventListener('abort', onCallerAbort);
   }
-
+  if (mustAbort.failure) throw mustAbort.failure.error;
   return result;
 }
 

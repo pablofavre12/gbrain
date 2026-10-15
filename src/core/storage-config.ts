@@ -12,20 +12,28 @@ import { join } from 'path';
 export interface StorageConfig {
   db_tracked: string[];
   db_only: string[];
+  /**
+   * #6696 C7: opt-in policy, present only when declared. Drifted pages under these prefixes are reconciled with
+   * the database copy by the trusted local maintenance worker on the canonical owner host (repair/keep-db-policy.ts).
+   */
+  keep_db?: string[];
 }
 
 export type StorageTier = 'db_tracked' | 'db_only' | 'unspecified';
 
 /** Recognized YAML keys (canonical and deprecated). */
 const STORAGE_KEYS = new Set([
-  'db_tracked', 'db_only',
+  'db_tracked', 'db_only', 'keep_db',
   'git_tracked', 'supabase_only', // deprecated aliases
 ]);
+const CANONICAL_STORAGE_KEYS = ['db_tracked', 'db_only', 'keep_db'];
 
 /**
- * Parse the gbrain.yml shape: a top-level `storage:` section with up to four
- * array-valued nested keys (canonical `db_tracked` / `db_only` plus the
- * deprecated aliases `git_tracked` / `supabase_only`).
+ * Parse the gbrain.yml shape: a top-level `storage:` section with up to five
+ * array-valued nested keys (canonical `db_tracked` / `db_only`, the opt-in
+ * `keep_db` policy, and the deprecated aliases `git_tracked` /
+ * `supabase_only`). Any other nested key is collected into `unknown`, which
+ * `loadStorageConfig` warns about once per key and process.
  *
  * Intentionally narrow. Does NOT handle the full YAML spec — only the file
  * shape gbrain controls. Trades expressiveness for zero-dep parsing and
@@ -44,11 +52,12 @@ const STORAGE_KEYS = new Set([
 type RawStorage = {
   db_tracked?: string[];
   db_only?: string[];
+  keep_db?: string[];
   git_tracked?: string[];
   supabase_only?: string[];
 };
 
-function parseStorageYaml(content: string): RawStorage | null {
+function parseStorageYaml(content: string, unknown: string[] = []): RawStorage | null {
   const lines = content.split('\n').map((line) => line.replace(/\r$/, ''));
 
   let inStorage = false;
@@ -103,6 +112,7 @@ function parseStorageYaml(content: string): RawStorage | null {
       }
       continue;
     }
+    if (!unknown.includes(key)) unknown.push(key);
     currentList = null;
   }
 
@@ -151,16 +161,19 @@ function normalizeStorageConfig(raw: RawStorage): StorageConfig {
     }
   }
 
+  const keep = raw.keep_db ? { keep_db: raw.keep_db } : {};
   if (hasCanonical) {
     return {
       db_tracked: raw.db_tracked ?? [],
       db_only: raw.db_only ?? [],
+      ...keep,
     };
   }
 
   return {
     db_tracked: raw.git_tracked ?? [],
     db_only: raw.supabase_only ?? [],
+    ...keep,
   };
 }
 
@@ -181,6 +194,7 @@ function normalizeStorageConfig(raw: RawStorage): StorageConfig {
  *     surface "your config didn't take" rather than silently no-op.
  */
 let _missingStorageWarned = false;
+const _unknownKeysWarned = new Set<string>();
 
 export function loadStorageConfig(repoPath?: string | null): StorageConfig | null {
   if (!repoPath) return null;
@@ -193,8 +207,9 @@ export function loadStorageConfig(repoPath?: string | null): StorageConfig | nul
   const content = readFileSync(yamlPath, 'utf-8');
 
   let raw: RawStorage | null;
+  const unknown: string[] = [];
   try {
-    raw = parseStorageYaml(content);
+    raw = parseStorageYaml(content, unknown);
   } catch (error) {
     console.warn(
       `Warning: Failed to parse gbrain.yml: ${error instanceof Error ? error.message : String(error)}`,
@@ -215,10 +230,15 @@ export function loadStorageConfig(repoPath?: string | null): StorageConfig | nul
     return null;
   }
 
+  for (const key of unknown.filter(key => !_unknownKeysWarned.has(key))) {
+    _unknownKeysWarned.add(key);
+    console.warn(`Warning: ${yamlPath}: unknown storage key '${key}' is ignored; storage takes ${CANONICAL_STORAGE_KEYS.join(', ')} (see docs/storage-tiering.md).`);
+  }
+
   const merged = normalizeStorageConfig(raw);
 
   // Empty storage section → return as-is but warn.
-  if (merged.db_tracked.length === 0 && merged.db_only.length === 0) {
+  if (merged.db_tracked.length === 0 && merged.db_only.length === 0 && !merged.keep_db?.length) {
     if (!_missingStorageWarned) {
       _missingStorageWarned = true;
       console.warn(
@@ -305,7 +325,8 @@ export function normalizeAndValidateStorageConfig(input: StorageConfig): Storage
 
   const tracked = normalize(input.db_tracked);
   const dbonly = normalize(input.db_only);
-  const allChanged = [...tracked.changed, ...dbonly.changed];
+  const keep = input.keep_db ? normalize(input.keep_db) : null;
+  const allChanged = [...tracked.changed, ...dbonly.changed, ...(keep?.changed ?? [])];
 
   if (allChanged.length > 0 && !_normalizationInfoEmitted) {
     _normalizationInfoEmitted = true;
@@ -326,7 +347,7 @@ export function normalizeAndValidateStorageConfig(input: StorageConfig): Storage
     }
   }
 
-  return { db_tracked: tracked.normalized, db_only: dbonly.normalized };
+  return { db_tracked: tracked.normalized, db_only: dbonly.normalized, ...(keep ? { keep_db: keep.normalized } : {}) };
 }
 
 /**
@@ -357,6 +378,42 @@ export function isDbOnly(slug: string, config: StorageConfig): boolean {
 }
 
 /**
+ * Declared db_only match for a page slug. Slugs are always lowercase, so the
+ * declared directory is lowercased before matching (same reasoning as
+ * `effectiveDbOnlyDirs`, issue #3766). Only declared dirs count: the
+ * derive-phase defaults may be file-backed on some brains.
+ */
+export function isDeclaredDbOnlySlug(slug: string, config: StorageConfig | null): boolean {
+  return config?.db_only.some((dir) => matchesTierDir(slug, dir.toLowerCase())) ?? false;
+}
+
+/** #6696 C7: whether a page slug sits under a declared `keep_db` prefix (case-insensitive, like `isDeclaredDbOnlySlug`). */
+export function isKeepDbSlug(slug: string, keepDb: readonly string[]): boolean {
+  return keepDb.some((dir) => matchesTierDir(slug, dir.toLowerCase()));
+}
+
+/**
+ * True when gbrain.yml has a `db_only` (or deprecated `supabase_only`) key
+ * line but no db_only directory resolved from it. `loadStorageConfig` warns
+ * and resolves nothing for syntax the narrow parser does not handle (e.g.
+ * flow-style `db_only: [dir/]`), so a caller that must not guess a tier
+ * refuses instead. Only YAML key lines count, not comments or prose that
+ * mention the word. Known false positive: an intentionally empty
+ * `db_only: []` also counts, since it resolves to the same empty config.
+ */
+export function hasUnresolvedDbOnlyDeclaration(repoPath: string, config: StorageConfig | null): boolean {
+  if (config && config.db_only.length > 0) return false;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoPath is the registered local source root and the file name is a constant; this only reads its gbrain.yml
+  const yamlPath = join(repoPath, 'gbrain.yml');
+  const yamlContent = existsSync(yamlPath) ? readFileSync(yamlPath, 'utf-8') : '';
+  return yamlContent.split('\n').some((line) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#')) return false;
+    return /^(db_only|supabase_only)\s*:/.test(trimmed);
+  });
+}
+
+/**
  * Derive-phase output prefixes the engine itself writes as DB-only machine
  * output (issue #2784, reported by @alexputici). These are re-derivable by
  * design and rarely file-backed, so the `undeclared_db_only_pages` doctor
@@ -368,13 +425,33 @@ export function isDbOnly(slug: string, config: StorageConfig): boolean {
 export const DERIVE_PHASE_DB_ONLY_DEFAULTS: readonly string[] = [
   'life/events/',
   'atoms/',
+  // synthesize_concepts writes through importFromContent without creating a
+  // backing markdown file. Keep this implicit (rather than merging it into
+  // storage.db_only) so installations that do file-back concepts are never
+  // auto-gitignored by manageGitignore.
+  'concepts/',
   'extracts/',
   'dream-cycle-summaries/',
 ];
 
-/** Declared db_only dirs plus the derive-phase defaults, deduped. */
+/**
+ * Declared db_only dirs plus the derive-phase defaults, deduped.
+ *
+ * `declared` is lowercased before the union (issue #3766): its only consumer
+ * (`checkUndeclaredDbOnlyPages`) matches these prefixes against page `slug`
+ * values via a plain `.startsWith()`, and slugs are ALWAYS lowercased at
+ * creation time (`pathToSlug`/`slugifyCodePath` in sync.ts) regardless of the
+ * host filesystem's case sensitivity. Without this, a `storage.db_only`
+ * entry typed with any uppercase (e.g. `Notes/` in gbrain.yml) silently never
+ * matches a single slug and every page under it gets falsely flagged as
+ * undeclared. This is deliberately NOT done in `normalizeAndValidateStorageConfig`
+ * / `loadStorageConfig` — `manageGitignore` (sync.ts) reads that raw,
+ * case-preserved config to write `.gitignore` entries that must match the
+ * REAL on-disk directory name (case-sensitive on Linux); lowercasing there
+ * would break gitignore management instead of fixing this doctor check.
+ */
 export function effectiveDbOnlyDirs(declared: string[]): string[] {
-  return [...new Set([...declared, ...DERIVE_PHASE_DB_ONLY_DEFAULTS])];
+  return [...new Set([...declared.map((d) => d.toLowerCase()), ...DERIVE_PHASE_DB_ONLY_DEFAULTS])];
 }
 
 /**
@@ -418,6 +495,7 @@ export const isSupabaseOnly = isDbOnly;
 /** Reset once-per-process warning flags. Test-only. */
 export function __resetMissingStorageWarning(): void {
   _missingStorageWarned = false;
+  _unknownKeysWarned.clear();
   _deprecationWarned = false;
   _normalizationInfoEmitted = false;
 }

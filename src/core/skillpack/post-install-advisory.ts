@@ -116,16 +116,54 @@ function buildAdvisoryWithoutWorkspace(
 }
 
 /**
- * Print the advisory to stderr at the end of init / post-upgrade.
- * No-op when buildAdvisory returns null.
+ * init's optional `skills_scaffold` first-run decision: the recommended
+ * skills missing from the detected agent workspace and the scaffold argv
+ * that installs them. Null when no workspace is detected (scaffold has no
+ * target), when every recommended skill is installed, or on any read error.
+ * The full agent-addressed banner stays the `upgrade` surface and `gbrain
+ * advisor`.
+ */
+export function initSkillsScaffold(opts: {
+  targetWorkspace?: string | null;
+  targetSkillsDir?: string | null;
+} = {}): { missing: string[]; argv: string[] } | null {
+  try {
+    let workspace = opts.targetWorkspace ?? null;
+    let skillsDir = opts.targetSkillsDir ?? null;
+    if (!skillsDir) {
+      const detected = autoDetectSkillsDir();
+      if (detected.dir) {
+        skillsDir = detected.dir;
+        if (!workspace) workspace = resolvePath(skillsDir, '..');
+      }
+    }
+    if (!workspace || !skillsDir) return null;
+    const all = currentRecommendedSet();
+    const installed = detectInstalledSlugs(skillsDir, workspace);
+    const missing = all.filter((s) => !installed.has(s.slug));
+    if (missing.length === 0) return null;
+    const slugs = missing.map((s) => s.slug);
+    return { missing: slugs, argv: ['gbrain', 'skillpack', 'scaffold', ...(missing.length === all.length ? ['--all'] : slugs)] };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Print the full advisory to stderr at the end of `post-upgrade`. No-op when
+ * buildAdvisory returns null. Fail-open: an unreadable RESOLVER.md never
+ * breaks the command.
  */
 export function printAdvisoryIfRecommended(opts: {
   version: string;
-  context: 'init' | 'upgrade';
+  context: 'upgrade';
   targetWorkspace?: string | null;
   targetSkillsDir?: string | null;
 }): void {
-  const advisory = buildAdvisory(opts);
-  if (!advisory) return;
-  process.stderr.write(advisory);
+  try {
+    const advisory = buildAdvisory(opts);
+    if (advisory) process.stderr.write(advisory);
+  } catch {
+    /* advisory is best-effort decoration — never break the command */
+  }
 }

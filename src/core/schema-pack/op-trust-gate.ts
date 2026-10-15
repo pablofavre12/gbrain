@@ -13,21 +13,21 @@
 // Undefined/missing `remote` defaults to REMOTE (fail-closed per v0.26.9
 // F7b — anything not strictly false is treated as untrusted).
 
-import type { OperationContext } from '../operations.ts';
-import { loadActivePackForEngine } from './load-active.ts';
-import { sourceScopeOpts } from '../operations.ts';
+import { OperationError, type OperationContext } from '../ops/contract.ts';
+import { resolveActivePackNameOnly } from './load-active.ts';
+import { engineSchemaInput, loadActivePackForEngine } from './engine-resolution.ts';
+import { sourceScopeOpts } from '../ops/context.ts';
 import type { ResolvedPack } from './registry.ts';
-import { loadConfig } from '../config.ts';
 
 /**
  * Thrown when a remote caller (ctx.remote !== false) passes the
  * per-call schema_pack param. Surfaced as `permission_denied` by the
  * operations.ts dispatch path with the standard error envelope.
  */
-export class SchemaPackTrustGateError extends Error {
+export class SchemaPackTrustGateError extends OperationError {
   readonly code: 'permission_denied' = 'permission_denied';
   constructor(message: string) {
-    super(message);
+    super('permission_denied', message);
     this.name = 'SchemaPackTrustGateError';
   }
 }
@@ -96,19 +96,15 @@ export async function loadActivePackForOp(
       // source. If they all agree, use the first; if they diverge, fail
       // closed with a permission_denied to surface the drift instead of
       // arbitrary pack selection.
-      const cfg = loadConfig();
       const packNames = new Set<string>();
       let firstPack: ResolvedPack | null = null;
       for (const sid of scope.sourceIds) {
-        const { pack } = await loadActivePackForEngine({
-          engine: ctx.engine,
-          cfg,
+        const res = resolveActivePackNameOnly(await engineSchemaInput(ctx.engine, {
           remote: ctx.remote ?? true,
           perCall,
           sourceId: sid,
-        });
-        firstPack ??= pack;
-        packNames.add(pack.manifest.name);
+        }));
+        packNames.add(res.pack_name);
       }
       if (packNames.size > 1) {
         throw new SchemaPackTrustGateError(
@@ -117,17 +113,14 @@ export async function loadActivePackForOp(
           `register an OAuth client scoped to a single source OR have the sources agree on one pack.`,
         );
       }
-      return firstPack!;
+      sourceId = scope.sourceIds[0];
     }
   } else {
     sourceId = scope.sourceId;
   }
-  const { pack } = await loadActivePackForEngine({
-    engine: ctx.engine,
-    cfg: loadConfig(),
+  return loadActivePackForEngine(ctx.engine, {
     remote: ctx.remote ?? true, // fail-closed default
     perCall,
     sourceId,
   });
-  return pack;
 }
