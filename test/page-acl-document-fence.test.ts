@@ -397,6 +397,10 @@ test('same-body writes publish ACL and document changes with server-derived clie
 });
 
 
+// Value: protects=put_page returns committed page identity and exact document receipts on writes and no-op retries;
+// fails_when=normal or canonical no-op publication omits identity or returns a fabricated document receipt;
+// why_new=the existing version-fence test checked stored versions but not the consumer-facing receipt;
+// seam=none; no_claim=HTTP authentication, PostgreSQL parity, or production deployment.
 test('Platform document writes retain the complete version fence without a new revision parameter', async () => {
   const ctx=remoteCtx(['user:alice'],['versioned_document_write']);
   const slug='documents/platform-compatibility';
@@ -404,9 +408,18 @@ test('Platform document writes retain the complete version fence without a new r
     slug,content:`---\ntitle: Platform document\n---\n${body}`,allowed_subject_ids:['user:alice'],
     document_id:'platform-document',document_version_sequence:sequence,document_version_hash:hash,...extra,
   });
-  await write(1,'version one');
-  await write(2,'version two');
-  await write(2,'version two');
+  for (const [sequence,body] of [[1,'version one'],[2,'version two'],[2,'version two']] as const) {
+    const result=await write(sequence,body) as Record<string,unknown>;
+    expect(result.page_id).toBe((await engine.getPage(slug))?.id);
+    expect(result.receipt).toEqual({document_id:'platform-document',version_sequence:sequence,version_hash:String(sequence).repeat(64)});
+  }
+  const canonical=await op('get_page').handler(ctx,{slug,include_content:true}) as {content:string};
+  const replay=await op('put_page').handler(ctx,{slug,content:canonical.content,allowed_subject_ids:['user:alice'],
+    document_id:'platform-document',document_version_sequence:2,document_version_hash:'2'.repeat(64)}) as Record<string,unknown>;
+  expect(replay.noop).toBe(true);
+  expect(replay.chunk_skip_reason).toBe('write_skipped');
+  expect(replay.page_id).toBe((await engine.getPage(slug))?.id);
+  expect(replay.receipt).toEqual({document_id:'platform-document',version_sequence:2,version_hash:'2'.repeat(64)});
   expect((await engine.getPage(slug))?.document_version_sequence).toBe(2);
   await expect(write(1,'stale version')).rejects.toThrow();
   await expect(write(2,'conflicting same version','f'.repeat(64))).rejects.toThrow();
@@ -418,6 +431,16 @@ test('Platform document writes retain the complete version fence without a new r
   expect((await engine.getPage(slug))?.document_version_sequence).toBe(3);
   await engine.putPage('notes/ordinary-revision',{type:'note',title:'Ordinary',compiled_truth:'before'});
   await expect(op('put_page').handler(ctx,{slug:'notes/ordinary-revision',content:'after'})).rejects.toMatchObject({code:'revision_required'});
+  const ordinarySlug='notes/ordinary-receipt';
+  const ordinary=await op('put_page').handler(ctx,{slug:ordinarySlug,content:'An ordinary page without a document fence.'}) as Record<string,unknown>;
+  expect(ordinary.page_id).toBe((await engine.getPage(ordinarySlug))!.id);
+  expect(ordinary).not.toHaveProperty('receipt');
+  const ordinaryCanonical=await op('get_page').handler(ctx,{slug:ordinarySlug,include_content:true}) as {content:string;revision:string};
+  const ordinaryReplay=await op('put_page').handler(ctx,{slug:ordinarySlug,content:ordinaryCanonical.content,expected_revision:ordinaryCanonical.revision}) as Record<string,unknown>;
+  expect(ordinaryReplay.noop).toBe(true);
+  expect(ordinaryReplay.chunk_skip_reason).toBe('write_skipped');
+  expect(ordinaryReplay.page_id).toBe(ordinary.page_id);
+  expect(ordinaryReplay).not.toHaveProperty('receipt');
 });
 
 
