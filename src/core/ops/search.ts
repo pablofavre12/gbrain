@@ -26,7 +26,7 @@ import {
 import { expandQuery } from '../search/expansion.ts';
 import { dedupResults } from '../search/dedup.ts';
 import { markKeywordHits } from '../search/evidence.ts';
-import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
+import { captureEvalCandidateIfEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { HybridSearchMeta, SearchResult } from '../types.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
@@ -1184,27 +1184,26 @@ const query: Operation = {
     // what hybridSearch *actually* did so replay can distinguish "with API
     // key" from "keyword-only fallback" and "expansion fired" from
     // "expansion requested + silently fell back."
-    if (isEvalCaptureEnabled(ctx.config)) {
-      const meta: HybridSearchMeta = capturedMeta ?? {
-        vector_enabled: false, detail_resolved: detail ?? null, expansion_applied: false,
-      };
-      void captureEvalCandidate(
-        ctx.engine,
-        {
-          tool_name: 'query',
-          query: queryText,
-          results,
-          meta,
-          latency_ms,
-          remote: ctx.remote ?? false,
-          expand_enabled: expandParam ?? null,
-          detail: detail ?? null,
-          job_id: ctx.jobId ?? null,
-          subagent_id: ctx.subagentId ?? null,
-        },
-        { scrub_pii: isEvalScrubEnabled(ctx.config) },
-      );
-    }
+    const captureMeta: HybridSearchMeta = capturedMeta ?? {
+      vector_enabled: false, detail_resolved: detail ?? null, expansion_applied: false,
+    };
+    void captureEvalCandidateIfEnabled(
+      ctx.engine,
+      ctx.config,
+      {
+        tool_name: 'query',
+        query: queryText,
+        results,
+        meta: captureMeta,
+        latency_ms,
+        remote: ctx.remote ?? false,
+        expand_enabled: expandParam ?? null,
+        detail: detail ?? null,
+        job_id: ctx.jobId ?? null,
+        subagent_id: ctx.subagentId ?? null,
+      },
+      { scrub_pii: isEvalScrubEnabled(ctx.config) },
+    );
 
     // WP2/D3: query never nudges toward itself — no concept hint here.
     // #1663: the CRAG grade rides the same retrieval meta channel.

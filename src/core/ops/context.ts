@@ -22,7 +22,7 @@ import { ALL_SOURCES, NO_SOURCES, isValidSourceId } from '../source-id.ts';
 import { encodeDeepResearchId } from '../deep-research-id.ts';
 import { isSearchMode } from '../search/mode.ts';
 import { stampEvidence } from '../search/evidence.ts';
-import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
+import { captureEvalCandidateIfEnabled, isEvalScrubEnabled } from '../eval-capture.ts';
 import type { SearchResult, HybridSearchMeta, PageReadScope, PageReadPolicy } from '../types.ts';
 import { resolveExcludePrivatePages, isPrivatePage } from '../search/private-visibility.ts';
 
@@ -1245,9 +1245,9 @@ export function maybeCaptureSearch(
   vectorEnabled: boolean,
   meta?: HybridSearchMeta | null,
 ): void {
-  if (!isEvalCaptureEnabled(ctx.config)) return;
-  void captureEvalCandidate(
+  void captureEvalCandidateIfEnabled(
     ctx.engine,
+    ctx.config,
     {
       tool_name: 'search',
       query: queryText,

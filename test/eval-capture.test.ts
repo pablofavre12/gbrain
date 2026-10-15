@@ -10,11 +10,14 @@
 
 import { describe, expect, mock, test } from 'bun:test';
 import {
+  awaitPendingEvalCaptures,
   buildEvalCandidateInput,
   captureEvalCandidate,
+  captureEvalCandidateIfEnabled,
   classifyCaptureFailure,
   isEvalCaptureEnabled,
   isEvalScrubEnabled,
+  resolveEvalCaptureEnabled,
   type CaptureContext,
 } from '../src/core/eval-capture.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -306,6 +309,100 @@ describe('isEvalCaptureEnabled / isEvalScrubEnabled (CONTRIBUTOR_MODE-gated)', (
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const opt: any = { engine: 'pglite', eval: { scrub_pii: false } };
       expect(isEvalScrubEnabled(opt)).toBe(false);
+    } finally { restore(); }
+  });
+});
+
+describe('resolveEvalCaptureEnabled / captureEvalCandidateIfEnabled (DB plane)', () => {
+  const origMode = process.env.GBRAIN_CONTRIBUTOR_MODE;
+  const restore = () => {
+    if (origMode === undefined) delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    else process.env.GBRAIN_CONTRIBUTOR_MODE = origMode;
+  };
+
+  function engineWithDbCapture(value: string | null | Error): BrainEngine {
+    return {
+      getConfig: mock((key: string) => {
+        if (key !== 'eval.capture') return Promise.resolve(null);
+        return value instanceof Error ? Promise.reject(value) : Promise.resolve(value);
+      }),
+      logEvalCandidate: mock(() => Promise.resolve(1)),
+      logEvalCaptureFailure: mock(() => Promise.resolve()),
+    } as unknown as BrainEngine;
+  }
+  const calls = (fn: unknown) => (fn as { mock: { calls: unknown[] } }).mock.calls.length;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fileCfg = (capture?: boolean): any => ({ engine: 'postgres', eval: capture === undefined ? {} : { capture } });
+
+  test('DB plane true turns capture on when file/env config is silent', async () => {
+    delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    try {
+      expect(await resolveEvalCaptureEnabled(engineWithDbCapture('true'), fileCfg())).toBe(true);
+      expect(await resolveEvalCaptureEnabled(engineWithDbCapture('true'), null)).toBe(true);
+    } finally { restore(); }
+  });
+
+  test('file config wins over the DB plane and skips the DB read', async () => {
+    const engine = engineWithDbCapture('true');
+    expect(await resolveEvalCaptureEnabled(engine, fileCfg(false))).toBe(false);
+    expect(await resolveEvalCaptureEnabled(engine, fileCfg(true))).toBe(true);
+    expect(calls(engine.getConfig)).toBe(0);
+  });
+
+  test('DB plane false wins over CONTRIBUTOR_MODE=1', async () => {
+    process.env.GBRAIN_CONTRIBUTOR_MODE = '1';
+    try {
+      expect(await resolveEvalCaptureEnabled(engineWithDbCapture('false'), null)).toBe(false);
+    } finally { restore(); }
+  });
+
+  test('unset DB value falls through to CONTRIBUTOR_MODE', async () => {
+    process.env.GBRAIN_CONTRIBUTOR_MODE = '1';
+    try {
+      expect(await resolveEvalCaptureEnabled(engineWithDbCapture(null), null)).toBe(true);
+    } finally { restore(); }
+    delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    try {
+      expect(await resolveEvalCaptureEnabled(engineWithDbCapture(''), null)).toBe(false);
+    } finally { restore(); }
+  });
+
+  test('DB read failure or missing getConfig degrades to the env check, never throws', async () => {
+    delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    try {
+      expect(await resolveEvalCaptureEnabled(engineWithDbCapture(new Error('db down')), null)).toBe(false);
+      const bare = { logEvalCandidate: mock(() => Promise.resolve(1)) } as unknown as BrainEngine;
+      expect(await resolveEvalCaptureEnabled(bare, null)).toBe(false);
+    } finally { restore(); }
+  });
+
+  test('DB value is cached per engine within the TTL', async () => {
+    const engine = engineWithDbCapture('true');
+    await resolveEvalCaptureEnabled(engine, null);
+    await resolveEvalCaptureEnabled(engine, null);
+    await resolveEvalCaptureEnabled(engine, null);
+    expect(calls(engine.getConfig)).toBe(1);
+  });
+
+  test('captureEvalCandidateIfEnabled writes when the DB plane enables capture, tracked for drain', async () => {
+    delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    try {
+      const engine = engineWithDbCapture('true');
+      void captureEvalCandidateIfEnabled(engine, null, makeCtx());
+      expect(await awaitPendingEvalCaptures(1_000)).toEqual({ unfinished: 0 });
+      expect(calls(engine.logEvalCandidate)).toBe(1);
+    } finally { restore(); }
+  });
+
+  test('captureEvalCandidateIfEnabled skips the write when capture resolves off', async () => {
+    delete process.env.GBRAIN_CONTRIBUTOR_MODE;
+    try {
+      const engine = engineWithDbCapture('false');
+      await captureEvalCandidateIfEnabled(engine, null, makeCtx());
+      expect(calls(engine.logEvalCandidate)).toBe(0);
+      const fileOff = engineWithDbCapture('true');
+      await captureEvalCandidateIfEnabled(fileOff, fileCfg(false), makeCtx());
+      expect(calls(fileOff.logEvalCandidate)).toBe(0);
     } finally { restore(); }
   });
 });
