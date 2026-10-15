@@ -423,8 +423,9 @@ Start with `gbrain doctor`. For database access failures, use `gbrain engine sta
 
 ## Docs
 
+- [Fork contracts](FORK.md) and [upgrade guide](skills/migrations/v0.60.238.0.md)
 - [`docs/INSTALL.md`](docs/INSTALL.md) — every install path, end to end
-- [`docs/guides/bootstrap.md`](docs/guides/bootstrap.md) — the persistent-personal-agent bootstrap contract (interview, identity files, hooks, private repo, security posture, uninstall), plus local harness mode (`gbrain bootstrap harness`) for wiring framework-spawned Claude Code/Codex sessions to a running serve
+- [`docs/guides/bootstrap.md`](docs/guides/bootstrap.md) — personal-agent setup, security, uninstall, and local harness mode
 - [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — why schemas matter: 7 killer use cases, the structural argument for typed page kinds, the agent-co-curates pattern
 - [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md) — 5-minute walkthrough: fork the bundled pack, add a custom type, backfill existing pages, prove the wiring via `gbrain whoknows`
 - [`docs/architecture/`](docs/architecture/) — system design, topologies, retrieval theory

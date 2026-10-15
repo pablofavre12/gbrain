@@ -11,7 +11,8 @@
  *   mapped through the pack's type aliases; untyped pages are `untyped`).
  *   A `type` filter accepts a canonical type or a stored type.
  * - Untrusted callers never see a private or derived-private referrer, nor a
- *   link whose origin page is private, in rows or counts.
+ *   link whose origin is outside source grants, ACL, liveness or eligibility,
+ *   in rows or counts.
  * - With `entity_identity.union` on, links to the page's identity co-members
  *   count as links to the page.
  * - #5575: a quarantined referrer is left out (rows and counts) unless an
@@ -32,6 +33,7 @@ import { quarantineFilterFragment, isQuarantined } from '../quarantine.ts';
 import { activationSuppressedSql, pageEligibleSql } from '../eligibility/sql.ts';
 import { trustFields, type TrustFields } from '../eligibility/labels.ts';
 import type { ReadEligibility } from '../eligibility/policy.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
 
 export const PREVIEW_CHARS = 160;
 export const GROUP_ROW_CAP = 10;
@@ -72,7 +74,8 @@ export interface ReferrerScope {
 }
 
 interface RawRow { id: number; slug: string; source_id: string; type: string | null; canonical_type: string;
-  d: string | null; gtotal?: number }
+  d: string | null; gtotal?: number; title: string | null; body: string | null; date_source: string;
+  trust_tier: string; write_origin: unknown; flagged: boolean; frontmatter: Record<string, unknown> | null }
 
 /** The entity page plus, under `entity_identity.union`, its identity co-members. */
 async function targetPages(engine: BrainEngine, scope: ReferrerScope): Promise<{ sources: string[]; slugs: string[] }> {
@@ -95,7 +98,10 @@ async function targetPages(engine: BrainEngine, scope: ReferrerScope): Promise<{
  * ids are collected once in `refs`, so a hub with thousands of inbound links
  * costs one hashed membership test per candidate page.
  */
-function referrersCte(scope: ReferrerScope): string {
+function referrersCte(scope: ReferrerScope, params: unknown[]): string {
+  const originPolicy = pageReadFilter('origin', { sourceIds: scope.referrerSources,
+    aclSubjectIds: scope.aclSubjectIds, excludePrivate: scope.excludePrivate,
+    minTrust: scope.eligibility?.floor, suppressFlagged: scope.eligibility?.suppressFlagged }, params, true);
   const targetPriv = scope.excludePrivate ? ` AND ${privatePagesFilterFragment('t')}` : '';
   const linkPriv = scope.excludePrivate ? ` AND ${privateLinkOriginFilterFragment('l')}` : '';
   const pagePriv = scope.excludePrivate ? ` AND ${privatePagesFilterFragmentFast('f')}` : '';
@@ -103,11 +109,12 @@ function referrersCte(scope: ReferrerScope): string {
   return `WITH tgt AS MATERIALIZED (
       SELECT t.id FROM pages t JOIN unnest($1::text[], $2::text[]) AS k(s, g) ON t.source_id = k.s AND t.slug = k.g
        WHERE t.deleted_at IS NULL${targetPriv}
+         AND EXISTS (SELECT 1 FROM sources source WHERE source.id=t.source_id AND NOT source.archived)
          AND ($6::text[] IS NULL OR t.acl_subject_ids IS NULL OR t.acl_subject_ids && $6::text[])
     ),
     refs AS MATERIALIZED (
       SELECT DISTINCT l.from_page_id AS id FROM links l WHERE l.to_page_id IN (SELECT id FROM tgt)${linkPriv}
-        AND ($6::text[] IS NULL OR l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM pages origin WHERE origin.id=l.origin_page_id AND (origin.acl_subject_ids IS NULL OR origin.acl_subject_ids && $6::text[])))
+        AND (l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM pages origin WHERE origin.id=l.origin_page_id AND ${originPolicy}))
     ),
     typed AS MATERIALIZED (
       SELECT f.id, f.slug, f.source_id, f.type,
@@ -116,6 +123,7 @@ function referrersCte(scope: ReferrerScope): string {
         FROM pages f
        WHERE f.id IN (SELECT id FROM refs)
          AND f.deleted_at IS NULL AND f.source_id = ANY($3::text[])
+         AND EXISTS (SELECT 1 FROM sources source WHERE source.id=f.source_id AND NOT source.archived)
          AND f.id NOT IN (SELECT id FROM tgt)${pagePriv}${pageTrust}
          AND ($6::text[] IS NULL OR f.acl_subject_ids IS NULL OR f.acl_subject_ids && $6::text[])
     )`;
@@ -133,22 +141,21 @@ function preview(body: string | null, keep: ('private' | 'world')[]): string {
   return text.length > PREVIEW_CHARS ? text.slice(0, PREVIEW_CHARS) : text;
 }
 
-async function hydrate(engine: BrainEngine, rows: RawRow[], keep: ('private' | 'world')[]): Promise<ReferenceRow[]> {
-  if (!rows.length) return [];
-  const pages = new Map((await engine.executeRaw<{ id: number; title: string | null; body: string | null; date_source: string;
-    trust_tier: string; write_origin: unknown; flagged: boolean; frontmatter: Record<string, unknown> | null }>(
-    `SELECT id, title, left(compiled_truth, 4000) AS body,
-            CASE WHEN effective_date IS NULL THEN 'updated_at' ELSE COALESCE(effective_date_source, 'effective_date') END AS date_source,
-            trust_tier, write_origin, ${activationSuppressedSql('pages', 'pages')} AS flagged, frontmatter
-       FROM pages WHERE id = ANY($1::int[])`, [rows.map(r => r.id)])).map(r => [Number(r.id), r]));
+/** Read content after the bounded selection, within its authorization snapshot. */
+function contentFields(): string {
+  return `p.title, left(p.compiled_truth, 4000) AS body,
+    CASE WHEN p.effective_date IS NULL THEN 'updated_at' ELSE COALESCE(p.effective_date_source, 'effective_date') END AS date_source,
+    p.trust_tier, p.write_origin, ${activationSuppressedSql('pages', 'p')} AS flagged, p.frontmatter`;
+}
+
+function hydrate(rows: RawRow[], keep: ('private' | 'world')[]): ReferenceRow[] {
   return rows.map(r => {
-    const page = pages.get(Number(r.id));
-    const fields = page ? trustFields(page.trust_tier, page.write_origin) : { trust_tier: 'unknown' as const, origin: 'unrecorded' };
+    const fields = trustFields(r.trust_tier, r.write_origin);
     return {
-      slug: r.slug, source_id: r.source_id, title: page?.title ?? r.slug, type: r.type || null, canonical_type: r.canonical_type,
-      date: r.d, date_source: page?.date_source ?? 'updated_at', preview: preview(page?.body ?? null, keep), ...fields,
-      ...(page?.flagged === true ? { unconfirmed: true as const } : {}),
-      ...(isQuarantined(page?.frontmatter) ? { quarantined: true as const } : {}),
+      slug: r.slug, source_id: r.source_id, title: r.title ?? r.slug, type: r.type || null, canonical_type: r.canonical_type,
+      date: r.d, date_source: r.date_source, preview: preview(r.body, keep), ...fields,
+      ...(r.flagged === true ? { unconfirmed: true as const } : {}),
+      ...(isQuarantined(r.frontmatter) ? { quarantined: true as const } : {}),
     };
   });
 }
@@ -171,9 +178,10 @@ export function decodeCursor(cursor: string): [string | null, string, string] | 
 export async function referrerTypes(engine: BrainEngine, scope: ReferrerScope): Promise<string[]> {
   const t = await targetPages(engine, scope);
   const pairs = typeAliasPairs(scope.pack);
+  const params: unknown[] = [t.sources, t.slugs, scope.referrerSources, pairs.stored, pairs.canonical, scope.aclSubjectIds ?? null];
+  const cte = referrersCte(scope, params);
   const rows = await engine.executeRaw<{ canonical_type: string; type: string | null }>(
-    `${referrersCte(scope)} SELECT DISTINCT canonical_type, type FROM typed`,
-    [t.sources, t.slugs, scope.referrerSources, pairs.stored, pairs.canonical, scope.aclSubjectIds ?? null]);
+    `${cte} SELECT DISTINCT canonical_type, type FROM typed`, params);
   return [...new Set(rows.flatMap(r => [r.canonical_type, ...(r.type ? [r.type] : [])]))].sort();
 }
 
@@ -184,21 +192,26 @@ export async function readReferrerPage(engine: BrainEngine, scope: ReferrerScope
   const pairs = typeAliasPairs(scope.pack);
   const params: unknown[] = [t.sources, t.slugs, scope.referrerSources, pairs.stored, pairs.canonical, scope.aclSubjectIds ?? null, opts.type ?? null];
   const typeFilter = `($7::text IS NULL OR canonical_type = $7 OR type = $7)`;
-  const [count] = await engine.executeRaw<{ n: number }>(`${referrersCte(scope)} SELECT count(*)::int AS n FROM typed WHERE ${typeFilter}`, params);
+  const cte = referrersCte(scope, params);
+  const [count] = await engine.executeRaw<{ n: number }>(`${cte} SELECT count(*)::int AS n FROM typed WHERE ${typeFilter}`, params);
   let after = '';
   if (opts.cursor) {
     params.push(opts.cursor[0], opts.cursor[1], opts.cursor[2]);
-    after = ` AND ((d IS NOT DISTINCT FROM $8::timestamptz AND (source_id, slug) > ($9::text, $10::text))
-                OR ($8::timestamptz IS NOT NULL AND (d < $8::timestamptz OR d IS NULL)))`;
+    const dateAt = params.length - 2;
+    after = ` AND ((d IS NOT DISTINCT FROM $${dateAt}::timestamptz AND (source_id, slug) > ($${dateAt + 1}::text, $${dateAt + 2}::text))
+                OR ($${dateAt}::timestamptz IS NOT NULL AND (d < $${dateAt}::timestamptz OR d IS NULL)))`;
   }
   params.push(opts.limit + 1);
   const raw = await engine.executeRaw<RawRow>(
-    `${referrersCte(scope)}
-     SELECT id, slug, source_id, type, canonical_type, ${dateText('d')} AS d FROM typed
+    `${cte}, selected AS MATERIALIZED (
+     SELECT * FROM typed
       WHERE ${typeFilter}${after}
-      ORDER BY d DESC NULLS LAST, source_id, slug LIMIT $${params.length}`, params);
+      ORDER BY d DESC NULLS LAST, source_id, slug LIMIT $${params.length})
+     SELECT s.id, s.slug, s.source_id, s.type, s.canonical_type, ${dateText('s.d')} AS d, ${contentFields()}
+       FROM selected s JOIN pages p ON p.id=s.id
+      ORDER BY s.d DESC NULLS LAST, s.source_id, s.slug`, params);
   const truncated = raw.length > opts.limit;
-  const rows = await hydrate(engine, raw.slice(0, opts.limit), scope.keepVisibility);
+  const rows = hydrate(raw.slice(0, opts.limit), scope.keepVisibility);
   return { rows, total: Number(count?.n ?? 0), truncated, cursor: truncated ? encodeCursor(rows[rows.length - 1]!) : null };
 }
 
@@ -217,16 +230,18 @@ export interface ReferenceGroup {
 export async function readReferrerGroups(engine: BrainEngine, scope: ReferrerScope): Promise<{ total: number; groups: ReferenceGroup[] }> {
   const t = await targetPages(engine, scope);
   const pairs = typeAliasPairs(scope.pack);
+  const params: unknown[] = [t.sources, t.slugs, scope.referrerSources, pairs.stored, pairs.canonical, scope.aclSubjectIds ?? null, GROUP_ROW_CAP];
+  const cte = referrersCte(scope, params);
   // Per-type totals by hash aggregate, then a bounded top-N per type (no full sort of the referrers).
   const raw = await engine.executeRaw<RawRow>(
-    `${referrersCte(scope)},
+    `${cte},
      counts AS (SELECT canonical_type, count(*)::int AS n FROM typed GROUP BY canonical_type)
-     SELECT x.id, x.slug, x.source_id, x.type, c.canonical_type, ${dateText('x.d')} AS d, c.n AS gtotal
+     SELECT x.id, x.slug, x.source_id, x.type, c.canonical_type, ${dateText('x.d')} AS d, c.n AS gtotal, ${contentFields()}
        FROM counts c CROSS JOIN LATERAL (
          SELECT * FROM typed t WHERE t.canonical_type = c.canonical_type ORDER BY t.d DESC NULLS LAST, t.source_id, t.slug LIMIT $7
-       ) x
+       ) x JOIN pages p ON p.id=x.id
       ORDER BY c.canonical_type, x.d DESC NULLS LAST, x.source_id, x.slug`,
-    [t.sources, t.slugs, scope.referrerSources, pairs.stored, pairs.canonical, scope.aclSubjectIds ?? null, GROUP_ROW_CAP]);
+    params);
   const byType = new Map<string, RawRow[]>();
   for (const r of raw) byType.set(r.canonical_type, [...(byType.get(r.canonical_type) ?? []), r]);
   const order = [...byType.entries()].sort(([a, x], [b, y]) => (y[0]!.d ?? '').localeCompare(x[0]!.d ?? '') || a.localeCompare(b));
@@ -240,7 +255,7 @@ export async function readReferrerGroups(engine: BrainEngine, scope: ReferrerSco
     }
   }
   const kept = order.flatMap(([type, rows]) => rows.slice(0, quota.get(type)));
-  const hydrated = await hydrate(engine, kept, scope.keepVisibility);
+  const hydrated = hydrate(kept, scope.keepVisibility);
   const groups: ReferenceGroup[] = order.map(([type, rows]) => ({
     canonical_type: type, total: Number(rows[0]!.gtotal ?? rows.length), rows: hydrated.filter(r => r.canonical_type === type),
   }));

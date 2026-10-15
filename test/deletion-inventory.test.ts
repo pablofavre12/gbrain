@@ -6,9 +6,13 @@
  * Also pins the docs promise: AGENTS.md still says never promise physical erasure.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { DELETION_INVENTORY, DELETION_INVENTORY_BY_TABLE } from '../src/core/deletion-inventory.ts';
+import { verifyPagePurge, type StoreReport } from '../src/core/facts/purge-verify.ts';
+import { extractStaleFromDB } from '../src/commands/extract.ts';
+import { emptyHome, withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 const TEXT_BEARING = ['text', 'varchar', 'bpchar', 'jsonb', 'json', 'bytea', '_text', '_varchar', 'tsvector', 'vector', 'halfvec'];
@@ -46,5 +50,38 @@ describe('deletion inventory', () => {
 
   test('AGENTS.md still says never promise physical erasure', () => {
     expect(readFileSync(new URL('../AGENTS.md', import.meta.url), 'utf8')).toMatch(/never promise physical erasure/i);
+  });
+
+  test('authored-reference residuals are reported per source without claiming they were swept', async () => {
+    const home = emptyHome();
+    const marker = 'inventory-residual-marker';
+    try {
+      await engine.executeRaw("INSERT INTO sources (id,name) VALUES ('inventory-other','Other'),('inventory-empty','Empty')");
+      for (const [sourceId, slug] of [['default', 'notes/origin'], ['inventory-other', 'notes/other-a'], ['inventory-other', 'notes/other-b']]) {
+        await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `See [[notes/${marker}]].`, frontmatter: {} }, { sourceId });
+      }
+      await engine.putPage('notes/purge-target', { type: 'note', title: 'Purged page', compiled_truth: marker, frontmatter: {} });
+      const purged = (await engine.getPage('notes/purge-target'))!;
+      await engine.deletePage('notes/purge-target');
+      await withEnv({ GBRAIN_HOME: home }, () => extractStaleFromDB(engine, {
+        dryRun: false, jsonMode: true, quiet: true, catchUp: true, includeFrontmatter: true,
+      }));
+      const before = await engine.executeRaw('SELECT * FROM authored_link_inventories ORDER BY origin_page_id');
+      for (const [sourceId, count] of [['default', 1], ['inventory-other', 2], ['inventory-empty', 0]] as const) {
+        const receipt = await verifyPagePurge(engine, { sourceId, slug: 'notes/purge-target', requestId: randomUUID(),
+          removed: {}, blobsRemaining: [], context: { pageId: purged.id, factIds: [], needles: [marker], paths: [] } });
+        const stores = receipt.stores as StoreReport[];
+        const residuals = receipt.residuals as StoreReport[];
+        if (count) {
+          const expected = { store: 'authored_link_inventories', status: 'out_of_scope', reason: 'probed_reported', remaining: count };
+          expect(stores).toContainEqual(expect.objectContaining(expected));
+          expect(residuals).toContainEqual(expect.objectContaining(expected));
+        } else {
+          expect(stores).toContainEqual({ store: 'authored_link_inventories', status: 'not_present' });
+          expect(residuals.some(row => row.store === 'authored_link_inventories')).toBe(false);
+        }
+      }
+      expect(await engine.executeRaw('SELECT * FROM authored_link_inventories ORDER BY origin_page_id')).toEqual(before);
+    } finally { rmSync(home, { recursive: true, force: true }); }
   });
 });

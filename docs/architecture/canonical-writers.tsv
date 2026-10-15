@@ -201,8 +201,8 @@ src/core/schema-migrations/v034-destructive-guard-columns.ts	2	schema	Schema ins
 src/core/schema-migrations/v043-takes-resolved-quality-and-drift-decisions.ts	2	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
 src/core/schema-migrations/v048-takes-weight-round-to-grid.ts	1	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
 src/core/schema-migrations/v123-configurable-fts-language.ts	1	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
-src/core/schema-migrations/v142-takes-embedding-dimension-matches-config.ts	1	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
-src/core/schema-migrations/v144-open-loops.ts	1	schema	Schema installation and forward-reference DDL; coordinated activation quiesces canonical writers.
+src/core/schema-migrations/v142-takes-embedding-dimension-matches-config.ts	2	schema	Transactional schema repair; mutually exclusive takes UPDATE branches handle present or missing embedding columns after the populated-fork vector guard.
+src/core/schema-migrations/v144-open-loops.ts	2	schema	Transactional skew repair; mutually exclusive takes UPDATE branches handle present or missing embedding columns after the populated-fork vector guard.
 src/core/schema-migrations/v189-pages-credential-projection-pending.ts	1	schema	Projection-only: unseals live pages whose canonical body holds a private-key marker and queues their keyless rebuild; canonical page columns are unchanged.
 src/core/schema-migrations/v191-alias-source-cascade.ts	2	schema	Orphan alias GC before the alias→sources FK (#5094); grants exactly the orphan rows' sources through gbrain.write_sources for its transaction.
 src/core/schema-migrations/v224-page-retrievals.ts	1	schema	Creates page_retrievals and copies pages.last_retrieved_at (retrieval telemetry, a projection column) into it; canonical page columns are unchanged.

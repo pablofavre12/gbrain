@@ -147,12 +147,28 @@ linking page is due for re-extraction and the next sweep creates the edge.
 pages link to it, most-referenced first. A bare-name link like
 `[[Dave Example]]` whose name matches an existing page in another directory
 shows that page in `existing_matches`, so the link can be rewritten by slug.
-Remote callers never see targets that only private pages reference. Writes from remote agents record their missing
-mention targets too (`wanted_pages.remote`, on by default).
+For remote readers, counts, origin samples, name resolution and suggestions use
+only pages the caller can read. A wanted target means there is no readable
+match for that caller; another reader may have a matching page. Access changes
+apply on the next read, including when maintenance has already resolved the
+link for another reader. The authored reference remains available for this
+check independently of the unresolved-link queue. A meeting with an unresolved
+attendee still contributes its authored references; its last verified attendance
+edges remain unchanged until the attendee can be resolved.
+
+After upgrading, a remote query can return `projection_pending` until the
+readable pages' reference inventories have been rebuilt. The brain operator
+can run `gbrain extract --stale --include-frontmatter --catch-up`, then repeat
+`wanted_pages`. An incomplete inventory is not reported as an empty wanted
+list. This reconstruction makes no model calls.
+
+Writes from remote agents record their missing mention targets too
+(`wanted_pages.remote`, on by default).
 
 **Say to your agent:** *"Which people and companies do my notes link to that don't have pages yet?"*
 
-Off switch: `gbrain config set wanted_pages.enabled false`.
+Off switch: `gbrain config set wanted_pages.enabled false`. The authored inventory
+is still collected, so re-enabling the tool cannot certify a false empty answer.
 
 ## Similar-page hints
 

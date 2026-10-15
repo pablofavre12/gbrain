@@ -119,7 +119,7 @@ beforeEach(async () => {
   // Far-endpoint-leak backlink: referrer in 'default' → must NOT show for [alpha,beta].
   await engine.addLink('default/only-doc', 'secret/beta-doc', 'LEAK back', 'cites', 'markdown', undefined, undefined, { fromSourceId: 'default', toSourceId: 'beta' });
   // Origin-leak guard (F1): both endpoints in-grant (beta→beta) but the AUTHORING
-  // (origin) page is out-of-grant ('default'). origin_slug must NOT leak that slug.
+  // (origin) page is out-of-grant ('default'), so the whole edge must be hidden.
   await engine.addLink('secret/beta-doc', 'secret/beta-target', 'origin-leak ctx', 'mentions', 'frontmatter', 'default/only-doc', 'related', { fromSourceId: 'beta', toSourceId: 'beta', originSourceId: 'default' });
   // Timeline entry on the beta page.
   await engine.addTimelineEntry('secret/beta-doc', {
@@ -367,14 +367,22 @@ describe('#2200 get_links honors the grant and scopes BOTH endpoints (D4A)', () 
     await expect(get_links.handler(remoteCtx(['alpha']), { slug: 'secret/beta-doc' })).rejects.toMatchObject({ code: 'page_not_found' });
   });
 
-  test('F1: in-grant link authored by an out-of-grant origin does NOT leak origin_slug', async () => {
+  test('F1: an authored link requires its origin grant as well as both endpoint grants', async () => {
     const links = (await get_links.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc' })) as any[];
-    const originLeakLink = links.find(l => l.link_type === 'mentions' && l.to_slug === 'secret/beta-target');
-    expect(originLeakLink).toBeDefined();
-    // origin page 'default/only-doc' is out of the [alpha,beta] grant → origin identity nulled.
-    expect(originLeakLink.origin_slug ?? null).toBeNull();
-    expect(originLeakLink.origin_source_id ?? null).toBeNull();
+    expect(links.filter(l => l.link_type === 'mentions' && l.to_slug === 'secret/beta-target')).toEqual([]);
     expect(links.map(l => l.origin_slug)).not.toContain('default/only-doc');
+    const root = (await engine.getPage('secret/beta-doc', { sourceId: 'beta' }))!;
+    const granted = (await get_links.handler(remoteCtx(['alpha', 'beta', 'default']), {
+      page_id: root.id,
+    })) as any[];
+    expect(granted.filter(l => l.link_type === 'mentions' && l.to_slug === 'secret/beta-target')).toEqual([
+      expect.objectContaining({
+        from_slug: 'secret/beta-doc', from_source_id: 'beta',
+        to_slug: 'secret/beta-target', to_source_id: 'beta',
+        origin_slug: 'default/only-doc', origin_source_id: 'default',
+        link_type: 'mentions', link_source: 'frontmatter', context: 'origin-leak ctx',
+      }),
+    ]);
   });
 
   test('D1: UNTRUSTED remote with a scalar source scope is promoted to all-endpoint scoping (no far-endpoint leak)', async () => {

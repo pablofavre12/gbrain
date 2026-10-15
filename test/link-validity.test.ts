@@ -184,7 +184,14 @@ describe('dates and params', () => {
     expect(relationshipFilterSql('l', { status: 'all' })).toBe('TRUE');
     expect(relationshipFilterSql('l', { disabled: true })).toBe('TRUE');
     expect(relationshipFilterSql('l', { asOf: '2022-01-01' })).toContain("DATE '2022-01-01'");
-    expect(relationshipFilterSql('l', { excludePrivate: true })).toContain("lr.scope = 'world'");
+    const scoped = relationshipFilterSql('l', { excludePrivate: true }, []);
+    // Scoped reads use the stored relation declaration, but derive dates and
+    // status from readable evidence rather than the shared state projection.
+    expect(scoped).toContain('SELECT tm.semantics FROM link_relationships tm');
+    expect(scoped).toContain('FROM links ta');
+    expect(scoped).toContain('FROM link_transitions tx');
+    expect(scoped).not.toContain('FROM link_relationships lr');
+    expect(scoped).not.toMatch(/\btm\.(valid_ranges|recorded_at|retired_at|disputed|undated_past|first_start)\b/);
     expect(() => relationshipFilterSql('l', { asOf: "2022-01-01'; DROP TABLE links; --" })).toThrow();
   });
 });

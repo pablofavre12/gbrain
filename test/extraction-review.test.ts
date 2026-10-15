@@ -519,6 +519,18 @@ describe('extraction_pending + extraction_review', () => {
     return r.slug;
   }
 
+  test('pending stubs obey page ACLs before applying the limit and revoke immediately', async () => {
+    const publicSlug = await seedStub('Public Pending');
+    const restricted = await seedStub('Restricted Pending');
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:director'] WHERE slug=$1", [restricted]);
+    const read = (subject: string) => extraction_pending.handler(ctx({ auth: { token: 'fixture', clientId: 'extract-reader', scopes: ['read'],
+      sourceId: 'default', subjectIds: [subject] } as never }), { limit: 1 }) as Promise<{ count: number; pending: Array<{ slug: string }> }>;
+    expect((await read('user:tech')).pending.map(p => p.slug)).toEqual([publicSlug]);
+    expect((await read('user:director')).pending.map(p => p.slug)).toEqual([restricted]);
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:other'] WHERE slug=$1", [restricted]);
+    expect(await read('user:director')).toEqual(await read('user:tech'));
+  });
+
   test('pending lists unverified stubs; promoted/rejected drop out', async () => {
     const a = await seedStub('Fake Aa');
     const b = await seedStub('Fake Bb');

@@ -1,13 +1,10 @@
 /**
  * `coverage` on entity cards, entity misses and get_backlinks: whether every
- * page in the caller's permitted sources has been scanned for recognized
- * names. Read from the per-source status row the mention pass maintains plus
- * the due pages written since its last count (an indexed read over recent
- * pages per source), never a whole-brain scan, and never another source's
- * state. A row counted by a binary with other extractor versions (its
- * version stamp differs) is recounted once and the count saved on the row,
- * so a version bump shows every version-behind page as pending, whatever its
- * `updated_at`, until the sweep reaches it.
+ * page visible to the caller has been scanned for recognized names.
+ * Restricted readers count current authorized page state without reading or
+ * updating source-wide status; their last_pass_at is null because no scoped
+ * pass timestamp is recorded. Unrestricted local readers use the per-source
+ * status cache plus recent due pages, repairing stale version counts once.
  *
  * States: `complete`; `pending` (pages written or invalidated since the last
  * pass, pages behind the binary's mention or alias version, or no pass yet);
@@ -18,9 +15,11 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import type { PageReadScope } from '../types.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
 import type { Notice } from '../agent-output.ts';
 import { linkableTypesFor, loadSourcePack, readMentionPolicy } from './policy.ts';
-import { INDEX_VERSION_STAMP, MENTION_EXTRACTOR_VERSION, countIndexDuePages, splitStoredFingerprint } from './pass.ts';
+import { INDEX_VERSION_STAMP, MENTION_EXTRACTOR_VERSION, ALIAS_DERIVATION_VERSION, countIndexDuePages, splitStoredFingerprint } from './pass.ts';
 
 export type CoverageState = 'complete' | 'pending' | 'disabled' | 'type_not_linkable' | 'failed';
 
@@ -37,8 +36,39 @@ const toIso = (v: unknown): string | null => {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 };
 
-/** Coverage over `sourceIds` (the caller's permitted sources). */
-export async function readMentionCoverage(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig'>, sourceIds: string[]): Promise<MentionCoverage> {
+/**
+ * Restricted readers count authorized page state directly. Shared status rows
+ * cannot establish their coverage: counts, failures and pass timestamps may
+ * come entirely from hidden pages. There is no reader-specific pass timestamp,
+ * so last_pass_at is null. This path never repairs the shared status cache.
+ */
+async function scopedMentionCoverage(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig'>,
+  sourceIds: string[], scope: PageReadScope): Promise<MentionCoverage> {
+  const policy = await readMentionPolicy(engine);
+  if (!policy.enabled) return { state: 'disabled', pending_pages: 0, last_pass_at: null, degraded: true };
+  let pending = 0;
+  for (const sourceId of new Set(sourceIds)) {
+    const types = linkableTypesFor(await loadSourcePack(engine, sourceId), policy);
+    const params: unknown[] = [sourceId, MENTION_EXTRACTOR_VERSION, types, ALIAS_DERIVATION_VERSION];
+    const visible = pageReadFilter('p', scope, params, true);
+    const [row] = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n
+      FROM pages p LEFT JOIN page_mention_state s ON s.page_id = p.id
+      WHERE p.source_id = $1 AND ${visible}
+        AND (s.page_id IS NULL OR s.mention_revision IS DISTINCT FROM p.knowledge_revision
+          OR s.mention_version IS DISTINCT FROM $2
+          OR (p.type = ANY($3::text[]) AND (s.alias_revision IS DISTINCT FROM p.knowledge_revision
+            OR s.alias_version IS DISTINCT FROM $4)))`, params);
+    pending += Number(row?.n ?? 0);
+  }
+  return { state: pending > 0 ? 'pending' : 'complete', pending_pages: pending, last_pass_at: null,
+    ...(pending > 0 ? { degraded: true as const } : {}) };
+}
+
+/** Coverage over sources, optionally confined to a reader's full page policy. */
+export async function readMentionCoverage(engine: Pick<BrainEngine, 'executeRaw' | 'getConfig'>, sourceIds: string[], scope?: PageReadScope): Promise<MentionCoverage> {
+  if (scope?.aclSubjectIds !== undefined || scope?.excludePrivate || scope?.minTrust || scope?.suppressFlagged) {
+    return scopedMentionCoverage(engine, sourceIds, scope);
+  }
   const policy = await readMentionPolicy(engine);
   const rows = await engine.executeRaw<{ source_id: string; state: string; pending: number; counted_at: unknown; last_pass_at: unknown; policy_fingerprint: string | null }>(
     `SELECT source_id, state, pending, counted_at, last_pass_at, policy_fingerprint FROM mention_index_status WHERE source_id = ANY($1::text[])`, [sourceIds]);

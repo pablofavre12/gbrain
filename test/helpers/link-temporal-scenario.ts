@@ -32,9 +32,10 @@ export function defineLinkRelationshipTests(label: string, engineOf: () => Brain
       [ids[from], ids[to], type, kind, on, origin ? ids[origin] : null]);
   }
   async function liveTargets(from: string, opts: Parameters<typeof relationshipFilterSql>[1] = {}) {
+    const params: unknown[] = [ids[from]];
     const rows = await eng.executeRaw<{ slug: string; link_type: string }>(
       `SELECT t.slug, l.link_type FROM links l JOIN pages t ON t.id = l.to_page_id
-        WHERE l.from_page_id = $1 AND ${relationshipFilterSql('l', opts)} ORDER BY t.slug, l.link_type`, [ids[from]]);
+        WHERE l.from_page_id = $1 AND ${relationshipFilterSql('l', opts, params)} ORDER BY t.slug, l.link_type`, params);
     return [...new Set(rows.map(r => `${short(r.slug)}:${r.link_type}`))];
   }
   const key = (to: string, link_type: string) => ({ from_page_id: ids[alice], to_page_id: ids[to], link_type });

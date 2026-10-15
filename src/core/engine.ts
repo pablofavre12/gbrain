@@ -1610,7 +1610,7 @@ export interface BrainEngine {
    * parity. `link_source` may be NULL (legacy/unknown rows).
    */
   listLinkSources(
-    opts?: PageReferenceOpts,
+    opts?: PageReadScope,
   ): Promise<{ link_source: string | null; count: number }[]>;
   /**
    * Fuzzy-match a display name to a page slug using pg_trgm similarity.
@@ -1639,6 +1639,7 @@ export interface BrainEngine {
     dirPrefix?: string,
     minSimilarity?: number,
     sourceId?: string,
+    readScope?: PageReadScope,
   ): Promise<{ slug: string; similarity: number } | null>;
   /**
    * v0.34.1 (#861 — P0 leak seal): `opts.sourceId` / `opts.sourceIds`

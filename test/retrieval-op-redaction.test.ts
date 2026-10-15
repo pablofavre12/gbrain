@@ -20,8 +20,11 @@
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
+import { emptyHome, withEnv } from './helpers/with-env.ts';
+import { extractStaleFromDB } from '../src/commands/extract.ts';
 import { operations, operationsByName, type Operation, type OperationContext } from '../src/core/operations.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { estimateTokens } from '../src/core/search/token-budget.ts';
@@ -38,11 +41,13 @@ const openaiKey = () => ['sk', rand(40)].join('-');
 const TOKEN = vendorToken();
 const MARK = 'PLANTMARK';
 const planted = (label: string) => `${MARK} ${label} ${TOKEN} end`;
+const WANTED_TARGET = `notes/${MARK}-wanted-${TOKEN}`;
 const TODAY = new Date().toISOString().slice(0, 10);
 const SRC = 'default';
 const CONFIG = { engine: 'pglite' } as OperationContext['config'];
 
 let engine: PGLiteEngine;
+let extractionHome: string;
 
 async function call(name: string, args: Record<string, unknown>, remote = true): Promise<{ text: string; isError: boolean }> {
   const res = await dispatchToolCall(engine, name, args, { remote, transport: 'stdio', sourceId: SRC, config: CONFIG });
@@ -60,6 +65,7 @@ const isRetrieval = (op: Operation) =>
   op.outputRedaction === 'retrieval' || (typeof op.outputRedaction === 'object' && 'retrieval' in op.outputRedaction);
 
 beforeAll(async () => {
+  extractionHome = emptyHome();
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -69,7 +75,7 @@ beforeAll(async () => {
     timeline: `- ${TODAY}: ${planted('timeline')}`, frontmatter: { summary: planted('summary') },
   }, { sourceId: SRC });
   await engine.putPage('notes/n1', {
-    type: 'note', title: planted('note'), compiled_truth: `${planted('note body')}\nGITHUB_TOKEN=${rand(31)}7`,
+    type: 'note', title: planted('note'), compiled_truth: `${planted('note body')}\nGITHUB_TOKEN=${rand(31)}7\nSee [[${WANTED_TARGET}]].`,
     timeline: `- ${TODAY}: ${planted('note timeline')}`, frontmatter: {},
   }, { sourceId: SRC });
   await engine.putPage('misc/orphan', { type: 'note', title: planted('orphan'), compiled_truth: planted('orphan body'), frontmatter: {} }, { sourceId: SRC });
@@ -96,6 +102,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  rmSync(extractionHome, { recursive: true, force: true });
 }, 60_000);
 
 describe('policy classification (ENG-4)', () => {
@@ -147,8 +154,7 @@ const SWEEP: Record<string, Row> = {
   advisor: { skip: 'aggregate advisory over the installed skill stack; advisor suites own it' },
   get_ingest_log: { args: { limit: 50 } },
   find_orphans: { args: {} },
-  // Targets and origin slugs only; the fixture has no unresolved links (behavior: test/wanted-links.test.ts).
-  wanted_pages: { args: {}, content: false },
+  wanted_pages: { args: {} },
   get_calibration_profile: { args: {}, content: false },
   takes_list: { args: { limit: 50 } },
   takes_search: { args: { query: 'PLANTMARK', limit: 20 } },
@@ -253,9 +259,23 @@ describe('seeded sweep through MCP dispatch (remote = true)', () => {
       continue;
     }
     test(`${isRetrieval(op) ? 'RETRIEVAL' : 'NO_STORED_TEXT'} ${op.name}`, async () => {
+      if (op.name === 'wanted_pages') {
+        // Earlier sweep writes advance revisions; publish current authored evidence before the scoped read.
+        await withEnv({ GBRAIN_HOME: extractionHome }, () => extractStaleFromDB(engine, {
+          dryRun: false, jsonMode: true, quiet: true, catchUp: true, includeFrontmatter: true,
+        }));
+      }
       const { text, isError } = await call(op.name, row.args, row.remote ?? true);
       expect(isError, text.slice(0, 300)).toBe(false);
       expect(text.includes(TOKEN), `${op.name} returned the planted token`).toBe(false);
+      if (op.name === 'wanted_pages') {
+        expect(text).not.toContain(TOKEN.toLowerCase());
+        expect(JSON.parse(text).targets).toContainEqual(expect.objectContaining({
+          target: `notes/${MARK}-wanted-<REDACTED:github_token>`,
+          referenced_by: 1,
+          sample_origins: [{ slug: 'notes/n1', source_id: SRC }],
+        }));
+      }
       if (!isRetrieval(op)) {
         if (op.scope === 'read') expect(text.includes(MARK), `${op.name} returned stored text`).toBe(false);
       } else if (row.content !== false) {

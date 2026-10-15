@@ -257,6 +257,15 @@ CREATE TABLE IF NOT EXISTS wanted_links (
 CREATE INDEX IF NOT EXISTS wanted_links_target_idx ON wanted_links (target_source_id, target_ref);
 CREATE INDEX IF NOT EXISTS wanted_links_source_idx ON wanted_links (source_id);
 
+CREATE TABLE IF NOT EXISTS authored_link_inventories (
+  origin_page_id INTEGER PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  origin_revision UUID NOT NULL,
+  refs JSONB NOT NULL CHECK (jsonb_typeof(refs) = 'array'),
+  checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS authored_link_inventories_source_idx ON authored_link_inventories(source_id);
+
 CREATE TABLE IF NOT EXISTS tags (
   id      SERIAL PRIMARY KEY,
   page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,

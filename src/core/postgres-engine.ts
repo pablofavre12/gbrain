@@ -1749,7 +1749,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async listLinkSources(
-    opts?: import('./engine.ts').PageReferenceOpts,
+    opts?: PageReadScope,
   ): Promise<{ link_source: string | null; count: number }[]> {
     return this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, tx => linksImpl.listLinkSources(scopedRead(this.engineSqlOn(tx)), opts));
   }
@@ -1759,8 +1759,9 @@ export class PostgresEngine implements BrainEngine {
     dirPrefix?: string,
     minSimilarity: number = 0.55,
     sourceId?: string,
+    readScope?: PageReadScope,
   ): Promise<{ slug: string; similarity: number } | null> {
-    return pagesImpl.findByTitleFuzzy(unscopedExecutor(this.engineSql, 'pages: unscoped on master (EO4 inventory)'), name, dirPrefix, minSimilarity, sourceId);
+    return pagesImpl.findByTitleFuzzy(unscopedExecutor(this.engineSql, 'pages: unscoped on master (EO4 inventory)'), name, dirPrefix, minSimilarity, sourceId, readScope);
   }
 
   async traverseGraph(
@@ -1826,10 +1827,7 @@ export class PostgresEngine implements BrainEngine {
     return readSalienceScores(this.executeRaw.bind(this), refs, opts);
   }
 
-  async findOrphanPages(opts?: {
-    sourceId?: string;
-    sourceIds?: string[];
-    excludePrivate?: boolean;
+  async findOrphanPages(opts?: PageReadScope & {
     mode?: 'inbound' | 'islanded';
   }): Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string }>> {
     return linksImpl.findOrphanPages(unscopedExecutor(this.engineSql, 'links: unscoped on master (EO4 inventory)'), opts);

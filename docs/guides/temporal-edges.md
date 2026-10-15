@@ -202,6 +202,51 @@ The same note follows a page into ambient turn context (appended to its synopsis
 compiled context files (a `relationships:` line under the excerpt), so an agent reading any
 of them sees the ended relationship even when the summary has not been rewritten.
 
+## Reader permissions
+
+Dates, stints, status, history filters and relationship notes use only evidence
+that the reader can access. The authorization policy applies before aggregation
+and before graph filtering or pagination, including each endpoint, evidence
+origin and permitted source. A restricted document cannot change another
+reader's visible relationship, its metadata or whether it appears in a walk.
+Permission revocation takes effect on the next database snapshot without waiting
+for a projection refresh.
+
+Scoped reads derive state directly from eligible evidence. Their `recorded_at`
+is the earliest authorized evidence timestamp; `retired_at` is the latest
+authorized evidence timestamp when that evidence describes an ended relationship.
+These are reader-scoped evidence timestamps, not the shared projection's audit
+history. Unrestricted local reads retain the writer-maintained projection.
+Ambient notes carry the caller's policy. Compiled context without a reader
+identity includes only unrestricted pages and evidence within the compiled
+source; explicitly included trusted-local core memory retains its separate rules.
+
+Automatically inferred timeline entries have a separate publication boundary:
+both the contradiction-report writer and the nightly relationship check require
+current public evidence in the destination source. A privileged reader's access
+does not authorize publishing restricted evidence to a broader audience. Derived
+pages whose complete input audience cannot be verified are skipped. This does
+not restrict authorized readers' temporal queries or ordinary manual writes.
+
+Multiple inferred entries for one page revalidate the original evidence before
+each write. Stale or legacy open closure proposals can be regenerated from
+current eligible evidence; rejected and reverted decisions remain final for that
+evidence. Deterministic single-value chains recapture and recompute after every
+applied closure.
+
+Inference records pin the evidence and its audience. Canonical publication
+rechecks those pins inside its transaction, refusing stale content, changed
+permissions, corrected effective dates or date sources, or replaced pages. Cached
+contradiction reports must match both current page anchors before selecting the
+destination and date; regenerate stale reports to use the corrected chronology.
+Legacy reports without immutable chunk or take
+provenance and legacy closure proposals without publication pins must be
+regenerated. Failed guarded requests cannot be replayed as ordinary timeline
+writes; rerun inference to capture fresh evidence. Once committed, a timeline
+entry is canonical content governed by its destination page. Later changes to
+the original evidence permissions do not retract that published entry; removal
+requires editing or undoing the destination entry.
+
 ## The nightly relationship check
 
 The dream cycle's `edge_contradictions` phase looks at subjects with two or more live

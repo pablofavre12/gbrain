@@ -1994,7 +1994,7 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async listLinkSources(
-    opts?: import('./engine.ts').PageReferenceOpts,
+    opts?: PageReadScope,
   ): Promise<{ link_source: string | null; count: number }[]> {
     return linksImpl.listLinkSources(scopedRead(this.engineSql), opts);
   }
@@ -2004,8 +2004,9 @@ export class PGLiteEngine implements BrainEngine {
     dirPrefix?: string,
     minSimilarity: number = 0.55,
     sourceId?: string,
+    readScope?: PageReadScope,
   ): Promise<{ slug: string; similarity: number } | null> {
-    return pagesImpl.findByTitleFuzzy(unscopedExecutor(this.engineSql, 'pages: unscoped on master (EO4 inventory)'), name, dirPrefix, minSimilarity, sourceId);
+    return pagesImpl.findByTitleFuzzy(unscopedExecutor(this.engineSql, 'pages: unscoped on master (EO4 inventory)'), name, dirPrefix, minSimilarity, sourceId, readScope);
   }
 
   async traverseGraph(
@@ -2069,10 +2070,7 @@ export class PGLiteEngine implements BrainEngine {
     return readSalienceScores(this.executeRaw.bind(this), refs, opts);
   }
 
-  async findOrphanPages(opts?: {
-    sourceId?: string;
-    sourceIds?: string[];
-    excludePrivate?: boolean;
+  async findOrphanPages(opts?: PageReadScope & {
     mode?: 'inbound' | 'islanded';
   }): Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string }>> {
     return plannerRead(this, this._pageTransaction, () => linksImpl.findOrphanPages(unscopedExecutor(this.engineSql, 'links: unscoped on master (EO4 inventory)'), opts));

@@ -67,10 +67,10 @@ const VETTED_BUILDERS: Record<string, string> = {
   privateSnapshotFilterFragment: 'src/core/search/private-visibility.ts: constant snapshot visibility predicate over a caller alias',
   privateProvenanceFilterFragment: 'src/core/search/private-visibility.ts: constant fact-provenance visibility predicate over a caller alias',
   vectorLiteralSql: 'src/core/engine-sql/facts.ts: master\'s inlined vector literal; toPgVectorLiteral output (numbers joined by commas) + a ::vector/::halfvec constant',
-  temporalLinkJoinSql: 'src/core/link-validity.ts: constant LEFT JOIN onto link_relationships over a caller alias; scope is one of two literals',
+  temporalLinkJoinSql: 'src/core/link-validity.ts: LEFT JOIN over a fixed caller alias; scoped evidence values append to bound parameters',
   projectionEligibleSql: 'src/core/eligibility/sql.ts: read-eligibility predicate over a caller alias; splices only closed tier and reason-family vocabularies (no values)',
   pageEligibleSql: 'src/core/eligibility/sql.ts: page trust-floor and activation predicate over a caller alias; closed vocabularies only',
-  relationshipFilterSql: 'src/core/link-validity.ts: relationship-state probe over a caller alias; dates pass isCalendarDate and inline as DATE literals, status/scope are literals',
+  relationshipFilterSql: 'src/core/link-validity.ts: relationship-state probe over a fixed caller alias; dates are validated DATE literals, reader policy and semantics are bound parameters',
 };
 
 const SQL_ARG_METHODS: Record<string, number> = { query: 0, unsafe: 0, executeRaw: 0 };

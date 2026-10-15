@@ -25,11 +25,9 @@ import {
   readPolicyOpts,
   reclassifyMutationTimePageMiss,
   requireWritablePage,
-  sourceScopeOpts,
   assertSourceInCallerScope,
 } from './context.ts';
 import { listWantedPages } from '../wanted-links-store.ts';
-import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { OperationContext } from './contract.ts';
 import type { Link, PageReadPolicy } from '../types.ts';
 import { ALL_SOURCES } from '../source-id.ts';
@@ -429,6 +427,10 @@ const get_backlinks: Operation = {
     const root = await resolveGraphPageRef(ctx, p);
     const resolvedParams = { ...p, slug: root.slug, page_id: root.id };
     if (p.group !== undefined) {
+      if (p.status !== undefined || p.as_of !== undefined || p.during !== undefined) {
+        throw opError('invalid_params', 'get_backlinks: grouped referrers do not support temporal filters.',
+          'Omit group and cursor to read relationship history with status, as_of or during.');
+      }
       const { policy } = await resolveLinkReadScope(ctx, p, 'get_backlinks');
       return readBacklinkPage(ctx, resolvedParams, policy);
     }
@@ -450,9 +452,7 @@ const list_link_sources: Operation = {
   description: 'Link provenances (e.g. markdown, manual) with their edge counts.',
   params: {},
   handler: async (ctx) => {
-    // Route through sourceScopeOpts so the read honors both scalar ctx.sourceId
-    // and federated ctx.auth.allowedSources (no cross-source provenance leak).
-    return ctx.engine.listLinkSources(sourceScopeOpts(ctx));
+    return ctx.engine.listLinkSources(await readPolicyOpts(ctx));
   },
   scope: 'read',
   cliHints: { name: 'link-sources' },
@@ -644,8 +644,7 @@ const wanted_pages: Operation = {
         `wanted_pages: limit must be 1-${WANTED_MAX_LIMIT} and offset a non-negative integer`,
         limitOk ? { def: wanted_pages.params.offset, example: 0 } : { def: wanted_pages.params.limit, example: WANTED_DEFAULT_LIMIT });
     }
-    const { total, rows } = await listWantedPages(ctx.engine, { sourceId: policy.sourceId, sourceIds: policy.sourceIds,
-      excludePrivate: policy.excludePrivate, privateFilter: privatePagesFilterFragment,
+    const { total, rows } = await listWantedPages(ctx.engine, { ...policy,
       limit: p.count_only === true ? 1 : limit, offset });
     const next = offset + limit < total ? offset + limit : null;
     return {

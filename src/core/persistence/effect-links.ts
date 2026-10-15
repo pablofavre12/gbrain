@@ -1,4 +1,5 @@
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
+import type { PageReadScope } from '../types.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { OperationError } from '../ops/contract.ts';
 import { matchesSlugAllowList, slugUnderBoundPrefixes } from '../ops/context.ts';
@@ -10,6 +11,8 @@ import { REMOTE_AUTO_LINKS_KEY, REMOTE_MENTION_LINK_SOURCE, type PersistenceEffe
 import { guardEffectSource } from './effect-recovery.ts';
 import type { SqlEngine, WriteAuthority, WriteRequest } from './model.ts';
 import { excludesPrivateWrites } from './page-visibility.ts';
+import { collectAuthoredLinkReferences } from '../authored-link-references.ts';
+import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
 import { isRemoteWantedPagesEnabled, replaceWantedLinks } from '../wanted-links.ts';
 
 /** `mcp.remote_auto_links`: unset is on; false/0/no/off (any case) turns the remote `links` effect off. */
@@ -27,10 +30,15 @@ const SKIPPED_TARGET_LIMIT = 50;
  * page-path mentions in compiled_truth only. No frontmatter, no timeline
  * section, no schema-pack verbs; every edge is stored as an untyped `mentions`.
  */
-async function mentionTargets(engine: BrainEngine, snapshot: PageSnapshot, sourceId: string) {
+async function mentionTargets(engine: BrainEngine, snapshot: PageSnapshot, sourceId: string, readScope: PageReadScope) {
   const { page } = snapshot;
+  const resolver = makeResolver(engine, { mode: 'live', sourceId, readScope });
+  const globalBasename = await isGlobalBasenameEnabled(engine);
   const { candidates } = await extractPageLinks(page.slug, page.compiled_truth, {}, page.type,
-    makeResolver(engine, { mode: 'live', sourceId }), { skipFrontmatter: true, pack: null, globalBasename: await isGlobalBasenameEnabled(engine) });
+    resolver, { skipFrontmatter: true, pack: null, globalBasename });
+  const pack = (await loadActivePackForLocalEngine(engine, { sourceId }))?.manifest ?? null;
+  const extracted = await extractPageLinks(page.slug, page.compiled_truth + '\n' + page.timeline, page.frontmatter, page.type,
+    resolver, { skipFrontmatter: true, collectAuthoredReferences: true, pack, globalBasename });
   const targets = new Map<string, string>();
   const skipped: SkippedLinkTarget[] = [];
   for (const candidate of candidates) {
@@ -38,7 +46,7 @@ async function mentionTargets(engine: BrainEngine, snapshot: PageSnapshot, sourc
     if (candidate.targetSourceId && candidate.targetSourceId !== sourceId) skipped.push({ slug: candidate.targetSlug, reason: 'cross_source' });
     else if (!targets.has(candidate.targetSlug)) targets.set(candidate.targetSlug, candidate.context);
   }
-  return { targets, skipped };
+  return { targets, skipped, extracted, pack };
 }
 
 /** The writer's slug confinement, stored and current, applied to link targets. */
@@ -80,7 +88,10 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
   const snapshot = await engine.readPageSnapshot(effect.data.slug, { sourceId });
   if (!snapshot || snapshot.page.id !== effect.data.page_id || snapshot.revision !== effect.revision) return skip(engine, 'superseded');
   if (!await isAutoLinkEnabled(engine) || !await isRemoteAutoLinksEnabled(engine)) return skip(engine, 'disabled');
-  const { targets, skipped } = await mentionTargets(engine, snapshot, sourceId);
+  const aclSubjects = row.authority.remote ? row.authority.aclSubjectIds ?? [] : null;
+  const readScope = { sourceId, ...(aclSubjects === null ? {} : { aclSubjectIds: aclSubjects }),
+    excludePrivate: row.authority.remote && ((row.authority.excludePrivate ?? true) || await excludesPrivateWrites(engine, true)) };
+  const { targets, skipped, extracted, pack } = await mentionTargets(engine, snapshot, sourceId, readScope);
   await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','1s',true),set_config('statement_timeout','5s',true)");
     await guardEffectSource(tx, effect, hostId);
@@ -95,8 +106,10 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
     const live = await tx.readPageSnapshot(snapshot.page.slug, { sourceId });
     if (!live || live.page.id !== snapshot.page.id || live.revision !== snapshot.revision) { await skip(tx, 'superseded'); return; }
     const hidePrivate = row.authority.remote && ((row.authority.excludePrivate ?? true) || await excludesPrivateWrites(tx, true));
+    // An ACL-denied destination is indistinguishable from an absent one, including skip reasons.
     const existing = targets.size ? await tx.executeRaw<{ slug: string; visible: boolean }>(`SELECT p.slug,(${privatePagesFilterFragment('p')}) AS visible
-      FROM pages p WHERE p.source_id=$1 AND p.slug=ANY($2::text[]) AND p.deleted_at IS NULL`, [sourceId, [...targets.keys()]]) : [];
+      FROM pages p WHERE p.source_id=$1 AND p.slug=ANY($2::text[]) AND p.deleted_at IS NULL
+        AND ($3::text[] IS NULL OR p.acl_subject_ids IS NULL OR p.acl_subject_ids && $3::text[])`, [sourceId, [...targets.keys()], aclSubjects]) : [];
     const visible = new Map(existing.map(page => [page.slug, page.visible]));
     const granted = await targetGrant(tx, row.authority);
     const wanted = new Map<string, string>();
@@ -105,23 +118,29 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
       if (reason) skipped.push({ slug, reason });
       else wanted.set(slug, context);
     }
-    const owned = await tx.executeRaw<{ id: number; slug: string }>(`SELECT l.id,t.slug FROM links l JOIN pages t ON t.id=l.to_page_id
-      WHERE l.link_source=$1 AND l.origin_page_id=$2`, [REMOTE_MENTION_LINK_SOURCE, live.page.id]);
-    const obsolete = owned.filter(link => !wanted.has(link.slug)).map(link => link.id);
+    const owned = await tx.executeRaw<{ id: number; slug: string; acl_visible: boolean }>(`SELECT l.id,t.slug,
+      ($3::text[] IS NULL OR t.acl_subject_ids IS NULL OR t.acl_subject_ids && $3::text[]) AS acl_visible
+      FROM links l JOIN pages t ON t.id=l.to_page_id
+      WHERE l.link_source=$1 AND l.origin_page_id=$2`, [REMOTE_MENTION_LINK_SOURCE, live.page.id, aclSubjects]);
+    const obsolete = owned.filter(link => !wanted.has(link.slug));
     const kept = new Set(owned.map(link => link.slug));
     const additions: LinkBatchInput[] = [...wanted].filter(([slug]) => !kept.has(slug)).map(([slug, context]) => ({
       from_slug: live.page.slug, to_slug: slug, from_source_id: sourceId, to_source_id: sourceId, link_type: 'mentions', context,
       link_source: REMOTE_MENTION_LINK_SOURCE, link_kind: 'plain', origin_slug: live.page.slug, origin_source_id: sourceId }));
-    if (obsolete.length) await tx.executeRaw('DELETE FROM links WHERE id=ANY($1::bigint[])', [obsolete]);
+    if (obsolete.length) await tx.executeRaw('DELETE FROM links WHERE id=ANY($1::bigint[])', [obsolete.map(link => link.id)]);
     const added = additions.length ? await tx.addLinksBatch(additions, { auditSite: 'addLinksBatch' }) : 0;
     // Wanted pages: a missing mention target is recorded so the edge appears once that page is written (core/wanted-links.ts).
-    if (await isRemoteWantedPagesEnabled(tx)) {
-      await replaceWantedLinks(tx, { pageId: Number(live.page.id), sourceId }, { producers: ['body'], rows: skipped
+    {
+      const wantedEnabled = await isRemoteWantedPagesEnabled(tx);
+      await replaceWantedLinks(tx, { pageId: Number(live.page.id), sourceId }, { producers: wantedEnabled ? ['body'] : [],
+        ...(pack ? { authoredReferences: collectAuthoredLinkReferences({ candidates: extracted.authoredCandidates ?? extracted.candidates,
+          frontmatterReferences: extracted.frontmatterReferences, originSourceId: sourceId, originSlug: live.page.slug, crossSourceAllowed: false,
+          resolve: candidate => ({ ok: true, toSourceId: candidate.targetSourceId ?? sourceId, fromSourceId: sourceId }) }) } : {}), rows: skipped
         .filter(target => target.reason === 'missing')
         .map(target => ({ producer: 'body', ref_kind: 'slug', target_source_id: sourceId, target_ref: target.slug,
           link_type: 'mentions', context: (targets.get(target.slug) ?? '').slice(0, 240) })) });
     }
-    await completeEffect(tx, effect, { links: 'committed', added, removed: obsolete.length, skipped_targets: skipped.slice(0, SKIPPED_TARGET_LIMIT),
+    await completeEffect(tx, effect, { links: 'committed', added, removed: obsolete.filter(link => link.acl_visible).length, skipped_targets: skipped.slice(0, SKIPPED_TARGET_LIMIT),
       ...(skipped.length > SKIPPED_TARGET_LIMIT ? { skipped_target_count: skipped.length } : {}) });
   });
 }

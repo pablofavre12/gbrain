@@ -189,6 +189,27 @@ for (const backend of testBackends()) describe(`#6643 maintenance file drift (${
     expect(await requests(sourceId)).toBe(before);
   }), 240_000);
 
+  test('conflict rows, counts and window ignore unreadable pages before pagination', () => fixture(async ({ root, sourceId, ctx }) => {
+    const read = (subject: string) => listConflicts.handler({ ...ctx, remote: true,
+      auth: { token: 'fixture', clientId: 'conflict-reader', scopes: ['read'], sourceId, subjectIds: [subject] } } as OperationContext,
+      { source_id: sourceId, limit: 1 });
+    await put(ctx, 'notes/public', '---\ntype: note\ntitle: Public\n---\nPublic.\n');
+    drift(root, 'notes/public', text => `${text}\nLocal edit.\n`);
+    await refusedWrite(ctx, 'notes/public', 'Public conflict.');
+    const before = await read('user:tech');
+    await put(ctx, 'notes/private-conflict', '---\ntype: note\ntitle: Restricted\n---\nRestricted.\n');
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:director'] WHERE source_id=$1 AND slug='notes/private-conflict'", [sourceId]);
+    drift(root, 'notes/private-conflict', text => `${text}\nLocal edit.\n`);
+    await refusedWrite(ctx, 'notes/private-conflict', 'Restricted conflict.');
+    expect(await read('user:tech')).toEqual(before);
+    const allowed = await read('user:director') as { totals: { slugs: number }; conflicts: Array<{ slug: string }>; next: string | null };
+    expect(allowed.totals.slugs).toBe(2);
+    expect(allowed.conflicts[0]!.slug).toBe('notes/private-conflict');
+    expect(allowed.next).not.toBeNull();
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:other'] WHERE source_id=$1 AND slug='notes/private-conflict'", [sourceId]);
+    expect(await read('user:director')).toEqual(before);
+  }), 240_000);
+
   test('the conflict audit groups receipts by slug; scoped MCP readers get database-derived fields within their grant', () => fixture(async ({ root, sourceId, ctx }) => {
     await put(ctx, 'notes/alpha', '---\ntype: note\ntitle: Alpha\n---\nAlpha.\n');
     await put(ctx, 'notes/secret', '---\ntype: note\ntitle: Secret\nvisibility: private\n---\nSecret.\n');

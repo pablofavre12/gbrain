@@ -177,7 +177,8 @@ describe('coverage states', () => {
     expect(proj.json.card.coverage.state).toBe('type_not_linkable');
     expect(proj.notices.join('\n')).toContain('mentions.entity_types');
     await engine.executeRaw("UPDATE mention_index_status SET state = 'failed', error = 'x'");
-    expect((await call('entity', { name: 'QUCO' }, remote)).json.card.coverage.state).toBe('failed');
+    expect((await call('entity', { name: 'QUCO' })).json.card.coverage.state).toBe('failed');
+    expect((await call('entity', { name: 'QUCO' }, remote)).json.card.coverage).toMatchObject({ state: 'complete', pending_pages: 0, last_pass_at: null });
     await engine.setConfig('mentions.auto_link', 'false');
     const off = await call('entity', { name: 'QUCO' }, remote);
     expect(off.json.card.coverage).toMatchObject({ state: 'disabled', degraded: true });

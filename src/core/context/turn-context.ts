@@ -347,7 +347,10 @@ export async function assembleTurnContext(
     } catch {
       volunteered = [];
     }
-    await appendRelationshipNotes(engine, [...pointers, ...volunteered]);
+    await appendRelationshipNotes(engine, [...pointers, ...volunteered], {
+      sourceId: opts.sourceId, aclSubjectIds: opts.aclSubjectIds ?? [], excludePrivate: true,
+      minTrust: policy.floor, suppressFlagged: policy.suppressFlagged,
+    });
     return { pointers, volunteered };
   })();
 

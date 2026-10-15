@@ -90,11 +90,11 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
       await tx.lockPageKeys(prepared.pageKeys);
       const current = await tx.readPageSnapshot(slug, { sourceId });
       if (current?.revision !== snapshot.revision) return null;
+      const written = await prepared.apply(tx);
       if (!prepared.attendanceComplete) {
         await tx.markPagesAttendanceBlocked([{ slug, source_id: sourceId, revision: current.revision }]);
         return null;
       }
-      const written = await prepared.apply(tx);
       if (written.errors) return null;
       const timeline = (await unrecordedCanonicalTimeline(tx, current.page.id, current.page, slug)).map(entry => ({ slug, date: entry.date,
         source: entry.source, summary: entry.summary, detail: entry.detail || '', source_id: sourceId }));

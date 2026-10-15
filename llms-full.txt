@@ -3,13 +3,13 @@
 > GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, fat-markdown skills, and one agent operator contract for every error and recommendation. Teaches agents brain ops, ingestion, enrichment, scheduling, identity, and access control.
 
 This file concatenates core GBrain documentation for single-fetch ingestion.
-For the link-only index, see `llms.txt`. Source of truth: https://github.com/perennia-regen/gbrain.
+For the link-only index, see `llms.txt`. Source of truth: https://github.com/pablofavre12/gbrain.
 
 # Choose your agent setup
 
 ## docs/guides/remote-mcp.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/remote-mcp.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/remote-mcp.md
 
 # Use your brain from anywhere over MCP
 
@@ -568,7 +568,7 @@ pre-mint before the service runs and pass `--token <value>`, or use the scoped
 
 ## docs/guides/grok-bot.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/grok-bot.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/grok-bot.md
 
 # GBrain for Grok Bot
 
@@ -776,7 +776,7 @@ network and OAuth failures belong to the
 
 ## docs/guides/muse.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/muse.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/muse.md
 
 # GBrain for Muse
 
@@ -1008,7 +1008,7 @@ old path. More errors and fixes are in the
 
 ## docs/guides/in-agent-setup.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/in-agent-setup.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/in-agent-setup.md
 
 # Install GBrain inside a personal agent
 
@@ -1362,7 +1362,7 @@ policies. Those remain app-level acceptance checks in the product guides.
 
 ## docs/guides/hosted-harness-access.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/hosted-harness-access.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/hosted-harness-access.md
 
 # Connect your agent to an existing hosted GBrain
 
@@ -1701,7 +1701,7 @@ As of **2026-09-09**, repository tests exercise private configuration writers, c
 
 ## AGENTS.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/AGENTS.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/AGENTS.md
 
 # Agents working on GBrain
 
@@ -2037,7 +2037,7 @@ publishing: `LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork
 
 ## CLAUDE.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/CLAUDE.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/CLAUDE.md
 
 # CLAUDE.md
 
@@ -2561,7 +2561,7 @@ installation is not proof of native use. Read
 
 ## INSTALL_FOR_AGENTS.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/INSTALL_FOR_AGENTS.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/INSTALL_FOR_AGENTS.md
 
 # GBrain Installation Guide for AI Agents
 
@@ -3323,7 +3323,7 @@ TTY-only (`GBRAIN_BANNER=1` forces it, `GBRAIN_NO_BANNER=1` hides it).
 
 ## docs/protocol/AGENT_OPERATOR_v1.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/protocol/AGENT_OPERATOR_v1.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/protocol/AGENT_OPERATOR_v1.md
 
 # AGENT_OPERATOR v1: how an agent operates gbrain
 
@@ -4564,7 +4564,7 @@ the decision table above and compare. Docs URLs are stored as
 
 ## skills/RESOLVER.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/skills/RESOLVER.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/skills/RESOLVER.md
 
 # GBrain Skill Resolver
 
@@ -4766,7 +4766,7 @@ These apply to ALL brain-writing skills:
 
 ## README.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/README.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/README.md
 
 <h1><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/brand/gbrain-wordmark-light.svg"><img src="docs/images/brand/gbrain-wordmark.svg" alt="GBrain" height="52"></picture></h1>
 
@@ -5193,8 +5193,9 @@ Start with `gbrain doctor`. For database access failures, use `gbrain engine sta
 
 ## Docs
 
+- [Fork contracts](FORK.md) and [upgrade guide](skills/migrations/v0.60.238.0.md)
 - [`docs/INSTALL.md`](docs/INSTALL.md) — every install path, end to end
-- [`docs/guides/bootstrap.md`](docs/guides/bootstrap.md) — the persistent-personal-agent bootstrap contract (interview, identity files, hooks, private repo, security posture, uninstall), plus local harness mode (`gbrain bootstrap harness`) for wiring framework-spawned Claude Code/Codex sessions to a running serve
+- [`docs/guides/bootstrap.md`](docs/guides/bootstrap.md) — personal-agent setup, security, uninstall, and local harness mode
 - [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — why schemas matter: 7 killer use cases, the structural argument for typed page kinds, the agent-co-curates pattern
 - [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md) — 5-minute walkthrough: fork the bundled pack, add a custom type, backfill existing pages, prove the wiring via `gbrain whoknows`
 - [`docs/architecture/`](docs/architecture/) — system design, topologies, retrieval theory
@@ -5231,7 +5232,7 @@ Community PR contributors are credited in `CHANGELOG.md` per release. Attributio
 
 ## docs/ENGINES.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/ENGINES.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/ENGINES.md
 
 # Pluggable Engine Architecture
 
@@ -6315,7 +6316,7 @@ Note: there is no SQLite engine. PGLite uses the same SQL as Postgres, so no sep
 
 ## docs/schema-author-tutorial.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/schema-author-tutorial.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/schema-author-tutorial.md
 
 # Tutorial: Build your first schema pack
 
@@ -6552,7 +6553,7 @@ gbrain schema lint --with-db
 
 ## docs/guides/live-sync.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/live-sync.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/live-sync.md
 
 # Live Sync: Keep the Index Current
 
@@ -7164,7 +7165,7 @@ and `--uninstall` act only on that brain's job.
 
 ## docs/guides/sync-unblock-runbook.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/sync-unblock-runbook.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/sync-unblock-runbook.md
 
 # Sync unblock runbook (for an operator agent)
 
@@ -7415,7 +7416,7 @@ with a live pending request is kept; the loop above owns it
 
 ## docs/guides/cron-schedule.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/cron-schedule.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/cron-schedule.md
 
 # Reference Cron Schedule
 
@@ -7835,7 +7836,7 @@ echo "Dream cycle complete at $(date)"
 
 ## docs/guides/quiet-hours.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/quiet-hours.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/quiet-hours.md
 
 # Quiet Hours and Timezone-Aware Delivery
 
@@ -8038,7 +8039,7 @@ Set `enabled: false` to disable quiet hours entirely (e.g., for 24/7 monitoring)
 
 ## docs/guides/scaling-skills.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/scaling-skills.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/scaling-skills.md
 
 # Scaling skills past 300 without drowning the context window
 
@@ -8391,7 +8392,7 @@ the bundled resolver lives at [`skills/RESOLVER.md`](../../skills/RESOLVER.md).
 
 ## docs/guides/push-context.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/push-context.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/push-context.md
 
 # Push-based context
 
@@ -8548,7 +8549,7 @@ never reach a prompt regardless of caller trust.
 
 ## docs/guides/github-source.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/github-source.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/github-source.md
 
 # GitHub source kind: issues and PRs live in the brain
 
@@ -8766,7 +8767,7 @@ gbrain sources remove gh --confirm-destructive
 
 ## docs/protocol/MEMORY_VERBS_v1.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/protocol/MEMORY_VERBS_v1.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/protocol/MEMORY_VERBS_v1.md
 
 # MEMORY_VERBS v1 — the memory wire protocol
 
@@ -9774,7 +9775,7 @@ dominates (~minutes); the measured calls report p50/p99 + the ratio guard.
 
 ## docs/GBRAIN_VERIFY.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/GBRAIN_VERIFY.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/GBRAIN_VERIFY.md
 
 # GBrain Installation Verification Runbook
 
@@ -10183,7 +10184,7 @@ end-to-end sync test (4c), push a real change and verify it appears in search.
 
 ## docs/guides/troubleshooting.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/troubleshooting.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/troubleshooting.md
 
 # Troubleshooting
 
@@ -10730,7 +10731,7 @@ three-step check, and the skip codes. `gbrain doctor` reports it as the
 
 ## docs/guides/exit-codes.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/exit-codes.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/exit-codes.md
 
 # Exit codes
 
@@ -10768,7 +10769,7 @@ the [CHANGELOG](../../CHANGELOG.md#exit-code-changes-by-command).
 
 ## docs/guides/minions-fix.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/guides/minions-fix.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/guides/minions-fix.md
 
 # Minions fix: repairing a blocked worker or half-migrated install
 
@@ -11331,7 +11332,7 @@ Each phase is idempotent. Re-running is safe. Common failure modes:
 
 ## docs/integrations/reliability-repair.md
 
-Source: https://raw.githubusercontent.com/perennia-regen/gbrain/master/docs/integrations/reliability-repair.md
+Source: https://raw.githubusercontent.com/pablofavre12/gbrain/master/docs/integrations/reliability-repair.md
 
 # Reliability repair
 

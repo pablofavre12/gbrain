@@ -1,4 +1,5 @@
 import { expect } from 'bun:test';
+import { operationsByName } from '../../src/core/operations.ts';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,7 +21,7 @@ import { withEnv } from './with-env.ts';
  * test and the PostgreSQL E2E wrapper. Each scenario owns its own source and
  * OAuth client, so scenarios can share one database.
  */
-export const remoteLinksCases = ['links', 'other_producers', 'confined', 'config_off', 'superseded', 'restart', 'revoked', 'trusted_local', 'reconcile', 'wanted'] as const;
+export const remoteLinksCases = ['links', 'other_producers', 'confined', 'config_off', 'superseded', 'restart', 'revoked', 'trusted_local', 'reconcile', 'wanted', 'acl', 'acl_names'] as const;
 export type RemoteLinksCase = typeof remoteLinksCases[number];
 
 const config = { engine: 'pglite' as const, embedding_disabled: true };
@@ -83,6 +84,71 @@ export async function exerciseRemoteLinks(engine: BrainEngine, scenario: RemoteL
       const effect = async (row: WriteRequest) => (await engine.executeRaw<{ state: string; outcome: Record<string, unknown> | null }>(
         "SELECT state,outcome FROM persistence_effects WHERE request_id=$1::uuid AND kind='links'", [row.id]))[0];
       const mention = (to_slug: string) => ({ to_slug, link_type: 'mentions', link_source: 'mcp-remote-mention' });
+
+      if (scenario === 'acl' || scenario === 'acl_names') {
+        const receipt = async (row: WriteRequest) => {
+          const ctx = { engine, config, dryRun: false, sourceId, logger: { info() {}, warn() {}, error() {} }, ...remote } as OperationContext;
+          const result = await operationsByName.get_write_request!.handler(ctx, { request_id: row.request_id }) as { effects: Array<{ kind: string; added?: number; removed?: number }> };
+          return result.effects.find(e => e.kind === 'links');
+        };
+        const fixturePage = (slug: string, frontmatter = '') => write(`---\ntype: ${slug.startsWith('people/') ? 'person' : 'note'}\ntitle: ${slug}\n${frontmatter}---\n\nSynthetic target.\n`, slug, { remote: false });
+        const restrict = (slug: string, subjects: string[]) => engine.executeRaw(
+          'UPDATE pages SET acl_subject_ids=$1::text[] WHERE source_id=$2 AND slug=$3', [subjects, sourceId, slug]);
+        if (scenario === 'acl') {
+          const content = '---\ntype: note\ntitle: ACL example\n---\n\nSee [[companies/acme-example]] and [[people/acl-hidden]].\n';
+          const absent = await write(content, 'notes/acl-absent');
+          await runLinks();
+          const absentReceipt = await receipt(absent);
+          expect(absentReceipt).toMatchObject({ added: 1, removed: 0 });
+          await fixturePage('people/acl-hidden');
+          await restrict('people/acl-hidden', ['user:director']);
+          expect(await engine.getPage('people/acl-hidden', { sourceId, aclSubjectIds: [`client:${clientId}`] })).toBeNull();
+          const denied = await write(content, 'notes/acl-denied');
+          await runLinks();
+          expect(await links('notes/acl-denied')).toEqual(await links('notes/acl-absent'));
+          expect(await receipt(denied)).toEqual(absentReceipt);
+          expect((await effect(denied)).outcome!.skipped_targets).toEqual((await effect(absent)).outcome!.skipped_targets);
+          // An edge left by another writer is cleaned up without disclosing its denied target in removed counts.
+          await engine.addLinksBatch([{ from_slug: 'notes/acl-denied', to_slug: 'people/acl-hidden', // gbrain-allow-direct-insert: fixture edge left by an earlier authorized writer
+            from_source_id: sourceId, to_source_id: sourceId, origin_slug: 'notes/acl-denied', origin_source_id: sourceId,
+            link_source: 'mcp-remote-mention', link_type: 'mentions', context: 'earlier authorized evidence' }]);
+          const cleanup = await write(content + '\nReconcile the origin.\n', 'notes/acl-denied');
+          await runLinks();
+          expect(await links('notes/acl-denied')).toEqual(await links('notes/acl-absent'));
+          expect(await receipt(cleanup)).toMatchObject({ added: 0, removed: 0 });
+          // Admission before a target ACL revocation must not authorize the later effect.
+          await restrict('people/acl-hidden', [`client:${clientId}`]);
+          const revoked = await write(content, 'notes/acl-revoked');
+          await restrict('people/acl-hidden', ['user:director']);
+          await runLinks();
+          expect(await links('notes/acl-revoked')).toEqual(await links('notes/acl-absent'));
+          expect(await receipt(revoked)).toEqual(absentReceipt);
+          await restrict('people/acl-hidden', [`client:${clientId}`]);
+          const granted = await write(content, 'notes/acl-granted');
+          await runLinks();
+          expect(await links('notes/acl-granted')).toEqual([mention('companies/acme-example'), mention('people/acl-hidden')]);
+          expect(await receipt(granted)).toMatchObject({ added: 2, removed: 0 });
+        } else {
+          await engine.setConfig('link_resolution.global_basename', 'true');
+          try {
+            await fixturePage('people/reader-name');
+            const content = '---\ntype: note\ntitle: Names example\nrelated: Hidden Alias\n---\n\nSee [[Reader Name]] and [[Hidden Alias]].\n';
+            const before = await write(content, 'notes/names-before');
+            await runLinks();
+            expect(await links('notes/names-before')).toEqual([mention('people/reader-name')]);
+            await fixturePage('archive/reader-name');
+            await restrict('archive/reader-name', ['user:director']);
+            await fixturePage('people/hidden-alias', 'aliases: [Hidden Alias]\n');
+            await restrict('people/hidden-alias', ['user:director']);
+            const after = await write(content, 'notes/names-after');
+            await runLinks();
+            expect(await links('notes/names-after')).toEqual(await links('notes/names-before'));
+            expect(await receipt(after)).toEqual(await receipt(before));
+            expect((await effect(after)).outcome!.skipped_targets).toEqual((await effect(before)).outcome!.skipped_targets);
+          } finally { await engine.unsetConfig('link_resolution.global_basename'); }
+        }
+        return;
+      }
 
       if (scenario === 'links') {
         const row = await write(MENTIONS(sourceId));

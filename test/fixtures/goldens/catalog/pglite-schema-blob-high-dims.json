@@ -3,6 +3,10 @@
     "constraints": {
       "access_tokens.access_tokens_pkey": "p PRIMARY KEY (id)",
       "access_tokens.access_tokens_token_hash_key": "u UNIQUE (token_hash)",
+      "authored_link_inventories.authored_link_inventories_origin_page_id_fkey": "f FOREIGN KEY (origin_page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "authored_link_inventories.authored_link_inventories_pkey": "p PRIMARY KEY (origin_page_id)",
+      "authored_link_inventories.authored_link_inventories_refs_check": "c CHECK ((jsonb_typeof(refs) = 'array'::text))",
+      "authored_link_inventories.authored_link_inventories_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "calibration_profiles.calibration_profiles_pkey": "p PRIMARY KEY (id)",
       "calibration_profiles.calibration_profiles_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "chat_usage_log.chat_usage_log_pkey": "p PRIMARY KEY (id)",
@@ -339,6 +343,9 @@
       "access_tokens": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "authored_link_inventories": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "calibration_profiles": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -658,6 +665,8 @@
     "indexes": {
       "access_tokens_pkey": "CREATE UNIQUE INDEX access_tokens_pkey ON public.access_tokens USING btree (id)",
       "access_tokens_token_hash_key": "CREATE UNIQUE INDEX access_tokens_token_hash_key ON public.access_tokens USING btree (token_hash)",
+      "authored_link_inventories_pkey": "CREATE UNIQUE INDEX authored_link_inventories_pkey ON public.authored_link_inventories USING btree (origin_page_id)",
+      "authored_link_inventories_source_idx": "CREATE INDEX authored_link_inventories_source_idx ON public.authored_link_inventories USING btree (source_id)",
       "calibration_profiles_bias_tags_gin": "CREATE INDEX calibration_profiles_bias_tags_gin ON public.calibration_profiles USING gin (active_bias_tags)",
       "calibration_profiles_holder_recent_idx": "CREATE INDEX calibration_profiles_holder_recent_idx ON public.calibration_profiles USING btree (source_id, holder, generated_at DESC)",
       "calibration_profiles_pkey": "CREATE UNIQUE INDEX calibration_profiles_pkey ON public.calibration_profiles USING btree (id)",
@@ -1006,6 +1015,16 @@
           "5 created_at timestamp with time zone/timestamptz NULL DEFAULT now()",
           "6 last_used_at timestamp with time zone/timestamptz NULL",
           "7 revoked_at timestamp with time zone/timestamptz NULL"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "authored_link_inventories": {
+        "columns": [
+          "1 origin_page_id integer/int4 NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 origin_revision uuid/uuid NOT NULL",
+          "4 refs jsonb/jsonb NOT NULL",
+          "5 checked_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },

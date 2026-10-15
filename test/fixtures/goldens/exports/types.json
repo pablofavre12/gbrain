@@ -87,7 +87,7 @@
           "executeRawDirect: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; }) => Promise<T[]>",
           "expireFact: (id: number, opts?: { supersededBy?: number; at?: Date; }) => Promise<boolean>",
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
-          "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) => Promise<{ slug: string; similarity: number; } | null>",
+          "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string, readScope?: PageReadScope) => Promise<{ slug: string; similarity: number; } | null>",
           "findCandidateDuplicates: (source_id: string, entitySlug: string, factText: string, opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: \"keyword\"; attributedTo?: FactAttribution | null; }) => Promise<FactRow[]>",
           "findDuplicatePage?: ((sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; }) => Promise<{ slug: string; id: number; } | null>) | undefined",
           "findDuplicatePages?: ((sourceId: string, inputs: ReadonlyArray<{ hash: string; frontmatterId?: string | null; excludeSlug?: string; }>) => Promise<Array<{ slug: string; id: number; } | null>>) | undefined",
@@ -157,7 +157,7 @@
           "listFactsKeyset: (source_id: string, after: { createdAt: string; id: number | null; } | null, opts?: FactListOpts) => Promise<FactRow[]>",
           "listFactsSince: (source_id: string, since: Date, opts?: FactListOpts & { entitySlug?: string; sessionId?: string; }) => Promise<FactRow[]>",
           "listFilesForPage: (pageId: number) => Promise<FileRow[]>",
-          "listLinkSources: (opts?: PageReferenceOpts) => Promise<{ link_source: string | null; count: number; }[]>",
+          "listLinkSources: (opts?: PageReadScope) => Promise<{ link_source: string | null; count: number; }[]>",
           "listPages: (filters?: PageFilters) => Promise<Page[]>",
           "listPrefixSampledPages: (opts: DomainBankSampleOpts) => Promise<DomainBankRow[]>",
           "listStaleChunks: (opts?: { batchSize?: number; afterPageId?: number; afterChunkIndex?: number; sourceId?: string; orderBy?: \"page_id\" | \"updated_desc\"; afterUpdatedAt?: string | null; }) => Promise<StaleChunkRow[]>",
@@ -1110,12 +1110,12 @@
           "expireFact: (id: number, opts?: { supersededBy?: number; at?: Date; }) => Promise<boolean>",
           "explainVectorSearch: (embedding: Float32Array, opts?: SearchOpts) => Promise<Record<string, unknown>>",
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
-          "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) => Promise<{ slug: string; similarity: number; } | null>",
+          "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string, readScope?: PageReadScope) => Promise<{ slug: string; similarity: number; } | null>",
           "findCandidateDuplicates: (source_id: string, entitySlug: string, factText: string, opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: \"keyword\"; attributedTo?: FactAttribution | null; }) => Promise<FactRow[]>",
           "findDuplicatePage: (sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; }) => Promise<{ slug: string; id: number; } | null>",
           "findDuplicatePages: (sourceId: string, inputs: Parameters<typeof findDuplicatePages>[2]) => Promise<({ slug: string; id: number; } | null)[]>",
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
-          "findOrphanPages: (opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
+          "findOrphanPages: (opts?: PageReadScope & { mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
           "getAllConfig: () => Promise<Record<string, string>>",
@@ -1181,7 +1181,7 @@
           "listFactsKeyset: (source_id: string, after: { createdAt: string; id: number | null; } | null, opts?: FactListOpts) => Promise<FactRow[]>",
           "listFactsSince: (source_id: string, since: Date, opts?: FactListOpts & { entitySlug?: string; sessionId?: string; }) => Promise<FactRow[]>",
           "listFilesForPage: (pageId: number) => Promise<FileRow[]>",
-          "listLinkSources: (opts?: PageReferenceOpts) => Promise<{ link_source: string | null; count: number; }[]>",
+          "listLinkSources: (opts?: PageReadScope) => Promise<{ link_source: string | null; count: number; }[]>",
           "listPages: (filters?: PageFilters) => Promise<Page[]>",
           "listPrefixSampledPages: (opts: DomainBankSampleOpts) => Promise<DomainBankRow[]>",
           "listStaleChunks: (opts?: { batchSize?: number; afterPageId?: number; afterChunkIndex?: number; sourceId?: string; orderBy?: \"page_id\" | \"updated_desc\"; afterUpdatedAt?: string | null; }) => Promise<StaleChunkRow[]>",
@@ -3391,7 +3391,7 @@
           "executeRawDirect: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; }) => Promise<T[]>",
           "expireFact: (id: number, opts?: { supersededBy?: number; at?: Date; }) => Promise<boolean>",
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
-          "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) => Promise<{ slug: string; similarity: number; } | null>",
+          "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string, readScope?: PageReadScope) => Promise<{ slug: string; similarity: number; } | null>",
           "findCandidateDuplicates: (source_id: string, entitySlug: string, factText: string, opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: \"keyword\"; attributedTo?: FactAttribution | null; }) => Promise<FactRow[]>",
           "findDuplicatePage?: ((sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; }) => Promise<{ slug: string; id: number; } | null>) | undefined",
           "findDuplicatePages?: ((sourceId: string, inputs: ReadonlyArray<{ hash: string; frontmatterId?: string | null; excludeSlug?: string; }>) => Promise<Array<{ slug: string; id: number; } | null>>) | undefined",
@@ -3461,7 +3461,7 @@
           "listFactsKeyset: (source_id: string, after: { createdAt: string; id: number | null; } | null, opts?: FactListOpts) => Promise<FactRow[]>",
           "listFactsSince: (source_id: string, since: Date, opts?: FactListOpts & { entitySlug?: string; sessionId?: string; }) => Promise<FactRow[]>",
           "listFilesForPage: (pageId: number) => Promise<FileRow[]>",
-          "listLinkSources: (opts?: PageReferenceOpts) => Promise<{ link_source: string | null; count: number; }[]>",
+          "listLinkSources: (opts?: PageReadScope) => Promise<{ link_source: string | null; count: number; }[]>",
           "listPages: (filters?: PageFilters) => Promise<Page[]>",
           "listPrefixSampledPages: (opts: DomainBankSampleOpts) => Promise<DomainBankRow[]>",
           "listStaleChunks: (opts?: { batchSize?: number; afterPageId?: number; afterChunkIndex?: number; sourceId?: string; orderBy?: \"page_id\" | \"updated_desc\"; afterUpdatedAt?: string | null; }) => Promise<StaleChunkRow[]>",
@@ -4962,8 +4962,23 @@
       {
         "kind": "interface",
         "members": [
+          "canonicalAttendance: boolean",
+          "dirHint: string | string[]",
+          "field: string",
+          "globalBasename: boolean",
+          "linkType: string",
+          "name: string",
+          "reason?: \"target_type_mismatch\" | undefined",
+          "resolvedSlug?: string | undefined"
+        ],
+        "name": "AuthoredFrontmatterRef"
+      },
+      {
+        "kind": "interface",
+        "members": [
           "key: string",
           "kind: \"slug\" | \"name\"",
+          "resolution?: { name: string; body: true; globalBasename?: boolean; } | undefined",
           "target: string",
           "targetSourceId?: string | undefined"
         ],
@@ -4995,6 +5010,7 @@
       {
         "kind": "interface",
         "members": [
+          "collectAuthoredReferences?: boolean | undefined",
           "explain?: ((e: LinkTypeExplanation) => void) | undefined",
           "globalBasename?: boolean | undefined",
           "lineGrammar?: { enabled?: boolean; allowUndeclaredTypes?: boolean; } | undefined",
@@ -5016,6 +5032,7 @@
         "kind": "interface",
         "members": [
           "attendanceComplete: boolean",
+          "authoredReferences: AuthoredFrontmatterRef[]",
           "candidates: LinkCandidate[]",
           "unresolved: UnresolvedFrontmatterRef[]"
         ],
@@ -5045,7 +5062,7 @@
         "kind": "variable",
         "name": "LINK_EXTRACTOR_VERSION_TS",
         "signature": [
-          "\"2026-10-08T00:00:00Z\""
+          "\"2026-10-15T00:00:00Z\""
         ]
       },
       {
@@ -5123,7 +5140,9 @@
         "kind": "interface",
         "members": [
           "attendanceComplete: boolean",
+          "authoredCandidates?: LinkCandidate[] | undefined",
           "candidates: LinkCandidate[]",
+          "frontmatterReferences?: AuthoredFrontmatterRef[] | undefined",
           "unresolved: UnresolvedFrontmatterRef[]"
         ],
         "name": "PageLinksResult"
@@ -5304,7 +5323,7 @@
         "kind": "function",
         "name": "makeResolver",
         "signature": [
-          "(engine: BrainEngine, opts?: { mode: \"batch\" | \"live\"; sourceId?: string; basenameIndex?: () => Promise<Map<string, string[]>>; }) => SlugResolver"
+          "(engine: Pick<BrainEngine, \"executeRaw\" | \"getAllSlugs\" | \"getPage\" | \"resolveSlugWithAlias\" | \"findByTitleFuzzy\" | \"searchKeyword\">, opts?: { mode: \"batch\" | \"live\"; sourceId?: string; readScope?: PageReadScope; basenameIndex?: () => Promise<Map<string, string[]>>; }) => SlugResolver"
         ]
       },
       {
@@ -6511,12 +6530,12 @@
           "executeRawDirect: <T = Record<string, unknown>>(sql: string, params?: unknown[], opts?: { signal?: AbortSignal; }) => Promise<T[]>",
           "expireFact: (id: number, opts?: { supersededBy?: number; at?: Date; }) => Promise<boolean>",
           "findAnomalies: (opts: AnomaliesOpts) => Promise<AnomalyResult[]>",
-          "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string) => Promise<{ slug: string; similarity: number; } | null>",
+          "findByTitleFuzzy: (name: string, dirPrefix?: string, minSimilarity?: number, sourceId?: string, readScope?: PageReadScope) => Promise<{ slug: string; similarity: number; } | null>",
           "findCandidateDuplicates: (source_id: string, entitySlug: string, factText: string, opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: \"keyword\"; attributedTo?: FactAttribution | null; }) => Promise<FactRow[]>",
           "findDuplicatePage: (sourceId: string, opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string; }) => Promise<{ slug: string; id: number; } | null>",
           "findDuplicatePages: (sourceId: string, inputs: Parameters<typeof pagesImpl.findDuplicatePages>[2]) => Promise<({ slug: string; id: number; } | null)[]>",
           "findOntologyConflicts: (opts?: PageReadScope & { minConfidence?: number; visibility?: OntologyReadOpts[\"visibility\"]; }) => Promise<OntologyConflict[]>",
-          "findOrphanPages: (opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
+          "findOrphanPages: (opts?: PageReadScope & { mode?: \"inbound\" | \"islanded\"; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
           "getAllConfig: () => Promise<Record<string, string>>",
@@ -6581,7 +6600,7 @@
           "listFactsKeyset: (source_id: string, after: { createdAt: string; id: number | null; } | null, opts?: FactListOpts) => Promise<FactRow[]>",
           "listFactsSince: (source_id: string, since: Date, opts?: FactListOpts & { entitySlug?: string; sessionId?: string; }) => Promise<FactRow[]>",
           "listFilesForPage: (pageId: number) => Promise<FileRow[]>",
-          "listLinkSources: (opts?: PageReferenceOpts) => Promise<{ link_source: string | null; count: number; }[]>",
+          "listLinkSources: (opts?: PageReadScope) => Promise<{ link_source: string | null; count: number; }[]>",
           "listPages: (filters?: PageFilters) => Promise<Page[]>",
           "listPrefixSampledPages: (opts: DomainBankSampleOpts) => Promise<DomainBankRow[]>",
           "listStaleChunks: (opts?: { batchSize?: number; afterPageId?: number; afterChunkIndex?: number; sourceId?: string; orderBy?: \"page_id\" | \"updated_desc\"; afterUpdatedAt?: string | null; }) => Promise<StaleChunkRow[]>",

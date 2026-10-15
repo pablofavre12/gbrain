@@ -600,6 +600,16 @@ CREATE TABLE IF NOT EXISTS wanted_links (
 CREATE INDEX IF NOT EXISTS wanted_links_target_idx ON wanted_links (target_source_id, target_ref);
 CREATE INDEX IF NOT EXISTS wanted_links_source_idx ON wanted_links (source_id);
 
+-- Authored references survive successful resolution; reader policy determines wanted targets.
+CREATE TABLE IF NOT EXISTS authored_link_inventories (
+  origin_page_id INTEGER PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  origin_revision UUID NOT NULL,
+  refs JSONB NOT NULL CHECK (jsonb_typeof(refs) = 'array'),
+  checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS authored_link_inventories_source_idx ON authored_link_inventories(source_id);
+
 -- ============================================================
 -- tags
 -- ============================================================
@@ -1850,7 +1860,7 @@ BEGIN
     -- ACCESS EXCLUSIVE lock even when RLS is already on, so re-running this block on a live brain
     -- queued behind every open transaction; a table whose relrowsecurity is already set is skipped.
     FOREACH target IN ARRAY ARRAY[
-      'pages','content_chunks','links','wanted_links','tags','raw_data','timeline_entries',
+      'pages','content_chunks','links','wanted_links','authored_link_inventories','tags','raw_data','timeline_entries',
       'page_versions','ingest_log','config','files','minion_jobs','sources','file_migration_ledger',
       'access_tokens','mcp_request_log','minion_inbox','minion_attachments','subagent_messages',
       'subagent_tool_executions','subagent_rate_leases','gbrain_cycle_locks','dream_verdicts',

@@ -9,7 +9,7 @@
  */
 
 import type { Operation } from './contract.ts';
-import { sourceScopeOpts } from './context.ts';
+import { sourceScopeOpts, readPolicyOpts } from './context.ts';
 
 // ──────────────────────────────────────────────────────────────────────
 // v0.40.6.0 Schema Cathedral v3 — 9 new MCP ops for the agent on-ramp.
@@ -240,7 +240,7 @@ const schema_review_orphans: Operation = {
     const { isUndefinedTableError } = await import('../utils.ts');
     const pack = await loadActivePackBestEffort(ctx);
     try {
-      return { schema_version: 1, ...await findTypeOrphans(ctx.engine, pack?.manifest ?? null, sourceScopeOpts(ctx), limit) };
+      return { schema_version: 1, ...await findTypeOrphans(ctx.engine, pack?.manifest ?? null, await readPolicyOpts(ctx), limit) };
     } catch (err) {
       if (isUndefinedTableError(err)) return { schema_version: 1, orphan_count: 0, orphans: [], undeclared_types: [], pack: pack?.manifest.name ?? null, truncated: false };
       throw err;

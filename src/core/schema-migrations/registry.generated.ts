@@ -256,6 +256,7 @@ import { v9006 } from './v9006-governed-native-page-write-proposals.ts';
 import { v9007 } from './v9007-reconcile-upstream-123-124-125-126.ts';
 import { v9008 } from './v9008-independent-upstream-schema-cursor.ts';
 import { v9009 } from './v9009-governed-write-base-revision.ts';
+import { v9010 } from './v9010-authored-link-inventories.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -510,4 +511,5 @@ export const MIGRATIONS: Migration[] = [
   v9007,
   v9008,
   v9009,
+  v9010,
 ];

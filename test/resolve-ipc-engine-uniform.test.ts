@@ -33,7 +33,10 @@ const URL_B = 'postgresql://user:hunter2@db.example.com:5432/brain_b';
 let tmp: string;
 
 beforeEach(() => {
-  tmp = mkdtempSync(join(tmpdir(), 'gbrain-ipc-uniform-'));
+  // These assertions pin the ordinary run-dir address. Long Unix addresses
+  // intentionally use the private fallback covered by local-ipc-path.test.ts.
+  const root = process.platform === 'win32' ? tmpdir() : process.platform === 'darwin' ? '/private/tmp' : '/tmp';
+  tmp = mkdtempSync(join(root, 'gbrain-ipc-uniform-'));
 });
 
 afterEach(() => {

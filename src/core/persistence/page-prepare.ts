@@ -1,3 +1,4 @@
+import { validateTimelinePublicationGuard } from './timeline-publication-guard.ts';
 import { forkMetadataChanges, hasDocumentVersionFence, type ForkPageMetadata } from '../page-state/fork-metadata.ts';
 import { assertPageContent } from '../page-state/content-precondition.ts';
 import { isEmbedSkipped } from '../embed-skip.ts';
@@ -616,7 +617,7 @@ export async function preparePageMutation(unbounded: BrainEngine, row: WriteRequ
   const pinMode = sourcePath && mintMode && scannerSourcePath(file!.root, file!.root) && !await readSlugRootMode(engine, row.source_id) ? mintMode : undefined;
   const publication: PreparedMutation = { observedRevision, noop, additionalPageKeys:links?.pageKeys, file, ...databaseOnly,
     ...(core ? { exclusiveSources: core.exclusiveSources } : {}), ...(trust ? { trust } : {}),
-    validate: async tx => { await ready.validate(tx); await core?.validate(tx); }, apply: async (tx, preimage) => {
+    validate: publicationValidators(ready.validate, core?.validate, tx => validateTimelinePublicationGuard(tx, p.timeline_publication_guard, { sourceId: row.source_id, pageId: row.page_id })), apply: async (tx, preimage) => {
     let autoLinks: Awaited<ReturnType<NonNullable<typeof links>['apply']>> | undefined;
     let removedTimeline: TimelineRowsRemoved | null = null;
     let lowered: { proposal_ref: string } | null = null;
@@ -693,4 +694,9 @@ function editLockedPage(row: WriteRequest, snapshot: PageSnapshot | null) {
     `Page ${row.slug} does not exist in source ${row.source_id} or is deleted, so the edit changed nothing. If it is soft-deleted, restore it with restore_page; otherwise write it whole with put_page.`,
     pageFix(row.source_id, row.slug));
   return applyPageEdits(snapshot.page, snapshot.tags, row.authority.remote, parsePageEdits(row.intent?.edits));
+}
+
+/** Compose independent checks in publication order, before any canonical write. */
+function publicationValidators(...checks: Array<PreparedMutation['validate']>): NonNullable<PreparedMutation['validate']> {
+  return async tx => { for (const check of checks) await check?.(tx); };
 }

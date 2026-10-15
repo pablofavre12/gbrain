@@ -123,11 +123,13 @@ const entity_identity_list: Operation = {
   scope: 'read',
   cliHints: { name: 'entity-identity-list' },
   handler: async (ctx, p) => {
+    const policy = await readPolicyOpts(ctx);
     const members = await listEntityIdentities(ctx.engine, {
       entityId: p.entity_id as string | undefined,
       slug: p.slug as string | undefined,
       allowedSources: identityReadScope(ctx),
-      excludePrivate: (await readPolicyOpts(ctx)).excludePrivate,
+      excludePrivate: policy.excludePrivate,
+      aclSubjectIds: policy.aclSubjectIds,
     });
     // Group for readability: one object per entity_id.
     const groups = new Map<string, typeof members>();

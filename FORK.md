@@ -1,7 +1,7 @@
 # Perennia gbrain fork
 
 The fork tracks [garrytan/gbrain](https://github.com/garrytan/gbrain). Fork PRs target
-`master` in `perennia-regen/gbrain`. The production wrapper pins an immutable fork
+`master` in `pablofavre12/gbrain` (the former repository URL redirects there). The production wrapper pins an immutable fork
 commit; merging this repository does not deploy the server.
 
 ## Upgrade baseline
@@ -26,6 +26,14 @@ or later. Validate the wrapper against the exact candidate before changing its p
 | Configured extraction models and Cohere | Model resolver, `ai/recipes/cohere.ts`, guarded Cohere endpoint overrides |
 | Domain entities and atom provenance | Mention policy includes Spanish domain types; extraction writes source-qualified `has_atom` edges |
 | Timeline maintenance and optional contradiction probe | Canonical timeline operations; default-disabled autopilot probe |
+| Reader-specific temporal graph | Authorized assertions and transitions are filtered before deriving state, dates, counts and relationship notes |
+| Durable authored references | Revision- and source-incarnation-bound inventories preserve references independently of target visibility and resolution |
+
+Legacy bearer grants use live source membership on both HTTP transports. An archived
+federated source is excluded; an archived or missing primary source suspends the
+bound grant without rewriting its stored permissions. Unarchiving restores access
+under the original grant. Historical unbound tokens retain their active-source
+federation floor. Canonical publication rechecks source membership for queued writes.
 
 Paths in the table are relative to `src/core/` unless stated otherwise. Upstream
 refactor wave 1 split the old `operations.ts`, engines, migration registry and
@@ -54,6 +62,20 @@ Definite refusals finish as failed; uncertain outcomes retain the canonical requ
 identity for safe replay. Existing pending
 proposals lack a base revision and must not overwrite an existing page without a
 fresh preview.
+
+Migration 9010 adds `authored_link_inventories`. After migration, run
+`gbrain extract --stale --include-frontmatter` on the brain host with the intended source scope to
+rebuild authored-reference inventories, including frontmatter references.
+Scoped readers return `projection_pending` while a required inventory is missing
+or stale; a migration alone does not establish extraction readiness.
+
+Reader-specific temporal state is derived from evidence the reader can access;
+hidden origins cannot change its dates, statuses, notes or counters. Archiving
+either endpoint or an independent origin removes it from scoped graph reads.
+Publishing inferred timeline entries separately requires current public evidence,
+canonical dates and provenance, checked again under publication locks. An entry
+already accepted into a public timeline is not automatically retracted when its
+original evidence is later restricted.
 
 Upstream 142 and its 144 skew guard would clear existing take vectors while
 resizing their dimension. The fork adds a guard before that destructive path:

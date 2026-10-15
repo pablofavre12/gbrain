@@ -30,6 +30,7 @@ import type { AuthInfo, OperationContext } from '../src/core/ops/contract.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { startHttpTransport } from '../src/mcp/http-transport.ts';
 import { RateLimiter } from '../src/mcp/rate-limit.ts';
+import { startServeHttp, startLegacyHttp, callTool, envelopeOf } from './helpers/live-mcp-servers.ts';
 import { authorizeStoredRequest, submissionAuthority } from '../src/core/persistence/authority.ts';
 import { admitWrite } from '../src/core/persistence/journal.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -286,4 +287,65 @@ describe('10. --migrate-legacy', () => {
     const shape = (await doctor()).legacy_token_grant_shape.details as { legacy_shape_count: number; malformed: unknown[] };
     expect(shape.legacy_shape_count).toBe(shape.malformed.length);
   });
+});
+
+
+describe('live source membership of legacy grants', () => {
+  test('both HTTP carriers deny archived primary and federated rooms without changing stored grants', async () => {
+    await engine.executeRaw(`INSERT INTO sources(id,name,config) VALUES
+      ('archive-primary','Archive primary','{"federated":true}'),('archive-federated','Archive federated','{"federated":true}')`);
+    const primary = await engine.putPage('notes/archive-primary', {type:'note',title:'Primary',compiled_truth:'primary live marker'}, {sourceId:'archive-primary'});
+    const federated = await engine.putPage('notes/archive-federated', {type:'note',title:'Federated',compiled_truth:'federated live marker'}, {sourceId:'archive-federated'});
+    const token = await mintLegacyToken(engine, {name:'archive-unified',takesHolders:['world'],scopes:['read','write'],sourceGrant:['archive-primary','archive-federated']});
+    const old = await legacyToken({source_id:['archive-primary','archive-federated'],takes_holders:['world']});
+    const unbound = await legacyToken({}, null);
+    const original = grantFields(await rowOf(token.id));
+    const auth = await provider().verifyAccessToken(token.token) as unknown as AuthInfo;
+    const [source] = await engine.executeRaw<{incarnation:string}>("SELECT incarnation FROM sources WHERE id='archive-primary'");
+    const ctx = {engine,config:{engine:'pglite'},sourceId:'archive-primary',auth,remote:true,dryRun:false,logger:{info(){},warn(){},error(){}}} as unknown as OperationContext;
+    const authority = await submissionAuthority(ctx,'put_page','archive-primary',source.incarnation,primary.slug);
+    const pending = await admitWrite(engine,{principal:authority.principal,authority,operation:'put_page',sourceId:'archive-primary',sourceIncarnation:source.incarnation,slug:primary.slug,requestId:randomUUID(),callerIntent:{},intent:{}});
+    const http = await startServeHttp(engine,{surface:'full'});
+    const legacy = await startLegacyHttp(engine);
+    const deny = (result:Awaited<ReturnType<typeof callTool>>) => {
+      expect(result.isError).toBe(true);
+      expect(['permission_denied','page_not_found','unknown_source','unknown_tool','insufficient_scope']).toContain(envelopeOf(result).code);
+      expect(JSON.stringify(result)).not.toContain('live marker');
+    };
+    try {
+      for (const server of [http,legacy]) {
+        for (const bearer of [token.token,old.token]) {
+          expect((await callTool(server.base,bearer,'get_page',{page_id:primary.id})).isError).not.toBe(true);
+          expect((await callTool(server.base,bearer,'get_page',{slug:federated.slug})).isError).not.toBe(true);
+        }
+        // The old global/default floor still sees active federated sources.
+        expect((await callTool(server.base,unbound.token,'get_page',{slug:federated.slug})).isError).not.toBe(true);
+      }
+      await engine.executeRaw("UPDATE sources SET archived=true WHERE id='archive-federated'");
+      for (const server of [http,legacy]) {
+        for (const bearer of [token.token,old.token,unbound.token]) {
+          for (const args of [{page_id:federated.id},{slug:federated.slug},{slug:federated.slug,source_id:'archive-federated'}]) deny(await callTool(server.base,bearer,'get_page',args));
+          expect((await callTool(server.base,bearer,'get_page',{page_id:primary.id})).isError).not.toBe(true);
+        }
+      }
+      await engine.executeRaw("UPDATE sources SET archived=false WHERE id='archive-federated'");
+      await engine.executeRaw("UPDATE sources SET archived=true WHERE id='archive-primary'");
+      await expect(authorizeStoredRequest(engine,pending)).rejects.toMatchObject({code:'source_changed'});
+      for (const server of [http,legacy]) {
+        for (const bearer of [token.token,old.token]) {
+          for (const args of [{page_id:primary.id},{slug:primary.slug},{page_id:federated.id}]) deny(await callTool(server.base,bearer,'get_page',args));
+        }
+        deny(await callTool(server.base,unbound.token,'get_page',{page_id:primary.id}));
+        expect((await callTool(server.base,unbound.token,'get_page',{page_id:federated.id})).isError).not.toBe(true);
+      }
+    } finally {
+      await engine.executeRaw("UPDATE sources SET archived=false WHERE id IN ('archive-primary','archive-federated')");
+      await http.close(); legacy.close();
+    }
+    expect(grantFields(await rowOf(token.id))).toEqual(original);
+    expect((await provider().verifyAccessToken(token.token) as unknown as AuthInfo).allowedSources).toEqual(['archive-primary','archive-federated']);
+    expect(await provider().verifyAccessToken(unbound.token)).toMatchObject({sourceId:'default',hasSourceGrant:false,scopes:['read','write','admin']});
+    const missing = await mintLegacyToken(engine,{name:'missing-primary',takesHolders:['world'],scopes:['read'],sourceGrant:['missing-primary']});
+    expect(await provider().verifyAccessToken(missing.token)).toMatchObject({sourceId:NO_SOURCES,scopes:[]});
+  },120_000);
 });

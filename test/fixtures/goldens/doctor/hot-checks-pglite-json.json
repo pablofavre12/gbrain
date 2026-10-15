@@ -931,7 +931,7 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1137 column(s) verified against live schema",
+            "message": "1141 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
@@ -2214,7 +2214,7 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
-            "message": "Extraction lag not applicable (20 pages — too few to assess); 1 page(s) pending link extraction (gbrain extract --stale finishes them)",
+            "message": "Extraction lag not applicable (20 pages — too few to assess); 20 page(s) pending link extraction (gbrain extract --stale finishes them)",
             "name": "links_extraction_lag",
             "status": "ok"
           },
@@ -4595,7 +4595,7 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1137 column(s) verified against live schema",
+            "message": "1141 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
@@ -5878,7 +5878,7 @@
           {
             "category": "brain",
             "elapsed_ms": "<volatile>",
-            "message": "Extraction lag not applicable (20 pages — too few to assess); 1 page(s) pending link extraction (gbrain extract --stale finishes them)",
+            "message": "Extraction lag not applicable (20 pages — too few to assess); 20 page(s) pending link extraction (gbrain extract --stale finishes them)",
             "name": "links_extraction_lag",
             "status": "ok"
           },

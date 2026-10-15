@@ -28,7 +28,8 @@ import { normalizeSlugPrefix } from '../ops/context.ts';
 import { resolveSourceLocalFilePath } from '../markdown.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode } from '../write-through.ts';
 import { hardenedGitSync, hardenedPathDirty } from '../hardened-git.ts';
-import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
+import type { PageReadPolicy } from '../types.ts';
 import { isValidSourceId } from '../source-id.ts';
 import { validateSlug } from '../utils.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
@@ -127,7 +128,7 @@ export async function driftClass(engine: BrainEngine, sourceId: string, slug: st
   } catch { return 'error'; }
 }
 
-export interface ConflictAuditAccess {
+export interface ConflictAuditAccess extends PageReadPolicy {
   /** `ctx.remote === false`: the live file check and local paths are allowed. */
   trusted: boolean;
   /** Sources this caller may read (undefined: every source). */
@@ -182,6 +183,24 @@ function parseCursor(value: unknown): { through: bigint; after: string } | null 
 function validSlug(slug: string): boolean { try { validateSlug(slug); return true; } catch { return false; } }
 const likeEscape = (value: string) => value.replace(/[\\%_]/g, char => `\\${char}`);
 
+function receiptVisibility(access: ConflictAuditAccess, params: unknown[]): string {
+  const where: string[] = [];
+  const prefixes = access.slugPrefixes?.map(normalizeSlugPrefix).filter(Boolean);
+  if (prefixes) {
+    if (!prefixes.length) return 'FALSE';
+    const alternatives = prefixes.map(base => {
+      params.push(base.endsWith('/') ? `${likeEscape(base)}%` : likeEscape(base));
+      const at = params.length;
+      return base.endsWith('/') ? `lower(r.slug) LIKE $${at}` : `(lower(r.slug) = $${at} OR lower(r.slug) LIKE $${at} || '/%')`;
+    });
+    where.push(`(${alternatives.join(' OR ')})`);
+  }
+  if (!access.trusted || access.excludePrivate || access.aclSubjectIds !== undefined) {
+    where.push(`EXISTS (SELECT 1 FROM pages p WHERE p.source_id=r.source_id AND p.slug=r.slug AND ${pageReadFilter('p', access, params, true)})`);
+  }
+  return where.length ? where.join(' AND ') : 'TRUE';
+}
+
 /**
  * Conflict receipts of one source (its current incarnation) grouped by slug. The rows scanned are the
  * newest `window` request sequences up to the source's own newest request (the
@@ -206,11 +225,13 @@ export async function auditDriftConflicts(engine: BrainEngine, sourceId: string,
   if (access.sourceIds && !access.sourceIds.includes(sourceId)) return empty();
   // The window is bounded by this source's own requests (its current incarnation, the request table's
   // (source_incarnation, sequence) index), so its sequences never reveal write activity in other sources.
+  const boundsParams: unknown[] = [sourceId];
+  const boundsVisibility = receiptVisibility(access, boundsParams);
   const [bounds] = await engine.executeRaw<{ incarnation: string; top: string | null; bottom: string | null }>(
     `SELECT s.incarnation::text AS incarnation,
-        (SELECT max(r.sequence) FROM persistence_requests r WHERE r.source_incarnation=s.incarnation)::text AS top,
-        (SELECT min(r.sequence) FROM persistence_requests r WHERE r.source_incarnation=s.incarnation)::text AS bottom
-       FROM sources s WHERE s.id=$1`, [sourceId]);
+        (SELECT max(r.sequence) FROM persistence_requests r WHERE r.source_incarnation=s.incarnation AND ${boundsVisibility})::text AS top,
+        (SELECT min(r.sequence) FROM persistence_requests r WHERE r.source_incarnation=s.incarnation AND ${boundsVisibility})::text AS bottom
+       FROM sources s WHERE s.id=$1`, boundsParams);
   if (!bounds) return empty();
   const top = BigInt(bounds.top ?? '0');
   const through = cursor && cursor.through < top ? cursor.through : top;
@@ -220,19 +241,7 @@ export async function auditDriftConflicts(engine: BrainEngine, sourceId: string,
     window: { from_sequence: String(floor > 0n ? floor + 1n : 1n), through_sequence: String(through), covers_history: coversHistory } };
   const params: unknown[] = [sourceId, String(floor), String(through), bounds.incarnation];
   const where = [`r.source_id=$1`, `r.source_incarnation=$4::uuid`, `r.sequence > $2::bigint`, `r.sequence <= $3::bigint`, `r.state='conflict'`, `r.error_code='source_changed'`];
-  const prefixes = access.slugPrefixes?.map(normalizeSlugPrefix).filter(Boolean);
-  if (prefixes) {
-    if (!prefixes.length) { report.complete = true; return report; }
-    const alternatives = prefixes.map(base => {
-      params.push(base.endsWith('/') ? `${likeEscape(base)}%` : likeEscape(base));
-      const at = params.length;
-      return base.endsWith('/') ? `lower(r.slug) LIKE $${at}` : `(lower(r.slug) = $${at} OR lower(r.slug) LIKE $${at} || '/%')`;
-    });
-    where.push(`(${alternatives.join(' OR ')})`);
-  }
-  if (!access.trusted || access.excludePrivate) {
-    where.push(`EXISTS (SELECT 1 FROM pages p WHERE p.source_id=r.source_id AND p.slug=r.slug AND p.deleted_at IS NULL${access.excludePrivate ? ` AND ${privatePagesFilterFragment('p')}` : ''})`);
-  }
+  where.push(receiptVisibility(access, params));
   const filtered = where.join(' AND ');
   const [totals] = await engine.executeRaw<{ slugs: number; receipts: number }>(
     `SELECT count(DISTINCT r.slug)::int AS slugs, count(*)::int AS receipts FROM persistence_requests r WHERE ${filtered}`, params);

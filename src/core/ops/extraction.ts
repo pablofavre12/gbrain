@@ -12,7 +12,8 @@ import type { Operation } from './contract.ts';
 import { opError, type OperationContext } from './contract.ts';
 import type { Action } from '../agent-output.ts';
 import { hostOnlyError, paramUse, readFix } from './op-fix.ts';
-import { sourceScopeOpts } from './context.ts';
+import { sourceScopeOpts, readPolicyOpts } from './context.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
 import { unverifiedExtractionFragment, isUnverifiedExtraction, EXTRACTION_STATUS_KEY, STATUS_VERIFIED } from '../extraction-review.ts';
 import { buildVisibilityClause } from '../search/sql-ranking.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
@@ -119,18 +120,9 @@ const extraction_pending: Operation = {
   handler: async (ctx, p) => {
     const limit = Math.min(Math.max(Number(p.limit ?? 100) || 100, 1), 500);
     const offset = Math.max(Number(p.offset ?? 0) || 0, 0);
-    // Read-side source isolation: route through sourceScopeOpts (federated
-    // array > scalar > nothing), applied in SQL below.
-    const scope = sourceScopeOpts(ctx);
+    const policy = await readPolicyOpts(ctx);
     const params: unknown[] = [];
-    let srcClause = '';
-    if (scope.sourceIds && scope.sourceIds.length > 0) {
-      params.push(scope.sourceIds);
-      srcClause = `AND p.source_id = ANY($${params.length}::text[])`;
-    } else if (scope.sourceId) {
-      params.push(scope.sourceId);
-      srcClause = `AND p.source_id = $${params.length}`;
-    }
+    const pagePolicy = pageReadFilter('p', policy, params, true);
     params.push(limit, offset);
     const rows = await ctx.engine.executeRaw<{
       slug: string; title: string; type: string; source_id: string;
@@ -143,7 +135,7 @@ const extraction_pending: Operation = {
        JOIN sources s ON s.id = p.source_id
        WHERE ${unverifiedExtractionFragment('p')}
          ${buildVisibilityClause('p', 's')}
-         ${srcClause}
+         AND ${pagePolicy}
        ORDER BY p.created_at DESC
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,

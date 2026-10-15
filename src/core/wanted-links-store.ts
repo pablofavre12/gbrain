@@ -1,12 +1,14 @@
 /**
- * Storage for wanted pages (see src/core/wanted-links.ts). Kept free of the
- * link-extraction import graph because derived-links.ts, which every engine
- * imports, calls it inside the derived-link replacement transaction.
+ * Storage for wanted pages (see src/core/wanted-links.ts). Derived-link writes
+ * preserve the healing queue and a durable inventory for reader-scoped answers.
  */
 import type { BrainEngine } from './engine.ts';
+import type { PageReadScope } from './types.ts';
+import { pageReadFilter } from './search/read-policy-sql.ts';
 import { executeRawJsonb } from './sql-query.ts';
 import { sanitizeForJsonb } from './batch-rows.ts';
 import { validateSlug } from './utils.ts';
+import { type AuthoredInventoryReader, listAuthoredWantedPages, replaceAuthoredLinkInventory, type AuthoredLinkReference } from './authored-link-inventory.ts';
 
 export type WantedProducer = 'body' | 'frontmatter';
 
@@ -21,6 +23,8 @@ export interface WantedLinkInput {
 
 export interface WantedLinksReplacement {
   rows: WantedLinkInput[];
+  /** Complete authored inventory, independent of which edge producers are replaced. */
+  authoredReferences?: AuthoredLinkReference[];
   /** Producers whose rows this replacement owns; others stay untouched. */
   producers: readonly WantedProducer[];
 }
@@ -64,6 +68,11 @@ export async function replaceWantedLinks(
   origin: { pageId: number; sourceId: string },
   replacement: WantedLinksReplacement,
 ): Promise<number> {
+  if (replacement.authoredReferences) {
+    const [page] = await tx.executeRaw<{ revision: string }>('SELECT knowledge_revision::text AS revision FROM pages WHERE id=$1 AND source_id=$2', [origin.pageId, origin.sourceId]);
+    if (page) await replaceAuthoredLinkInventory(tx, { ...origin, revision: page.revision },
+      await possibleWantedRows(tx, origin.sourceId, replacement.authoredReferences));
+  }
   if (!replacement.producers.length) return 0;
   const rows = (await possibleWantedRows(tx, origin.sourceId,
     replacement.rows.filter(row => replacement.producers.includes(row.producer))))
@@ -108,27 +117,25 @@ export interface WantedPageRow {
 }
 
 /**
- * Missing link targets, most-referenced first. Scope applies to the origin
- * pages (the caller's readable sources) and, when `excludePrivate`, private
- * origins are removed BEFORE aggregation so a private page never reveals a
- * target name or contributes to a count. Soft-deleted origins never count.
+ * Missing link targets, most-referenced first. Authorize origins before
+ * aggregation, and authorize destination existence and suggested matches too:
+ * a hidden page must not affect the caller's counts, order or suggestions.
  */
-export async function listWantedPages(engine: Pick<BrainEngine, 'executeRaw'>, opts: {
-  sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; privateFilter?: (alias: string) => string;
+export async function listWantedPages(engine: AuthoredInventoryReader, opts: PageReadScope & {
   limit: number; offset: number;
 }): Promise<{ total: number; rows: WantedPageRow[] }> {
+  if (opts.aclSubjectIds !== undefined || opts.excludePrivate || opts.minTrust || opts.suppressFlagged) {
+    return listAuthoredWantedPages(engine, opts);
+  }
   const params: unknown[] = [];
-  const scope = opts.sourceIds?.length
-    ? (params.push(opts.sourceIds), ` AND o.source_id = ANY($${params.length}::text[])`)
-    : opts.sourceId ? (params.push(opts.sourceId), ` AND o.source_id = $${params.length}`) : '';
-  const originPrivacy = opts.excludePrivate && opts.privateFilter ? ` AND ${opts.privateFilter('o')}` : '';
-  const matchPrivacy = opts.excludePrivate && opts.privateFilter ? ` AND ${opts.privateFilter('m')}` : '';
+  const originPolicy = pageReadFilter('o', opts, params, true);
+  const destinationPolicy = pageReadFilter('t', opts, params, true);
   const base = `WITH wanted AS (
       SELECT w.target_source_id, w.target_ref, w.ref_kind, w.link_type, w.first_seen_at, w.checked_at,
         o.slug AS origin_slug, o.source_id AS origin_source_id
       FROM wanted_links w JOIN pages o ON o.id = w.origin_page_id AND o.deleted_at IS NULL
-      WHERE NOT EXISTS (SELECT 1 FROM pages t WHERE t.source_id = w.target_source_id AND t.slug = w.target_ref AND t.deleted_at IS NULL)
-        ${scope}${originPrivacy}
+      WHERE NOT EXISTS (SELECT 1 FROM pages t WHERE t.source_id = w.target_source_id AND t.slug = w.target_ref AND ${destinationPolicy})
+        AND ${originPolicy}
     ), grouped AS (
       SELECT target_source_id, target_ref, min(ref_kind) AS ref_kind,
         count(DISTINCT (origin_source_id, origin_slug))::int AS referenced_by,
@@ -138,13 +145,14 @@ export async function listWantedPages(engine: Pick<BrainEngine, 'executeRaw'>, o
       FROM wanted GROUP BY target_source_id, target_ref
     )`;
   const [{ total }] = await engine.executeRaw<{ total: number }>(`${base} SELECT count(*)::int AS total FROM grouped`, params);
+  const matchPolicy = pageReadFilter('m', opts, params, true);
   params.push(opts.limit, opts.offset);
   const rows = await engine.executeRaw<{ target_source_id: string; target_ref: string; ref_kind: 'slug' | 'name'; referenced_by: number;
     origins: Array<{ slug: string; source_id: string }>; link_types: string[]; matches: Array<{ slug: string; source_id: string }> | null;
     first_seen: Date | string; last_checked: Date | string }>(`${base}
     SELECT g.*, (SELECT jsonb_agg(jsonb_build_object('slug', m.slug, 'source_id', m.source_id))
         FROM (SELECT m.slug, m.source_id FROM pages m WHERE g.ref_kind = 'name' AND m.source_id = g.target_source_id
-          AND regexp_replace(m.slug, '^.*/', '') = g.target_ref AND m.deleted_at IS NULL${matchPrivacy}
+          AND regexp_replace(m.slug, '^.*/', '') = g.target_ref AND ${matchPolicy}
           ORDER BY m.slug LIMIT 3) m) AS matches
     FROM grouped g ORDER BY g.referenced_by DESC, g.target_source_id, g.target_ref
     LIMIT $${params.length - 1} OFFSET $${params.length}`, params);

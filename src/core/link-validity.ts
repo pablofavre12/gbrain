@@ -8,9 +8,9 @@
  *   `link_transitions` row (dated start/end statements).
  * - `buildRelationshipState` turns that evidence into stints. It reads only the
  *   evidence, never arrival order, so any ingestion order yields the same state.
- * - `link_relationships` stores the state per read scope; readers filter with
- *   `relationshipFilterSql`, a primary-key probe. A relationship with no state
- *   row reads as live, so a lagging projection never hides an edge.
+ * - Unrestricted local readers use `link_relationships`. Restricted readers
+ *   derive state from authorized live evidence in the query snapshot, before
+ *   graph filtering or pagination. Missing state reads as live.
  * - `closeContradiction` is the date arithmetic applied after something (an LLM
  *   verdict, a declared single-value relation) says two relationships cannot
  *   both hold. It never invents dates.
@@ -18,6 +18,7 @@
  * Pure module except the SQL fragment builders; no engine imports.
  */
 import type { PageReadScope } from './types.ts';
+import { needsScopedTemporalState, scopedTemporalStateSql } from './link-temporal-read-sql.ts';
 
 export type RelationSemantics = 'state' | 'event' | 'reference';
 export type TransitionKind = 'start' | 'end';
@@ -339,7 +340,7 @@ export interface LinkReadScope extends PageReadScope {
   temporal?: EdgeTemporalOpts;
 }
 
-export interface EdgeTemporalOpts {
+export interface EdgeTemporalOpts extends PageReadScope {
   /** live (default), ended, or all. */
   status?: EdgeStatusFilter;
   /** Valid-time reference day, YYYY-MM-DD; default today (UTC). */
@@ -363,26 +364,28 @@ function dateLiteral(date: string): string {
  * filtering applies. Dates are validated and inlined as literals so the
  * fragment composes into statements with any parameter numbering.
  *
- * A row passes when its relationship has no state row (reference type, or not
- * yet refreshed) or its state row matches the requested status.
+ * Restricted scopes require the caller parameter array: all ACL, source and
+ * relation-type values stay bound. Unrestricted local reads use cached state.
+ * A row passes when state is absent or matches the requested status.
  */
-export function relationshipFilterSql(linkAlias: string, opts: EdgeTemporalOpts = {}): string {
+export function relationshipFilterSql(linkAlias: string, opts: EdgeTemporalOpts = {}, params?: unknown[]): string {
   const status = opts.status ?? 'live';
   if (opts.disabled || (status === 'all' && !opts.during)) return 'TRUE';
-  const scope = opts.excludePrivate ? 'world' : 'all';
   const day = opts.asOf ? dateLiteral(opts.asOf) : `(now() AT TIME ZONE 'UTC')::date`;
-  const probe = `lr.from_page_id = ${linkAlias}.from_page_id AND lr.to_page_id = ${linkAlias}.to_page_id
-      AND lr.link_type = ${linkAlias}.link_type AND lr.scope = '${scope}'`;
+  const scoped = needsScopedTemporalState(opts);
+  const relation = scoped ? `(${readerTemporalStateSql(linkAlias, opts, params)}) lr` : 'link_relationships lr';
+  const probe = scoped ? 'TRUE' : `lr.from_page_id = ${linkAlias}.from_page_id AND lr.to_page_id = ${linkAlias}.to_page_id
+      AND lr.link_type = ${linkAlias}.link_type AND lr.scope = 'all'`;
   if (opts.during) {
     const range = `daterange(${dateLiteral(opts.during.from)}, ${dateLiteral(opts.during.until)})`;
-    return `NOT EXISTS (SELECT 1 FROM link_relationships lr WHERE ${probe} AND NOT (lr.valid_ranges && ${range}))`;
+    return `NOT EXISTS (SELECT 1 FROM ${relation} WHERE ${probe} AND NOT (lr.valid_ranges && ${range}))`;
   }
   if (status === 'ended') {
-    return `EXISTS (SELECT 1 FROM link_relationships lr WHERE ${probe} AND lr.semantics = 'state'
+    return `EXISTS (SELECT 1 FROM ${relation} WHERE ${probe} AND lr.semantics = 'state'
       AND NOT (lr.valid_ranges @> ${day}) AND (lr.first_start IS NULL OR lr.first_start <= ${day}))`;
   }
   const disputedClause = opts.asOf ? ' OR lr.disputed' : '';
-  return `NOT EXISTS (SELECT 1 FROM link_relationships lr WHERE ${probe} AND (NOT (lr.valid_ranges @> ${day})${disputedClause}))`;
+  return `NOT EXISTS (SELECT 1 FROM ${relation} WHERE ${probe} AND (NOT (lr.valid_ranges @> ${day})${disputedClause}))`;
 }
 
 /** Validate op-level temporal params; returns normalized opts or an error message. */
@@ -445,11 +448,22 @@ export interface TemporalAnnotation {
   retired_at?: string | null;
 }
 
-/** LEFT JOIN of a links alias onto its relationship state row for the read scope. */
-export function temporalLinkJoinSql(linkAlias: string, excludePrivate?: boolean): string {
+/** Join read-authorized state; restricted scopes append values to `params`. */
+export function temporalLinkJoinSql(linkAlias: string, policy?: boolean | PageReadScope, params?: unknown[]): string {
+  const scope = typeof policy === 'boolean' ? { excludePrivate: policy } : policy ?? {};
+  if (needsScopedTemporalState(scope)) {
+    return `LEFT JOIN LATERAL (${readerTemporalStateSql(linkAlias, scope, params)}) lr_t ON TRUE`;
+  }
   return `LEFT JOIN link_relationships lr_t ON lr_t.from_page_id = ${linkAlias}.from_page_id
       AND lr_t.to_page_id = ${linkAlias}.to_page_id AND lr_t.link_type = ${linkAlias}.link_type
-      AND lr_t.scope = '${excludePrivate ? 'world' : 'all'}'`;
+      AND lr_t.scope = 'all'`;
+}
+
+function readerTemporalStateSql(linkAlias: string, scope: PageReadScope, params?: unknown[]): string {
+  if (!params) throw new TypeError('Scoped temporal SQL requires a parameter array');
+  return scopedTemporalStateSql(linkAlias, scope, temporalLinkTypes().map(linkType => ({
+    linkType, semantics: relationSemantics(linkType) as 'state' | 'event',
+  })), params);
 }
 
 export const TEMPORAL_LINK_SELECT_SQL = `, lr_t.valid_ranges::text AS temporal_ranges, lr_t.semantics AS temporal_semantics,

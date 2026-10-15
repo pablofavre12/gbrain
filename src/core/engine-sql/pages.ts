@@ -15,8 +15,10 @@ import { DocumentVersionConflictError } from '../engine.ts';
  */
 import type { BrainEngine } from '../engine.ts';
 import type { DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow } from '../types.ts';
-import type { Page, PageInput, PageFilters, StalePageRow } from '../types.ts';
+import type { Page, PageInput, PageFilters, StalePageRow, PageReadScope } from '../types.ts';
 import type { GetVersionsOpts, PageVersionRows } from '../page-state/version-types.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
+import { temporalSqlFragment } from '../link-temporal-read-sql.ts';
 import { PAGE_SORT_SQL } from '../types.ts';
 import type { PageWriteOptions } from '../page-state/types.ts';
 import { moveSlugBindings, recordRenameAlias } from '../page-state/rename-alias.ts';
@@ -854,6 +856,7 @@ export async function findByTitleFuzzy(
   dirPrefix?: string,
   minSimilarity: number = 0.55,
   sourceId?: string,
+  readScope?: PageReadScope,
 ): Promise<{ slug: string; similarity: number } | null> {
     // Use `%` so the existing idx_pages_trgm GIN index can prune candidates
     // when the requested threshold is at least pg_trgm's default 0.3. Below
@@ -875,6 +878,7 @@ export async function findByTitleFuzzy(
     const trgmPrefilter = minSimilarity >= 0.3
       ? sqlFragment`title % ${name} AND`
       : sqlFragment``;
+    const policy = readScope ? temporalSqlFragment(params => ` AND ${pageReadFilter('pages', readScope, params, true)}`) : sqlFragment``;
     const { rows } = sourceId
       ? await exec.run<{ slug: string; sim: number }>(sqlFragment`
           SELECT slug, similarity(title, ${name}) AS sim
@@ -882,7 +886,7 @@ export async function findByTitleFuzzy(
           WHERE ${trgmPrefilter} similarity(title, ${name}) >= ${minSimilarity}
             AND slug LIKE ${prefixPattern}
             AND source_id = ${sourceId}
-            AND deleted_at IS NULL
+            AND deleted_at IS NULL${policy}
           ORDER BY sim DESC, slug ASC
           LIMIT 1
         `)
@@ -890,7 +894,7 @@ export async function findByTitleFuzzy(
           SELECT slug, similarity(title, ${name}) AS sim
           FROM pages
           WHERE ${trgmPrefilter} similarity(title, ${name}) >= ${minSimilarity}
-            AND slug LIKE ${prefixPattern}
+            AND slug LIKE ${prefixPattern}${policy}
           ORDER BY sim DESC, slug ASC
           LIMIT 1
         `);

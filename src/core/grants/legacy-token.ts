@@ -24,6 +24,7 @@
  * `--adopt-permissions` or `--adopt-columns` resolves it.
  */
 import type { BrainEngine } from '../engine.ts';
+import { pgArray } from './encoding.ts';
 import { assertAllowedScopes, operationScopesAllowed } from '../scope.ts';
 import { isValidSourceId } from '../source-id.ts';
 import { executeRawJsonb, type SqlQuery } from '../sql-query.ts';
@@ -342,22 +343,37 @@ export async function migrateLegacyTokens(engine: BrainEngine, opts: { dryRun: b
  * stays deny-all.
  */
 export async function resolveTokenGrant(sql: SqlQuery, row: Record<string, unknown>): Promise<PrincipalGrant> {
-  const grant = grantFromTokenRow(row);
-  if (grant.shape !== 'legacy_permissions' || grant.permissionsMalformed || !('source_grant' in row)) return grant;
-  const [kind, write, reads, ops, holders] = tokenGrantColumnValues(grant);
-  try {
-    const [converted] = await sql`
-      UPDATE access_tokens SET source_grant = ${kind}, source_id = ${write}, federated_read = ${reads}::text[],
-        allowed_operations = ${ops}::text[], takes_holders = ${holders}::text[], grant_revision = grant_revision + 1,
-        last_used_at = now()
-      WHERE id IN (SELECT id FROM access_tokens WHERE id = ${String(row.id)}::uuid AND source_grant IS NULL FOR UPDATE SKIP LOCKED)
-      RETURNING *
-    `;
-    if (converted) return grantFromTokenRow(converted);
-  } catch {
-    // Read-only role or transient failure: authorize with the identical in-memory conversion.
+  let grant = grantFromTokenRow(row);
+  if (grant.shape === 'legacy_permissions' && !grant.permissionsMalformed && 'source_grant' in row) {
+    const [kind, write, reads, ops, holders] = tokenGrantColumnValues(grant);
+    try {
+      const [converted] = await sql`
+        UPDATE access_tokens SET source_grant = ${kind}, source_id = ${write}, federated_read = ${reads}::text[],
+          allowed_operations = ${ops}::text[], takes_holders = ${holders}::text[], grant_revision = grant_revision + 1,
+          last_used_at = now()
+        WHERE id IN (SELECT id FROM access_tokens WHERE id = ${String(row.id)}::uuid AND source_grant IS NULL FOR UPDATE SKIP LOCKED)
+        RETURNING *
+      `;
+      if (converted) grant = grantFromTokenRow(converted);
+    } catch {
+      // Read-only role or transient failure: authorize with the identical in-memory conversion.
+    }
   }
-  return grant;
+  return liveTokenGrant(sql, grant);
+}
+
+/** Archive revocation is live on both HTTP carriers; never persist this narrowed view. */
+async function liveTokenGrant(sql: SqlQuery, grant: PrincipalGrant): Promise<PrincipalGrant> {
+  const sources = grant.sources;
+  // Keep the historical no-grant federation floor and explicit deny-all unchanged.
+  if (sources.kind === 'default' || sources.kind === 'none') return grant;
+  const ids = sources.kind === 'scalar' ? [sources.writeSource] : sources.readSources;
+  const rows = await sql`SELECT id FROM sources WHERE id = ANY(${pgArray(ids)}::text[]) AND archived IS NOT TRUE`;
+  const active = new Set(rows.map(row => String(row.id)));
+  if (!active.has(sources.writeSource)) return { ...grant, scopes: [], sources: { kind: 'none' } };
+  return sources.kind === 'scalar' ? grant : {
+    ...grant, sources: { ...sources, readSources: sources.readSources.filter(id => active.has(id)) },
+  };
 }
 
 /**

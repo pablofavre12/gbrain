@@ -5,6 +5,8 @@ import { buildBasenameIndex, extractPageLinks, isGlobalBasenameEnabled, makeReso
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
 import { DerivedLinkEndpointChangedError } from '../derived-links.ts';
 import { capturedLinkEndpoints, indexLinkSources, loadLinkSourcePolicy, makeLinkSourceResolver } from '../link-reconciliation.ts';
+import { collectAuthoredLinkReferences } from '../authored-link-references.ts';
+import { replaceAuthoredLinkInventory } from '../authored-link-inventory.ts';
 import { collectWantedLinks, isWantedPagesEnabled, possibleWantedRows } from '../wanted-links.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { readLineGrammarSettings, type LineGrammarSettings } from '../line-grammar.ts';
@@ -84,7 +86,7 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
   // One settings snapshot for the whole extraction; publication validates it (derived-links.ts). An unreadable
   // setting leaves the page's links unpublished (stale) rather than extracted under defaults.
   const settings: LineGrammarSettings | null = await readLineGrammarSettings(engine).catch(() => null);
-  const opts = { globalBasename: await isGlobalBasenameEnabled(engine),
+  const opts = { collectAuthoredReferences: true, globalBasename: await isGlobalBasenameEnabled(engine),
     lineGrammar: { enabled: settings?.enabled ?? false, allowUndeclaredTypes: settings?.allowUndeclaredTypes ?? false },
     pack: (await loadActivePackForLocalEngine(engine, { sourceId }))?.manifest ?? null };
   if (!opts.pack || !settings) return { pageKeys: [{ sourceId, slug }], attendanceComplete: true, settings,
@@ -108,14 +110,17 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
   endpoints.slugToSources.set(slug, [...new Set([sourceId, ...(endpoints.slugToSources.get(slug) ?? [])])]);
   // #4680: the source policy decides the target's source (shared with the reconciliation sweep).
   const sources = makeLinkSourceResolver(slug, sourceId, endpoints, policy);
-  const { candidates, unresolved, attendanceComplete } = await extractPageLinks(slug, content, page.frontmatter, page.type, resolver,
+  const { candidates, authoredCandidates, frontmatterReferences, unresolved, attendanceComplete } = await extractPageLinks(slug, content, page.frontmatter, page.type, resolver,
     { ...opts, targetType: (targetSlug, targetSourceId) => {
       const resolved = sources.resolve({ targetSlug, targetSourceId, linkType: '', context: '' });
       return resolved.ok ? (targetSlug === slug && resolved.toSourceId === sourceId ? page.type
         : metadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type) : undefined;
     } });
   // The rows the store keeps (#6228/#6225), so the receipt's wanted preview never names a target no page can have.
-  const wanted = { producers: ['body', 'frontmatter'] as const, rows: await isWantedPagesEnabled(engine)
+  const authoredReferences = collectAuthoredLinkReferences({
+    candidates: (authoredCandidates ?? candidates).map(retarget), frontmatterReferences, originSourceId: sourceId, originSlug: slug,
+    crossSourceAllowed: sources.crossSourceAllowed, resolve: sources.resolve });
+  const wanted = { authoredReferences, producers: ['body', 'frontmatter'] as const, rows: await isWantedPagesEnabled(engine)
     ? await possibleWantedRows(engine, sourceId, collectWantedLinks({ candidates: candidates.map(retarget), frontmatterUnresolved: unresolved,
       originSourceId: sourceId, crossSourceAllowed: sources.crossSourceAllowed, resolve: sources.resolve }))
     : [] };
@@ -129,9 +134,13 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
   return { attendanceComplete, settings, pageKeys: [{ sourceId, slug }, ...rows.flatMap(row => [
     { sourceId: row.from_source_id!, slug: row.from_slug }, { sourceId: row.to_source_id!, slug: row.to_slug },
   ])], apply: async (tx: BrainEngine) => {
-    if (!attendanceComplete) return { created: 0, removed: 0, errors: 1, unresolved_count: Math.max(1, unresolved.length) };
     const snapshot = await tx.readPageSnapshot(slug, { sourceId });
     if (!snapshot) throw new Error('Automatic link origin disappeared');
+    if (!attendanceComplete) {
+      await replaceAuthoredLinkInventory(tx, { pageId: snapshot.page.id, sourceId, revision: snapshot.revision },
+        await possibleWantedRows(tx, sourceId, authoredReferences));
+      return { created: 0, removed: 0, errors: 1, unresolved_count: Math.max(1, unresolved.length) };
+    }
     try {
       const result = await tx.replaceDerivedLinks({ slug, sourceId, expectedRevision: snapshot.revision,
         sourceIncarnation: snapshot.sourceIncarnation, snapshot }, rows, { preserveExisting: true, semanticsPrimed: primeSemantics, lineGrammar: settings, wanted: { ...wanted, producers: [...wanted.producers] },

@@ -13,7 +13,8 @@
 import {
   annotateTemporalRow, temporalLinkJoinSql, TEMPORAL_LINK_SELECT_SQL, type RelationshipStatus,
 } from './link-validity.ts';
-import { privateLinkOriginFilterFragment, privatePagesFilterFragment } from './search/private-visibility.ts';
+import { pageReadFilter } from './search/read-policy-sql.ts';
+import type { PageReadScope } from './types.ts';
 
 const NOTE_ENDED_CAP = 3;
 
@@ -47,26 +48,31 @@ function renderNote(summary: string, edges: NoteEdge[]): string | undefined {
 
 /**
  * Notes keyed by `relationshipNoteKey(source_id, slug)`; subjects without an
- * ended relationship are absent. `excludePrivate` reads the world-scope state
- * and hides private targets and private-origin links, like remote graph reads.
+ * ended relationship are absent. Each endpoint and evidence origin must be
+ * readable under the same policy used to derive the temporal state.
  */
 export async function loadRelationshipNotes(
   engine: RawExec,
   subjects: readonly NoteSubject[],
-  opts: { excludePrivate: boolean },
+  opts: PageReadScope,
 ): Promise<Map<string, string>> {
   const notes = new Map<string, string>();
   if (subjects.length === 0) return notes;
-  const privacy = opts.excludePrivate ? ` AND ${privatePagesFilterFragment('t')} AND ${privateLinkOriginFilterFragment('l')}` : '';
-  const rows = await engine.executeRaw<{ from_slug: string; source_id: string; to_slug: string; to_title: string | null; link_type: string }>(
-    `SELECT f.slug AS from_slug, f.source_id, t.slug AS to_slug, t.title AS to_title, l.link_type${TEMPORAL_LINK_SELECT_SQL}
+  const params: unknown[] = [subjects.map(s => s.source_id), subjects.map(s => s.slug)];
+  const fromPolicy = pageReadFilter('f', opts, params, true);
+  const toPolicy = pageReadFilter('t', opts, params, true);
+  const originPolicy = pageReadFilter('note_origin', opts, params, true);
+  const rows = await engine.executeRaw<{ from_slug: string; source_id: string; to_slug: string; to_source_id: string; to_title: string | null; link_type: string }>(
+    `SELECT f.slug AS from_slug, f.source_id, t.slug AS to_slug, t.source_id AS to_source_id, t.title AS to_title, l.link_type${TEMPORAL_LINK_SELECT_SQL}
        FROM links l
        JOIN pages f ON f.id = l.from_page_id
        JOIN pages t ON t.id = l.to_page_id
-       ${temporalLinkJoinSql('l', opts.excludePrivate)}
+       ${temporalLinkJoinSql('l', opts, params)}
       WHERE (f.source_id, f.slug) IN (SELECT s.source_id, s.slug FROM unnest($1::text[], $2::text[]) AS s(source_id, slug))
-        AND lr_t.semantics = 'state' AND t.deleted_at IS NULL${privacy}`,
-    [subjects.map(s => s.source_id), subjects.map(s => s.slug)],
+        AND lr_t.semantics = 'state' AND ${fromPolicy} AND ${toPolicy}
+        AND (l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM pages note_origin
+          WHERE note_origin.id = l.origin_page_id AND ${originPolicy}))`,
+    params,
   );
   const bySubject = new Map<string, Map<string, NoteEdge>>();
   for (const raw of rows) {
@@ -74,7 +80,7 @@ export async function loadRelationshipNotes(
     const key = relationshipNoteKey(r.source_id, r.from_slug);
     const edges = bySubject.get(key) ?? new Map<string, NoteEdge>();
     const last = r.stints?.[r.stints.length - 1];
-    edges.set(`${r.link_type}\u0000${r.to_slug}`, {
+    edges.set(`${r.link_type}\u0000${r.to_source_id}\u0000${r.to_slug}`, {
       type: r.link_type, slug: r.to_slug, title: r.to_title ?? '', status: r.status,
       since: last?.from ?? null, until: last?.until ?? null,
     });
@@ -90,16 +96,20 @@ export async function loadRelationshipNotes(
 }
 
 /**
- * Ambient turn context: fold each page's note into its synopsis (world scope),
+ * Ambient turn context: fold each page's authorized note into its synopsis,
  * so the budget trimmer prices the rendered line. Fail-soft: an error leaves
  * the synopses unchanged.
  */
 export async function appendRelationshipNotes(
   engine: RawExec,
   items: Array<{ slug: string; source_id: string; synopsis: string }>,
+  scope: PageReadScope = { aclSubjectIds: [], excludePrivate: true },
 ): Promise<void> {
   if (items.length === 0) return;
-  const notes = await loadRelationshipNotes(engine, items.map(i => ({ slug: i.slug, source_id: i.source_id, summary: i.synopsis })), { excludePrivate: true })
+  const notes = await loadRelationshipNotes(engine, items.map(i => ({ slug: i.slug, source_id: i.source_id, summary: i.synopsis })), {
+    ...(!scope.sourceId && !scope.sourceIds?.length ? { sourceIds: [...new Set(items.map(i => i.source_id))] } : {}),
+    ...scope,
+  })
     .catch(() => new Map<string, string>());
   for (const item of items) {
     const note = notes.get(relationshipNoteKey(item.source_id, item.slug));

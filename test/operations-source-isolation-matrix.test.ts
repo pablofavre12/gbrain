@@ -23,14 +23,18 @@
  * brain-wide only with a written rationale.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { rmSync } from 'node:fs';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
+import { emptyHome, withEnv } from './helpers/with-env.ts';
+import { extractStaleFromDB } from '../src/commands/extract.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
 import { readOps } from './helpers/ops-registry.ts';
 import { linkEntityIdentity } from '../src/core/entity-identity.ts';
 
 let engine: PGLiteEngine;
+let extractionHome: string;
 
 const LEAK_TOKENS = ['srcbeta', 'BETAMARKER', 'beta-secret', 'beta-person', 'beta-note', 'beta-topic', 'betamarkerdim', 'betamarkertype'];
 
@@ -220,6 +224,7 @@ const MATRIX: Row[] = [
 
 // ─── Fixture ───────────────────────────────────────────────────────────────
 beforeAll(async () => {
+  extractionHome = emptyHome();
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
@@ -235,7 +240,7 @@ beforeAll(async () => {
       type: 'person', title: `${MARK} Person`, compiled_truth: `${MARK} person truth`, frontmatter: {},
     }, { sourceId: src });
     await engine.putPage(`notes/${name}-note`, {
-      type: 'note', title: `${MARK} Note`, compiled_truth: `${name}-secret-content ${MARK}`,
+      type: 'note', title: `${MARK} Note`, compiled_truth: `${name}-secret-content ${MARK}\nSee [[people/${name}-person]] and [[people/${name}-missing-${MARK.toLowerCase()}]].`,
       timeline: `- ${TODAY}: ${MARK} timeline entry`, frontmatter: { marker: MARK },
     }, { sourceId: src });
     // Typeless page: schema_review_orphans lists pages with NULL/empty type.
@@ -256,10 +261,6 @@ beforeAll(async () => {
     await engine.addTag(`notes/${name}-note`, `${name}-topic`, { sourceId: src });
     await engine.addTag(`people/${name}-person`, `${name}-topic`, { sourceId: src });
     await engine.addLink(`notes/${name}-note`, `people/${name}-person`, `${MARK} ctx`, 'mentions', 'markdown', undefined, undefined, { fromSourceId: src, toSourceId: src });
-    // Wanted page: an unresolved link from the note to a missing marker-named target.
-    await engine.executeRaw(`INSERT INTO wanted_links (origin_page_id, source_id, producer, ref_kind, target_source_id, target_ref, checked_at)
-      SELECT id, $1, 'body', 'slug', $1, $2, now() FROM pages WHERE slug = $3 AND source_id = $1`,
-    [src, `people/${name}-missing-${MARK.toLowerCase()}`, `notes/${name}-note`]);
     await engine.createVersion(`notes/${name}-note`, { sourceId: src });
     await engine.putRawData(`notes/${name}-note`, 'crm', { owner: MARK }, { sourceId: src });
     await engine.logIngest({
@@ -324,6 +325,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (engine) await engine.disconnect();
+  rmSync(extractionHome, { recursive: true, force: true });
 }, 60_000);
 
 // ─── Ratchet: the table covers the registry exactly ───────────────────────
@@ -358,6 +360,18 @@ describe('source isolation matrix', () => {
     }
 
     test(`ISOLATED ${row.name}`, async () => {
+      if (row.name === 'wanted_pages') {
+        await withEnv({ GBRAIN_HOME: extractionHome }, () => extractStaleFromDB(engine, {
+          dryRun: false, jsonMode: true, quiet: true, catchUp: true, includeFrontmatter: true,
+        }));
+        for (const ctx of [scopedScalar(), scopedFederated()]) {
+          expect(await op.handler(ctx, row.args)).toMatchObject({ total: 1, targets: [{
+            target: 'people/alpha-missing-alphamark', target_source_id: 'srcalpha', referenced_by: 1,
+            sample_origins: [{ slug: 'notes/alpha-note', source_id: 'srcalpha' }],
+          }] });
+          await expect(op.handler(ctx, { source_id: 'srcbeta' })).rejects.toMatchObject({ code: 'not_found' });
+        }
+      }
       // Anti-vacuity control ladder: brain-wide local first; some engine
       // reads default to 'default' when unscoped, so fall back to a
       // srcbeta-scoped LOCAL ctx. Something must see beta or the test fails.

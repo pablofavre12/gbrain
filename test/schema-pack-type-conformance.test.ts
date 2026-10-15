@@ -81,6 +81,21 @@ function ctxOf(sourceId?: string): OperationContext {
 }
 
 describe('#5879 orphan review counts undeclared stored types', () => {
+  test('remote orphan rows and aggregate type counts use the same page ACL', async () => {
+    await seed('misc/public', '');
+    await seed('misc/restricted', 'classified-type');
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:director'] WHERE slug='misc/restricted'");
+    const read = (subject: string) => env(() => operationsByName.schema_review_orphans!.handler({ ...ctxOf('default'), remote: true,
+      auth: { token: 'fixture', clientId: 'schema-reader', scopes: ['read'], sourceId: 'default', subjectIds: [subject] } } as OperationContext, {})) as Promise<Record<string, any>>;
+    const denied = await read('user:tech');
+    expect(denied.orphan_count).toBe(1);
+    expect(denied.orphans.map((p: { slug: string }) => p.slug)).toEqual(['misc/public']);
+    expect(denied.undeclared_types).toEqual([]);
+    expect((await read('user:director')).orphan_count).toBe(2);
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:other'] WHERE slug='misc/restricted'");
+    expect(await read('user:director')).toEqual(denied);
+  });
+
   test('schema_review_orphans op: undeclared + untyped are orphans; declared and alias types are not', async () => {
     await seedMixed();
     const result = await env(() => operationsByName.schema_review_orphans!.handler(ctxOf(), {})) as Record<string, any>;

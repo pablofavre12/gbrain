@@ -60,7 +60,7 @@ describe('graduation inventory', () => {
     expect(new Set(names).size).toBe(names.length);
     const counts: Record<string, number> = {};
     for (const e of GRADUATION_INVENTORY.entries) counts[e.class] = (counts[e.class] ?? 0) + 1;
-    expect(counts).toEqual({ carry: 123, rebind: 2, rebuild: 2, discard: 7, schema_owned: 4 });
+    expect(counts).toEqual({ carry: 124, rebind: 2, rebuild: 2, discard: 7, schema_owned: 4 });
     for (const e of GRADUATION_INVENTORY.entries) {
       expect({ relation: e.relation, reason: e.reason.length > 5, present: e.engines.pglite || e.engines.postgres })
         .toEqual({ relation: e.relation, reason: true, present: true });
@@ -157,7 +157,7 @@ describe('graduation inventory', () => {
     for (const { engine } of engines) {
       const closure = await fkClosure(engine, 'pages');
       expect(closure[0]).toBe('pages');
-      for (const child of ['content_chunks', 'links', 'tags', 'timeline_entries', 'page_versions', 'raw_data']) expect(closure).toContain(child);
+      for (const child of ['content_chunks', 'links', 'tags', 'timeline_entries', 'page_versions', 'raw_data', 'authored_link_inventories']) expect(closure).toContain(child);
       const fks = await foreignKeys(engine);
       for (const fk of fks) {
         if (fk.parent === fk.child || !closure.includes(fk.parent)) continue;

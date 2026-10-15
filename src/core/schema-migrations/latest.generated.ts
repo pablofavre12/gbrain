@@ -5,4 +5,4 @@
 // loading the migrations themselves.
 
 export const LATEST_UPSTREAM_SCHEMA_VERSION = 245;
-export const LATEST_SCHEMA_VERSION = 9009;
+export const LATEST_SCHEMA_VERSION = 9010;

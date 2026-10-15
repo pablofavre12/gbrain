@@ -354,7 +354,7 @@ export class DeclarationMemo {
  * notice when the resolved entity's source is not fully indexed yet (its
  * aliases may be incomplete until the catch-up sweep finishes).
  */
-async function emitFanoutNotices(ctx: OperationContext, fanout: FanoutMeta | undefined, scope: SourceScope): Promise<void> {
+async function emitFanoutNotices(ctx: OperationContext, fanout: FanoutMeta | undefined, scope: SourceScope & { excludePrivate?: boolean }): Promise<void> {
   if (!fanout) return;
   if (fanout.truncated) {
     const notice: Notice = { code: 'alias_fanout', kind: 'info',
@@ -362,7 +362,7 @@ async function emitFanoutNotices(ctx: OperationContext, fanout: FanoutMeta | und
     ctx.emitNotice?.(notice);
   }
   if (!fanout.resolved_entity) return;
-  const coverage = await readMentionCoverage(ctx.engine, scope.sourceIds?.length ? scope.sourceIds : [scope.sourceId ?? ctx.sourceId ?? 'default']).catch(() => null);
+  const coverage = await readMentionCoverage(ctx.engine, scope.sourceIds?.length ? scope.sourceIds : [scope.sourceId ?? ctx.sourceId ?? 'default'], scope).catch(() => null);
   const notice = coverage ? mentionCoverageNotice(coverage) : null;
   if (notice) ctx.emitNotice?.(notice);
 }
@@ -794,7 +794,7 @@ const search: Operation = {
         { excludePrivate, requireSafeChunks: ctx.remote !== false, ...(types ? { types } : {}), ...scope }, () => declarations.scan(primary, queryText)))
       : { results: primary };
     let results = fanned.results.map(r => ({ ...r }));
-    await emitFanoutNotices(ctx, fanned.fanout, scope);
+    await emitFanoutNotices(ctx, fanned.fanout, { ...scope, excludePrivate });
     results = await timings.stage('anchoring', () => anchorOpResults(ctx.engine, p, queryText, results, { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false, filtered: !!types, evidencePlan: !!plan }));
     stampDeepResearchIds(results);
     const latency_ms = Date.now() - startedAt;
@@ -1049,7 +1049,7 @@ const query: Operation = {
     const primaryRows = results;
     const fanned = await timings.stage('alias_fanout', () => withAliasFanOut(ctx.engine, primaryRows, queryText, { ...querySourceScope, excludePrivate },
       { excludePrivate, requireSafeChunks: ctx.remote !== false, ...(types ? { types } : {}), ...querySourceScope }, () => declarations.scan(primaryRows, queryText)));
-    await emitFanoutNotices(ctx, fanned.fanout, querySourceScope);
+    await emitFanoutNotices(ctx, fanned.fanout, { ...querySourceScope, excludePrivate });
     results = await applyQueryArms(ctx.engine, p, queryText, fanned.results, { ...querySourceScope, excludePrivate, requireSafeChunks: ctx.remote !== false, filtered: !!types, evidencePlan: !!plan, evidenceBudget: plan?.budgetTokens, remote: ctx.remote !== false, queryEmbedding, rowCap: () => resolveEffectiveLimit(ctx, p), timer: timings });
     // #1663 — CRAG confidence gate. Grade what retrieval returned (zero-LLM;
     // reads the stamped honesty signals: evidence, exact_lookup, rerank

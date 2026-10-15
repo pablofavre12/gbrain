@@ -40,6 +40,7 @@ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { extractStaleFromDB } from '../src/commands/extract.ts';
 import { operations, operationsByName } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
@@ -88,6 +89,17 @@ const SINCE_EPOCH = '2020-01-01T00:00:00.000Z';
 const WORLD_FENCE_SLUG = 'people/world-fence-example';
 const WORLD_PAGE_SLUG = 'people/world-page-example';
 const PRIV_PAGE_SLUG = 'people/priv-page-example';
+const WANTED_WORLD = 'notes/sweep-missing-world';
+const WANTED_PRIVATE = 'notes/sweep-missing-private';
+const WANTED_PRIVATE_SRC2 = 'notes/sweep-missing-private-src2';
+
+// Seed writes and ACL fixture edits can advance page revisions after automatic links.
+// Build current authored evidence through the real maintenance path before reading it.
+async function prepareReadInventories() {
+  await withEnv({ GBRAIN_HOME: home }, () => extractStaleFromDB(engine, {
+    dryRun: false, jsonMode: true, quiet: true, catchUp: true, includeFrontmatter: true,
+  }));
+}
 
 // Known, reviewed op-wide exemptions. An entry here exempts the WHOLE op
 // from the sentinel assertion (the substring check cannot do field-level).
@@ -122,7 +134,7 @@ type Shape = 'scalar' | 'federated';
  * calls without one (missing_source_scope, dispatch.ts) exactly like the
  * shipped HTTP transport, which always resolves a scalar default.
  */
-async function sweepCall(name: string, params: Record<string, unknown>, shape: Shape) {
+async function sweepCall(name: string, params: Record<string, unknown>, shape: Shape, subjectIds?: string[]) {
   return withEnv({ GBRAIN_HOME: home }, async () => {
   const response = await dispatchToolCall(engine, name, params, {
     remote: true,
@@ -130,7 +142,7 @@ async function sweepCall(name: string, params: Record<string, unknown>, shape: S
     takesHoldersAllowList: ['world'],
     sourceId: 'default',
     metaHook: getBrainHotMemoryMeta,
-    ...(shape === 'federated'
+    ...(shape === 'federated' || subjectIds !== undefined
       ? {
           auth: {
             token: 'test-token',
@@ -138,7 +150,8 @@ async function sweepCall(name: string, params: Record<string, unknown>, shape: S
             principal: { kind: 'oauth_client', id: 'gbrain_cl_privacy_read' },
             sourceId: 'default',
             scopes: ['read'],
-            allowedSources: ['default', SRC2],
+            allowedSources: shape === 'federated' ? ['default', SRC2] : ['default'],
+            ...(subjectIds === undefined ? {} : { subjectIds }),
           },
         }
       : {}),
@@ -517,6 +530,8 @@ type: person
 # WorldSweep
 
 ${WORLD.pageBody}
+
+See [[${WANTED_WORLD}]].
 `,
   });
   // 3. Private page — title AND body carry sentinels (the TITLE sentinel
@@ -532,6 +547,10 @@ visibility: private
 # ${PRIV.pageTitle}
 
 ${PRIV.pageBody}
+
+See [[${WANTED_PRIVATE}]].
+
+WORLDSWEEP searchable canary
 `,
   });
   // 4. Facts hot memory: one world, one private (also feeds the
@@ -581,7 +600,9 @@ visibility: private
 
 # ${PRIV.src2Title}
 
-private source-2 body
+private source-2 body WORLDSWEEP searchable canary
+
+See [[${WANTED_PRIVATE_SRC2}]].
 `,
   });
   await remember.handler(localCtx(SRC2), {
@@ -606,6 +627,7 @@ type: person
 world source-2 body
 `,
   });
+  await prepareReadInventories();
   await disposePersistenceConsumer(engine);
   });
 }, 120_000);
@@ -646,6 +668,12 @@ async function runCase(opName: string, shape: Shape) {
   const res = await sweepCall(opName, params, shape);
   const serialized = JSON.stringify(res);
   assertNoPrivateSentinel(opName, serialized);
+  if (opName === 'wanted_pages') {
+    expect(res.isError ?? false).toBe(false);
+    expect(serialized).toContain(WANTED_WORLD);
+    expect(serialized).not.toContain(WANTED_PRIVATE);
+    expect(serialized).not.toContain(WANTED_PRIVATE_SRC2);
+  }
   // The federated fixture deliberately holds READ authority only. A read
   // federation grant cannot authorize writes or receipt administration.
   const readOnlyRefusal = shape === 'federated' && COORDINATED_WRITES.has(opName);
@@ -742,10 +770,76 @@ describe('phase R — non-mutating ops leak no private sentinel', () => {
   });
 });
 
+// ── Phase ACL: world visibility with a restrictive page ACL ─────────────
+// The private-visibility filter cannot hide these canaries: only the page ACL
+// may exclude them. Public pages retain the existing corpus-contact controls.
+// Reuse phase R's registry and parameter factories rather than a second list.
+describe('phase ACL — world-visible restricted pages leak no private sentinel', () => {
+  let original: Array<{ id: number; frontmatter: Record<string, unknown>; acl_subject_ids: string[] | null }> = [];
+
+  beforeAll(async () => {
+    original = await engine.executeRaw(`SELECT id,frontmatter,acl_subject_ids FROM pages
+      WHERE slug=$1 AND source_id=ANY($2::text[]) ORDER BY id`, [PRIV_PAGE_SLUG, ['default', SRC2]]);
+    expect(original).toHaveLength(2);
+    await engine.executeRaw(`UPDATE pages SET frontmatter=jsonb_set(frontmatter,'{visibility}','"world"'),
+      acl_subject_ids=ARRAY['user:director']::text[],updated_at=clock_timestamp() WHERE id=ANY($1::int[])`, [original.map(page => page.id)]);
+    await prepareReadInventories();
+  });
+
+  afterAll(async () => {
+    for (const page of original) {
+      await engine.executeRaw('UPDATE pages SET frontmatter=$2::jsonb,acl_subject_ids=$3::text[],updated_at=clock_timestamp() WHERE id=$1',
+        [page.id, JSON.stringify(page.frontmatter), page.acl_subject_ids]);
+    }
+    await prepareReadInventories();
+  });
+
+  it('authorized director sees the canaries and an unprivileged reader cannot', async () => {
+    for (const shape of ['scalar', 'federated'] as const) {
+      const authorized = await sweepCall('get_page', { slug: PRIV_PAGE_SLUG, source_id: 'default', include_content: true }, shape, ['user:director']);
+      if (authorized.isError) throw new Error(`ACL positive control failed [${shape}]: ${JSON.stringify(authorized)}`);
+      expect(JSON.stringify(authorized)).toContain(PRIV.pageBody);
+      const wanted = await sweepCall('wanted_pages', {}, shape, ['user:director']);
+      if (wanted.isError) throw new Error(`ACL wanted positive control failed [${shape}]: ${JSON.stringify(wanted)}`);
+      expect(JSON.stringify(wanted)).toContain(WANTED_WORLD);
+      expect(JSON.stringify(wanted)).toContain(WANTED_PRIVATE);
+      if (shape === 'federated') expect(JSON.stringify(wanted)).toContain(WANTED_PRIVATE_SRC2);
+      const denied = await sweepCall('get_page', { slug: PRIV_PAGE_SLUG, source_id: 'default', include_content: true }, shape);
+      assertNoPrivateSentinel('get_page', JSON.stringify(denied));
+    }
+    const authorizedFederation = await sweepCall('list_pages', {}, 'federated', ['user:director']);
+    expect(JSON.stringify(authorizedFederation)).toContain(PRIV.src2Title);
+  });
+
+  for (const op of phaseR) {
+    for (const shape of ['scalar', 'federated'] as const) {
+      it(`${op.name} [${shape}]`, async () => {
+        await runCase(op.name, shape);
+        // Targeted reads also address the denied page. Query/list operations
+        // already sweep both public and canary pages through their usual params.
+        const originalParams = PARAM_FACTORY[op.name] ?? {};
+        const serializedParams = JSON.stringify(originalParams);
+        const restrictedParams = serializedParams
+          .replaceAll(WORLD_FENCE_SLUG, PRIV_PAGE_SLUG)
+          .replaceAll(WORLD_PAGE_SLUG, PRIV_PAGE_SLUG)
+          .replaceAll('world-page', 'priv-page');
+        if (restrictedParams !== serializedParams) {
+          const denied = await sweepCall(op.name, JSON.parse(restrictedParams), shape);
+          assertNoPrivateSentinel(op.name, JSON.stringify(denied));
+        }
+      }, CASE_TIMEOUT_MS);
+    }
+  }
+});
+
 // ── Phase W: mutating ops (fresh-slug targets), destructive last ─────────
 describe('phase W — mutating ops leak no private sentinel in response envelopes', () => {
   it('corpus intact at start of phase W', async () => {
     await assertCorpusIntact('start of phase W');
+    const restored = await engine.executeRaw<{ visibility: string; acl_subject_ids: string[] | null }>(
+      "SELECT frontmatter->>'visibility' AS visibility,acl_subject_ids FROM pages WHERE slug=$1", [PRIV_PAGE_SLUG]);
+    expect(restored).toHaveLength(2);
+    expect(restored.every(page => page.visibility === 'private' && page.acl_subject_ids === null)).toBe(true);
   });
 
   for (const op of phaseW) {

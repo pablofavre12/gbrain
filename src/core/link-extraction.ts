@@ -12,7 +12,8 @@
  */
 
 import type { BrainEngine, LinkBatchInput } from './engine.ts';
-import type { PageType, EffectiveDateSource } from './types.ts';
+import { pageReadFilter } from './search/read-policy-sql.ts';
+import type { PageType, EffectiveDateSource, PageReadScope } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
 import { stripCodeBlocks } from './markdown-code.ts';
 import { targetTakesVerb } from './link-target-roles.ts';
@@ -22,8 +23,8 @@ import { isValidSourceId } from './source-id.ts';
 import { isDatedTimelineLine, parseInlineCitationTimelineEntries, TIMELINE_LINE_RE, TIMELINE_LINE_RE_CN } from './timeline-citations.ts';
 import { isMaterializedMarkerLine } from './timeline-marker.ts';
 import { slugifyPath, slugifySegment } from './sync.ts';
-import { SLUG_WORD_CHARS, SLUG_VARIATION_SELECTORS_RE } from './cjk.ts';
-import { foldNonDecomposingLatin } from './latin-fold.ts';
+import { normalizeBasename, buildBasenameIndex, queryBasenameIndex } from './link-basename.ts';
+export { normalizeBasename, buildBasenameIndex, queryBasenameIndex } from './link-basename.ts';
 import { isIdentityEntity, sameEntityName } from './entities/resolve.ts';
 // #3190: pack-aware link typing. link-inference imports only manifest-v1
 // (zod) + redos-guard (node:vm) — no cycle back into this module.
@@ -101,7 +102,7 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
 // 2026-10-05T03: typed relation lines (core/line-grammar.ts) state their link's type; a per-edge verb that
 // belongs to another link in the window no longer types this one; "joined [X] as <role>" reads as works_at.
 // 2026-10-08: held-out-confirmed Q2 units U1, U3, U4 (core/link-typing-units.ts). Re-extract so pages pick these up.
-export const LINK_EXTRACTOR_VERSION_TS = '2026-10-08T00:00:00Z';
+export const LINK_EXTRACTOR_VERSION_TS = '2026-10-15T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -664,15 +665,18 @@ export interface ExtractPageLinksOptions {
   lineGrammar?: { enabled?: boolean; allowUndeclaredTypes?: boolean };
   targetType?: (slug: string, sourceId?: string) => string | undefined;
   onResolvedFrontmatterTarget?: (slug: string) => void;
+  /** Preserve authored references even when frontmatter edges are disabled. */
+  collectAuthoredReferences?: boolean;
   /** Receives every body-link typing decision with its reasons (explainLinkType, development reports). */
   explain?: (e: LinkTypeExplanation) => void;
 }
 
 /** The authored reference of a wikilink at `idx`: a slug path, or a bare name keyed by its basename. */
 function wikilinkAuthoredRef(target: string, idx: number): AuthoredRef | undefined {
-  if (target.includes('/')) return { key: `ref:${idx}`, kind: 'slug', target };
+  const resolution = { name: target, body: true as const };
+  if (target.includes('/')) return { key: `ref:${idx}`, kind: 'slug', target, resolution };
   const name = normalizeBasename(target);
-  return name ? { key: `ref:${idx}`, kind: 'name', target: name } : undefined;
+  return name ? { key: `ref:${idx}`, kind: 'name', target: name, resolution } : undefined;
 }
 
 /** One authored body reference, as recorded in `wanted_links` when it does not resolve. */
@@ -681,6 +685,7 @@ export interface AuthoredRef {
   kind: 'slug' | 'name';
   target: string;
   targetSourceId?: string;
+  resolution?: { name: string; body: true; globalBasename?: boolean };
 }
 
 /** One explained typing decision for a body link occurrence (explainLinkType, ExtractPageLinksOptions.explain). */
@@ -769,6 +774,8 @@ function makeTypeFor(content: string, pageType: PageType, opts: ExtractPageLinks
  */
 export interface PageLinksResult {
   candidates: LinkCandidate[];
+  authoredCandidates?: LinkCandidate[];
+  frontmatterReferences?: AuthoredFrontmatterRef[];
   unresolved: UnresolvedFrontmatterRef[];
   attendanceComplete: boolean;
 }
@@ -854,7 +861,7 @@ export async function extractPageLinks(
           ...typeFor(litContext, ref.slug, litIdx),
           context: litContext,
           linkSource: 'markdown',
-          authoredRef: { key: `ref:${litIdx}`, kind: 'slug', target: ref.slug },
+          authoredRef: wikilinkAuthoredRef(ref.slug, litIdx),
         });
       }
       // #4062: a bare `[[name]]` (no slash) gets a direct verb-typed
@@ -1003,16 +1010,29 @@ export async function extractPageLinks(
   // path needed `resolveBasenameMatches` on the real resolver.
   let fmUnresolved: UnresolvedFrontmatterRef[] = [];
   let frontmatterAttendanceComplete = true;
-  if (!opts.skipFrontmatter) {
+  let frontmatterReferences: AuthoredFrontmatterRef[] = [];
+  if (!opts.skipFrontmatter || opts.collectAuthoredReferences) {
     const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver, opts.globalBasename, pack, opts.targetType,
       opts.onResolvedFrontmatterTarget);
-    candidates.push(...fm.candidates);
-    fmUnresolved = fm.unresolved;
-    frontmatterAttendanceComplete = fm.attendanceComplete;
+    frontmatterReferences = fm.authoredReferences;
+    if (!opts.skipFrontmatter) {
+      candidates.push(...fm.candidates);
+      fmUnresolved = fm.unresolved;
+      frontmatterAttendanceComplete = fm.attendanceComplete;
+    }
   }
 
+  // Authored evidence depends on origin syntax, never target existence, type or ambiguity.
+  // Reuse the parser with no target corpus; retain the real resolver options as input.
+  const authoredCandidates = opts.collectAuthoredReferences
+    ? (await extractPageLinks(slug, content, {}, pageType, { resolve: async () => null },
+      { ...opts, collectAuthoredReferences: false, skipFrontmatter: true, globalBasename: false, targetType: () => undefined, explain: undefined }))
+      .candidates.filter(c => c.authoredRef).map(c => ({ ...c, authoredRef: { ...c.authoredRef!,
+        ...(c.authoredRef!.resolution ? { resolution: { ...c.authoredRef!.resolution, globalBasename: !!opts.globalBasename } } : {}) } }))
+    : undefined;
   const result = dedupeCandidates(candidates);
   return { candidates: result, unresolved: fmUnresolved,
+    ...(opts.collectAuthoredReferences ? { authoredCandidates, frontmatterReferences } : {}),
     attendanceComplete: [...attendancePending].every(index => attendanceResolved.has(index) && !attendanceAmbiguous.has(index))
       && frontmatterAttendanceComplete };
 }
@@ -1612,65 +1632,6 @@ export interface SlugResolver {
 }
 
 /**
- * Issue #972 (codex [P2] DRY): the ONE basename matcher. makeResolver, the
- * FS resolver, and the doctor `link_resolution_opportunity` check all
- * build/query through these two functions so they cannot drift.
- *
- * Keying: raw tail + lowercase tail + slugified tail (the final `/`-segment,
- * or the whole slug when it has no `/`). #2367: slugified keys follow
- * slugifySegment (NFD → strip accents → NFC → lowercase → SLUG_WORD_CHARS
- * filter) and then fold stroke letters through latin-fold (#4855), so for
- * names with đ/ø/ł/ß… the key is NOT byte-identical to the page slug sync
- * mints; the dir-hint candidate step (makeResolver step 2, the FS resolver)
- * tries both forms. The old ASCII-only strip emptied CJK basenames.
- */
-const BASENAME_KEEP_RE = new RegExp(`[^${SLUG_WORD_CHARS}\\s\\-]`, 'gu');
-export function normalizeBasename(s: string): string {
-  // The accent strip cannot fold stroke letters \u2014 Unicode gives them no
-  // decomposition \u2014 so the shared table runs after it, on both the index and
-  // the query side. Without it a display name keeps the unfolded letter while
-  // the ASCII page slug does not, and the lookup misses in silence:
-  // `[[\u0110\u1ee9c Example]]` keyed `\u0111uc-example` and never found `people/duc-example`.
-  const folded = foldNonDecomposingLatin(
-    s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
-      .replace(SLUG_VARIATION_SELECTORS_RE, '').toLowerCase(), // twin of slugifySegment's strip (#4985)
-  );
-  return folded.replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-}
-
-/** Stable order: shorter slug first (likely closer to brain root), then lexical. */
-function basenameSort(a: string, b: string): number {
-  return (a.length - b.length) || a.localeCompare(b);
-}
-
-/** Build a `key → slug[]` index over a slug collection, or add the slugs to `idx`. Keys: raw/lower/slugified tail. */
-export function buildBasenameIndex(slugs: Iterable<string>, idx = new Map<string, string[]>()): Map<string, string[]> {
-  const addKey = (key: string, slug: string) => {
-    const existing = idx.get(key);
-    if (existing) { if (!existing.includes(slug)) existing.push(slug); }
-    else idx.set(key, [slug]);
-  };
-  for (const slug of slugs) {
-    const tail = slug.includes('/') ? slug.slice(slug.lastIndexOf('/') + 1) : slug;
-    addKey(tail, slug);
-    const lower = tail.toLowerCase();
-    if (lower !== tail) addKey(lower, slug);
-    const slugified = normalizeBasename(tail);
-    if (slugified && slugified !== tail && slugified !== lower) addKey(slugified, slug);
-  }
-  return idx;
-}
-
-/** Look a name up in a basename index (raw → lower → slugified), stable-sorted. */
-export function queryBasenameIndex(idx: Map<string, string[]>, name: string): string[] {
-  if (!name || typeof name !== 'string') return [];
-  const trimmed = name.trim();
-  if (!trimmed) return [];
-  const hit = idx.get(trimmed) ?? idx.get(trimmed.toLowerCase()) ?? idx.get(normalizeBasename(trimmed));
-  return hit ? [...hit].sort(basenameSort) : [];
-}
-
-/**
  * Create a resolver scoped to a single extract run or single put_page call.
  *
  * mode: 'batch' (migration / gbrain extract) — pg_trgm only, NO search
@@ -1686,9 +1647,14 @@ export function queryBasenameIndex(idx: Map<string, string[]>, name: string): st
  * Callers never need to dedupe names themselves.
  */
 export function makeResolver(
-  engine: BrainEngine,
-  opts: { mode: 'batch' | 'live'; sourceId?: string; basenameIndex?: () => Promise<Map<string, string[]>> } = { mode: 'live' },
+  engine: Pick<BrainEngine, 'executeRaw' | 'getAllSlugs' | 'getPage' | 'resolveSlugWithAlias' | 'findByTitleFuzzy' | 'searchKeyword'>,
+  opts: { mode: 'batch' | 'live'; sourceId?: string; readScope?: PageReadScope; basenameIndex?: () => Promise<Map<string, string[]>> } = { mode: 'live' },
 ): SlugResolver {
+  if (opts.readScope && opts.sourceId && (opts.readScope.sourceIds?.length
+    ? !opts.readScope.sourceIds.includes(opts.sourceId) : opts.readScope.sourceId && opts.readScope.sourceId !== opts.sourceId)) {
+    return { resolve: async () => null, resolveAttendance: async () => null, resolveBasenameMatches: async () => [] };
+  }
+  const pageScope = opts.readScope ? { ...opts.readScope, ...(opts.sourceId ? { sourceId: opts.sourceId, sourceIds: [opts.sourceId] } : {}) } : opts.sourceId ? { sourceId: opts.sourceId } : undefined;
   const cache = new Map<string, string | null>();
   const basenameMatches = new Map<string, string[]>();
   const attendanceCache = new Map<string, string | null>();
@@ -1719,7 +1685,10 @@ export function makeResolver(
       // spanning unrelated sources — a bare [[name]] must NOT resolve to a
       // same-tail page in a DIFFERENT source and create a cross-source edge.
       // #972 is "global basename across folders," not "cross-source federation."
-      const all = await engine.getAllSlugs(opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+      const params: unknown[] = [];
+      const all = opts.readScope
+        ? new Set((await engine.executeRaw<{ slug: string }>(`SELECT p.slug FROM pages p WHERE ${pageReadFilter('p', pageScope, params, true)}`, params)).map(p => p.slug))
+        : await engine.getAllSlugs(opts.sourceId ? { sourceId: opts.sourceId } : undefined);
       // Issue #972 (codex [P2] DRY): one shared index builder for all surfaces.
       basenameIndex = buildBasenameIndex(all);
       return basenameIndex;
@@ -1744,12 +1713,13 @@ export function makeResolver(
       if (attendanceCache.has(cacheKey)) return attendanceCache.get(cacheKey)!;
       const slugs = value.includes('/') ? [value] : [...new Set(hints.flatMap(hint =>
         [normalizeBasename(value), slugifySegment(value)].map(form => `${hint}/${form}`)))];
+      const params: unknown[] = [opts.sourceId ?? 'default', slugs, value];
+      const policy = opts.readScope ? `AND ${pageReadFilter('pages', pageScope, params, true)}` : '';
       const matches = await engine.executeRaw<{ slug: string }>(`SELECT slug FROM pages
         WHERE source_id=$1 AND deleted_at IS NULL AND type='person'
           AND (slug=ANY($2::text[]) OR lower(title)=lower($3)
             OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(frontmatter->'aliases')='array'
-              THEN frontmatter->'aliases' ELSE '[]'::jsonb END) alias WHERE lower(alias)=lower($3))) LIMIT 2`,
-      [opts.sourceId ?? 'default', slugs, value]);
+              THEN frontmatter->'aliases' ELSE '[]'::jsonb END) alias WHERE lower(alias)=lower($3))) ${policy} LIMIT 2`, params);
       const resolved = matches.length === 1 ? matches[0].slug : null;
       if (attendanceCache.size >= attendanceCacheLimit) attendanceCache.clear();
       attendanceCache.set(cacheKey, resolved);
@@ -1787,7 +1757,7 @@ export function makeResolver(
       if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed)) {
         // Same source scope as the basename index above (#972): a wikilink in
         // source A must not resolve to a same-slug page in source B.
-        const page = await engine.getPage(trimmed, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
+        const page = await engine.getPage(trimmed, pageScope); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
         if (page) {
           cache.set(cacheKey, trimmed);
           return trimmed;
@@ -1796,7 +1766,7 @@ export function makeResolver(
         // against the old slug keep resolving to the page that moved.
         if (typeof engine.resolveSlugWithAlias === 'function') {
           const canonical = await engine.resolveSlugWithAlias(trimmed, opts.sourceId ?? 'default');
-          if (canonical !== trimmed && await engine.getPage(canonical, { sourceId: opts.sourceId ?? 'default' })) {
+          if (canonical !== trimmed && await engine.getPage(canonical, pageScope ?? { sourceId: opts.sourceId ?? 'default' })) {
             cache.set(cacheKey, canonical);
             return canonical;
           }
@@ -1813,7 +1783,7 @@ export function makeResolver(
         if (!hint) continue;
         for (const form of forms) {
           const candidate = `${hint}/${form}`;
-          const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
+          const page = await engine.getPage(candidate, pageScope); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
           if (page) {
             cache.set(cacheKey, candidate);
             return candidate;
@@ -1847,11 +1817,11 @@ export function makeResolver(
       // links to a different person's page and stays unresolved instead.
       const searchHints = hints.length > 0 ? hints : [undefined];
       const confident = async (slug: string): Promise<boolean> => {
-        const page = await engine.getPage(slug, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only confidence check on a candidate the fuzzy lookup just returned
+        const page = await engine.getPage(slug, pageScope); // gbrain-allow-unscoped-getpage: read-only confidence check on a candidate the fuzzy lookup just returned
         return !!page && (!isIdentityEntity(slug, page.type) || sameEntityName(trimmed, page.title, slug));
       };
       for (const hint of searchHints) {
-        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55, opts.sourceId);
+        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55, opts.sourceId, pageScope && opts.readScope ? pageScope : undefined);
         if (match && await confident(match.slug)) {
           cache.set(cacheKey, match.slug);
           return match.slug;
@@ -1863,7 +1833,7 @@ export function makeResolver(
       // mode skips this step entirely to keep migration deterministic.
       if (opts.mode === 'live') {
         try {
-          const results = await engine.searchKeyword(trimmed, { limit: 3, ...(opts.sourceId ? { sourceId: opts.sourceId } : {}) });
+          const results = await engine.searchKeyword(trimmed, { ...pageScope, limit: 3 });
           if (results.length > 0 && results[0].score >= 0.8) {
             // Filter by dir hint if provided.
             const top = hints.length > 0
@@ -1913,7 +1883,19 @@ export interface UnresolvedFrontmatterRef {
   reason?: 'target_type_mismatch';
 }
 
+export interface AuthoredFrontmatterRef {
+  dirHint: string | string[];
+  globalBasename: boolean;
+  canonicalAttendance: boolean;
+  field: string;
+  name: string;
+  linkType: string;
+  resolvedSlug?: string;
+  reason?: 'target_type_mismatch';
+}
+
 export interface FrontmatterExtractResult {
+  authoredReferences: AuthoredFrontmatterRef[];
   candidates: LinkCandidate[];
   unresolved: UnresolvedFrontmatterRef[];
   attendanceComplete: boolean;
@@ -1939,6 +1921,7 @@ export async function extractFrontmatterLinks(
 ): Promise<FrontmatterExtractResult> {
   const candidates: LinkCandidate[] = [];
   const unresolved: UnresolvedFrontmatterRef[] = [];
+  const authoredReferences: AuthoredFrontmatterRef[] = [];
   let attendanceComplete = true;
 
   const packMappings: FrontmatterFieldMapping[] = [];
@@ -1998,6 +1981,9 @@ export async function extractFrontmatterLinks(
         // unwrapping to the bare target before resolution. Bare titles pass
         // through unchanged; the original `name` is preserved for the
         // unresolved report and edge context.
+        const authored: AuthoredFrontmatterRef = { field, name, linkType: mapping.type, dirHint: mapping.dirHint,
+          globalBasename, canonicalAttendance: mapping.type === 'attended' && mapping.direction === 'incoming' };
+        authoredReferences.push(authored);
         const linkTarget = unwrapWikilink(name);
         const canonicalAttendance = mapping.type === 'attended' && mapping.direction === 'incoming';
         let resolved = await (canonicalAttendance && resolver.resolveAttendance
@@ -2024,12 +2010,14 @@ export async function extractFrontmatterLinks(
           unresolved.push({ field, name });
           continue;
         }
+        authored.resolvedSlug = resolved;
         onResolvedTarget?.(resolved);
         const packTargetType = packMappings.includes(mapping)
           ? pack?.link_types.find(lt => lt.name === mapping.type)?.inference?.target_type : undefined;
         const expectedType = canonicalAttendance ? 'person' : packTargetType;
         if (expectedType && (targetType || packTargetType) && targetType?.(resolved) !== expectedType) {
           if (targetType?.(resolved) === undefined && mapping.type === 'attended') attendanceComplete = false;
+          authored.reason = 'target_type_mismatch';
           unresolved.push({ field, name, reason: 'target_type_mismatch' });
           continue;
         }
@@ -2054,7 +2042,7 @@ export async function extractFrontmatterLinks(
     }
   }
 
-  return { candidates, unresolved, attendanceComplete };
+  return { candidates, unresolved, attendanceComplete, authoredReferences };
 }
 
 // ─── Timeline parsing ───────────────────────────────────────────

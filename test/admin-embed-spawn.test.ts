@@ -163,6 +163,26 @@ describe('admin embed E2E — /admin served from embedded manifest (v0.36.1.x #1
     // Content-Type is text/html, not application/octet-stream (which would
     // mean the mime lookup in ADMIN_ASSETS regressed).
     expect(res.headers.get('content-type') ?? '').toMatch(/text\/html/);
+
+    const modules = [...html.matchAll(/<script\b(?=[^>]*\btype="module")[^>]*\bsrc="([^"]+)"/g)].map(match => match[1]!);
+    const styles = [...html.matchAll(/<link\b(?=[^>]*\brel="stylesheet")[^>]*\bhref="([^"]+)"/g)]
+      .map(match => match[1]!).filter(href => href.startsWith('/admin/'));
+    expect(modules.length).toBeGreaterThan(0);
+    expect(styles.length).toBeGreaterThan(0);
+    for (const [paths, mime] of [[modules, /^(?:application|text)\/javascript\b/], [styles, /^text\/css\b/]] as const) {
+      for (const path of paths) {
+        expect(path).toStartWith('/admin/');
+        const asset = await fetch(`http://127.0.0.1:${server.port}${path}`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        expect(asset.status).toBe(200);
+        expect(asset.headers.get('content-type') ?? '').toMatch(mime);
+        const body = await asset.text();
+        expect(body.trim().length).toBeGreaterThan(0);
+        expect(body).not.toBe(html);
+        expect(body).not.toMatch(/^\s*(?:<!doctype html|<html\b)/i);
+      }
+    }
   }, 90_000);
 
   test('GET /admin (no trailing slash) redirects to /admin/', async () => {

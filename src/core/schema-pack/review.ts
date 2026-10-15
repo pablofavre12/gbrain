@@ -11,6 +11,8 @@
 // current brain state" so users understand what they're reviewing.
 
 import type { BrainEngine } from '../engine.ts';
+import type { PageReadScope } from '../types.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
 import { runDetect } from './detect.ts';
 import { loadActivePack, loadActivePackForEngine } from './load-active.ts';
 import { loadActivePackForLocalEngine } from './best-effort.ts';
@@ -136,20 +138,13 @@ export interface TypeOrphansResult {
 export async function findTypeOrphans(
   engine: BrainEngine,
   manifest: (TypeUsagePack & { name: string }) | null,
-  scope: { sourceId?: string; sourceIds?: string[] },
+  scope: PageReadScope,
   limit: number,
 ): Promise<TypeOrphansResult> {
   const params: unknown[] = [];
-  let where = 'deleted_at IS NULL';
-  if (scope.sourceIds && scope.sourceIds.length > 0) {
-    params.push(scope.sourceIds);
-    where += ` AND source_id = ANY($${params.length}::text[])`;
-  } else if (scope.sourceId) {
-    params.push(scope.sourceId);
-    where += ` AND source_id = $${params.length}`;
-  }
+  const where = pageReadFilter('p', scope, params, true);
   const typeRows = await engine.executeRaw<{ type: string | null; n: string }>(
-    `SELECT type, count(*)::text AS n FROM pages WHERE ${where} GROUP BY type`,
+    `SELECT type, count(*)::text AS n FROM pages p WHERE ${where} GROUP BY type`,
     params,
   );
   const missing = typeRows.filter((r) => (manifest ? storedTypeMissesPack(r.type, manifest) : !r.type));
@@ -163,7 +158,7 @@ export async function findTypeOrphans(
   }
   const rowLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 100;
   const rows = await engine.executeRaw<{ slug: string; source_id: string; type: string | null }>(
-    `SELECT slug, COALESCE(source_id, 'default') AS source_id, type FROM pages
+    `SELECT slug, COALESCE(source_id, 'default') AS source_id, type FROM pages p
       WHERE ${where} AND (type IS NULL OR type = '' OR type = ANY($${params.length + 1}::text[]))
       ORDER BY source_id, slug
       LIMIT ${rowLimit}`,

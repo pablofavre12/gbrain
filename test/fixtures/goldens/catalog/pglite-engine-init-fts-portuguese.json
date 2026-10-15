@@ -6,6 +6,10 @@
       "access_tokens.access_tokens_source_grant_check": "c CHECK ((source_grant = ANY (ARRAY['default'::text, 'scalar'::text, 'federated'::text, 'none'::text])))",
       "access_tokens.access_tokens_token_hash_key": "u UNIQUE (token_hash)",
       "access_tokens.trust_generation_update": "t TRIGGER DEFERRABLE INITIALLY DEFERRED",
+      "authored_link_inventories.authored_link_inventories_origin_page_id_fkey": "f FOREIGN KEY (origin_page_id) REFERENCES pages(id) ON DELETE CASCADE",
+      "authored_link_inventories.authored_link_inventories_pkey": "p PRIMARY KEY (origin_page_id)",
+      "authored_link_inventories.authored_link_inventories_refs_check": "c CHECK ((jsonb_typeof(refs) = 'array'::text))",
+      "authored_link_inventories.authored_link_inventories_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "budget_ledger.budget_ledger_pkey": "p PRIMARY KEY (scope, resolver_id, local_date)",
       "budget_reservations.budget_reservations_pkey": "p PRIMARY KEY (reservation_id)",
       "calibration_profiles.calibration_profiles_pkey": "p PRIMARY KEY (id)",
@@ -480,6 +484,9 @@
       "access_tokens": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "authored_link_inventories": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "budget_ledger": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -892,6 +899,8 @@
     "indexes": {
       "access_tokens_pkey": "CREATE UNIQUE INDEX access_tokens_pkey ON public.access_tokens USING btree (id)",
       "access_tokens_token_hash_key": "CREATE UNIQUE INDEX access_tokens_token_hash_key ON public.access_tokens USING btree (token_hash)",
+      "authored_link_inventories_pkey": "CREATE UNIQUE INDEX authored_link_inventories_pkey ON public.authored_link_inventories USING btree (origin_page_id)",
+      "authored_link_inventories_source_idx": "CREATE INDEX authored_link_inventories_source_idx ON public.authored_link_inventories USING btree (source_id)",
       "budget_ledger_pkey": "CREATE UNIQUE INDEX budget_ledger_pkey ON public.budget_ledger USING btree (scope, resolver_id, local_date)",
       "budget_reservations_pkey": "CREATE UNIQUE INDEX budget_reservations_pkey ON public.budget_reservations USING btree (reservation_id)",
       "calibration_profiles_bias_tags_gin": "CREATE INDEX calibration_profiles_bias_tags_gin ON public.calibration_profiles USING gin (active_bias_tags)",
@@ -1389,6 +1398,16 @@
           "15 min_trust text/text NULL"
         ],
         "flags": "relkind=r rls=false force_rls=false"
+      },
+      "authored_link_inventories": {
+        "columns": [
+          "1 origin_page_id integer/int4 NOT NULL",
+          "2 source_id text/text NOT NULL",
+          "3 origin_revision uuid/uuid NOT NULL",
+          "4 refs jsonb/jsonb NOT NULL",
+          "5 checked_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=true force_rls=false"
       },
       "budget_ledger": {
         "columns": [

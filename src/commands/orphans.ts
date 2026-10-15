@@ -131,9 +131,6 @@ export async function findOrphans(
   // clients) or `sourceIds` (federated, from `allowedSources` MCP clients)
   // scopes the candidate set. `sourceIds` wins when both set (mirrors
   // sourceScopeOpts precedence).
-  const sourceId = opts.sourceId;
-  const sourceIds =
-    opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
   // The NOT EXISTS anti-join over pages × links can take seconds on 50K-page
   // brains. Heartbeat every second so agents see the scan is alive. Keyset
   // pagination was considered and rejected: without an index on
@@ -150,11 +147,8 @@ export async function findOrphans(
   const isConnectorRender = (row: { type?: string | null; source_id?: string }) =>
     !!row.source_id && connectorSources.has(row.source_id) && !!row.type && CONNECTOR_RENDER_TYPES.has(row.type);
   try {
-    allOrphans = await engine.findOrphanPages({
-      excludePrivate: opts.excludePrivate,
-      ...(sourceIds ? { sourceIds } : sourceId ? { sourceId } : {}),
-      ...(opts.mode ? { mode: opts.mode } : {}),
-    });
+    // Candidates and totals must use the same complete reader policy.
+    allOrphans = await engine.findOrphanPages(opts);
     // v0.41.29.0 (Codex F6): correct the `total_linkable` denominator.
     // Enumerate ALL live pages (scoped) and count excluded-by-slug across
     // the WHOLE set — not just among orphans. The old

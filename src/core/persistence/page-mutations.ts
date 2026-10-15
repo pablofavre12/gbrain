@@ -1,3 +1,4 @@
+import type { TimelinePublicationGuard } from './timeline-publication-guard.ts';
 import { randomUUID } from 'node:crypto';
 import { pageQuarantinedNotice } from '../quarantine.ts';
 import { fenceNormalizedNotice, type FencesNormalized } from '../fence-repair/report.ts';
@@ -200,7 +201,7 @@ const OWNER_FILE_INTENTS: ReadonlySet<string> = new Set(['managed_file_import', 
 export interface PageBatchMember { id: string; index: number; size: number; requestId: string; repeats?: number[] }
 
 export async function submitPageMutation(ctx: OperationContext,
-  input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection }): Promise<Record<string, unknown>> {
+  input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection; timelinePublicationGuard?: TimelinePublicationGuard }): Promise<Record<string, unknown>> {
   assertPersistenceAccepting(ctx.engine);
   // #6007: wait_ms is a reply deadline from arrival, never part of the write's identity.
   const arrived = performance.now();
@@ -236,7 +237,7 @@ export async function submitPageMutation(ctx: OperationContext,
  * the admission to submit. `put_pages` admits several of these together.
  */
 export async function preparePageAdmission(ctx: OperationContext,
-  input: { operation: string; params: Record<string, unknown>; managedFileImport?: true; batch?: PageBatchMember; timelineSection?: TimelineSection }
+  input: { operation: string; params: Record<string, unknown>; managedFileImport?: true; batch?: PageBatchMember; timelineSection?: TimelineSection; timelinePublicationGuard?: TimelinePublicationGuard }
 ): Promise<{ prior: WriteRequest; admission?: undefined; typeWarning?: undefined; slugAdvisory?: undefined } | { prior?: undefined; admission: WriteAdmission; typeWarning: PageTypeWarning | null; slugAdvisory: string | null }> {
   if (input.operation === 'put_page' && ['kind', 'preview', 'backup_reference'].some(key => Object.hasOwn(input.params, key))) {
     if (ctx.remote !== false || input.managedFileImport !== true || !OWNER_FILE_INTENTS.has(String(input.params.kind)) ||
@@ -250,8 +251,15 @@ export async function preparePageAdmission(ctx: OperationContext,
     throw new OperationError('invalid_params', 'fence_repair is reserved for the trusted fence repair.',
       'Drop fence_repair and submit the page without it; gbrain repair fences records its own receipt on the brain host. To fix a malformed facts or takes fence, correct it in content (or write facts with remember and takes with takes_add); a held file is repaired by the brain host operator with gbrain repair fences, so ask the user to run it.');
   }
-  const { page_batch: _forged, timeline_section: _section, ...params } = input.params;
+  if (Object.hasOwn(input.params, 'timeline_publication_guard') && !input.timelinePublicationGuard) {
+    throw new OperationError('invalid_params', 'Stored inference provenance cannot be resubmitted as caller parameters.', 'Re-run the inference to capture current publication evidence.');
+  }
+  const { page_batch: _forged, timeline_section: _section, timeline_publication_guard: _guard, ...params } = input.params;
   const p: Record<string, unknown> = { ...params, ...parseMutationPrecondition(params) };
+  if (input.timelinePublicationGuard) {
+    if (input.operation !== 'add_timeline_entry') throw new OperationError('invalid_params', 'Timeline provenance belongs to a timeline mutation.', 'Submit this inference as add_timeline_entry.');
+    p.timeline_publication_guard = input.timelinePublicationGuard;
+  }
   if (p.content_origin !== undefined) contentOriginTier(p.content_origin);
   if (input.batch) p.page_batch = { id: input.batch.id, index: input.batch.index, size: input.batch.size, ...(input.batch.repeats?.length ? { repeats: input.batch.repeats } : {}) };
   const requestId = input.batch ? input.batch.requestId : typeof p.request_id === 'string' ? p.request_id : randomUUID();

@@ -30,9 +30,10 @@ async function put(slug: string, frontmatter: string, body: string) {
 }
 
 async function liveWorksAt(slug: string, opts: Parameters<typeof relationshipFilterSql>[1] = {}) {
+  const params: unknown[] = [slug];
   const rows = await engine.executeRaw<{ slug: string }>(
     `SELECT DISTINCT t.slug FROM links l JOIN pages f ON f.id = l.from_page_id JOIN pages t ON t.id = l.to_page_id
-      WHERE f.slug = $1 AND l.link_type = 'works_at' AND ${relationshipFilterSql('l', opts)} ORDER BY t.slug`, [slug]);
+      WHERE f.slug = $1 AND l.link_type = 'works_at' AND ${relationshipFilterSql('l', opts, params)} ORDER BY t.slug`, params);
   return rows.map(r => r.slug);
 }
 

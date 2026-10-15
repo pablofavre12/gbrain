@@ -29,6 +29,7 @@ import { trustFields } from '../eligibility/labels.ts';
 import { isQuarantined } from '../quarantine.ts';
 import { loadPageTrust } from '../eligibility/stamp.ts';
 import { loadRelationshipNotes, relationshipNoteKey } from '../link-relationship-notes.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { slugify } from '../entities/resolve.ts';
 import { safeSynopsis } from '../context/retrieval-reflex.ts';
@@ -370,7 +371,7 @@ export async function buildEntityCard(
   if (selected.kind === 'miss') {
     return {
       found: false, suggestions: selected.suggestions,
-      ...(opts.includeReferences ? { coverage: await readMentionCoverage(engine, [sourceId]).catch(() => undefined) } : {}),
+      ...(opts.includeReferences ? { coverage: await readMentionCoverage(engine, [sourceId], { ...scope, sourceId, minTrust: opts.eligibility?.floor, suppressFlagged: opts.eligibility?.suppressFlagged }).catch(() => undefined) } : {}),
     };
   }
 
@@ -404,7 +405,9 @@ async function cardReferences(engine: BrainEngine, sourceId: string, row: CardPa
     const { pack } = await loadLinkableTypes(engine, sourceId);
     const { total, groups } = await readReferrerGroups(engine, { slug: row.slug, sourceId, referrerSources: [sourceId], aclSubjectIds: opts.remote ? opts.aclSubjectIds ?? [] : opts.aclSubjectIds, excludePrivate, pack,
       keepVisibility: opts.remote ? ['world'] : ['private', 'world'], eligibility: opts.eligibility });
-    let coverage = await readMentionCoverage(engine, [sourceId]);
+    let coverage = await readMentionCoverage(engine, [sourceId], { sourceId, excludePrivate,
+      aclSubjectIds: opts.remote ? opts.aclSubjectIds ?? [] : opts.aclSubjectIds,
+      minTrust: opts.eligibility?.floor, suppressFlagged: opts.eligibility?.suppressFlagged });
     if (coverage.state !== 'disabled' && !entityTypes.has(row.type ?? '')) coverage = { ...coverage, state: 'type_not_linkable', degraded: true };
     const referenced_by = groups.map((g): ReferenceGroupView => {
       const rows = g.rows.map(({ source_id: _s, ...rest }) => rest);
@@ -430,13 +433,21 @@ async function assembleCard(
   aclSubjectIds?: string[],
 ): Promise<EntityCard> {
   const pageSlug = row.slug;
+  const readScope = { sourceId, aclSubjectIds, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged };
   const visibility = remote ? (['world'] as ('private' | 'world')[]) : undefined;
   // Facts saved about this entity may sit under a sibling page or the bare subject slug (siblings.ts).
   const factSlugs = await factEntitySlugs(engine, sourceId, pageSlug, { excludePrivate, aclSubjectIds }).catch(() => [pageSlug]);
-  const { privatePagesFilterFragment, privateLinkOriginFilterFragment, privateProvenanceFilterFragment } = await import('../search/private-visibility.ts');
-  const inboundPrivacy = excludePrivate
-    ? ` AND ${privatePagesFilterFragment('f')} AND ${privateLinkOriginFilterFragment('l')}`
-    : '';
+  const { privatePagesFilterFragment, privateProvenanceFilterFragment } = await import('../search/private-visibility.ts');
+  const inboundParams: unknown[] = [pageSlug];
+  const inboundFrom = pageReadFilter('f', readScope, inboundParams, true);
+  const inboundTo = pageReadFilter('t', readScope, inboundParams, true);
+  const inboundOrigin = pageReadFilter('origin', readScope, inboundParams, true);
+  const inboundPolicy = `${inboundFrom} AND ${inboundTo}
+    AND (l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM pages origin
+      WHERE origin.id = l.origin_page_id AND ${inboundOrigin}))`;
+
+  const inboundTemporalParams = [...inboundParams];
+  const inboundTemporalJoin = temporalLinkJoinSql('l', readScope, inboundTemporalParams);
 
   // Parallel depth-1 reads — every arm individually fail-soft so a partial
   // brain (no aliases, no timeline) still returns a card.
@@ -457,19 +468,17 @@ async function assembleCard(
   // links.context sentence, or a count.
   const [aka, outLinks, inEdges, backlinkCount, timeline, facts, activeFactCount] = await Promise.all([
     readAka(engine, sourceId, pageSlug),
-    engine.getLinks(pageSlug, { ...(remote ? { sourceIds: [sourceId] } : { sourceId }), excludePrivate, aclSubjectIds, temporal: { status: 'all' } }).catch(() => []),
+    engine.getLinks(pageSlug, { ...readScope, ...(remote ? { sourceIds: [sourceId] } : {}), temporal: { status: 'all' } }).catch(() => []),
     engine
       .executeRaw<{ from_slug: string; link_type: string; context: string | null }>(
         `SELECT f.slug AS from_slug, l.link_type, l.context${TEMPORAL_LINK_SELECT_SQL}
            FROM links l
            JOIN pages f ON f.id = l.from_page_id
            JOIN pages t ON t.id = l.to_page_id
-           ${temporalLinkJoinSql('l', excludePrivate)}
-          WHERE t.slug = $1 AND t.source_id = $2 AND f.source_id = $2 AND f.deleted_at IS NULL
-            AND COALESCE(l.link_source, '') <> 'mentions'${inboundPrivacy}
-            AND ($3::text[] IS NULL OR f.acl_subject_ids IS NULL OR f.acl_subject_ids && $3::text[])
-            AND ($3::text[] IS NULL OR l.origin_page_id IS NULL OR EXISTS(SELECT 1 FROM pages origin WHERE origin.id=l.origin_page_id AND (origin.acl_subject_ids IS NULL OR origin.acl_subject_ids && $3::text[])))`,
-        [pageSlug, sourceId, aclSubjectIds ?? null],
+           ${inboundTemporalJoin}
+          WHERE t.slug = $1 AND ${inboundPolicy}
+            AND COALESCE(l.link_source, '') <> 'mentions'`,
+        inboundTemporalParams,
       )
       .then(rs => rs.map(r => annotateTemporalRow(r)))
       .catch(() => [] as Array<{ from_slug: string; link_type: string; context: string | null } & TemporalAnnotation>),
@@ -479,11 +488,9 @@ async function assembleCard(
            FROM links l
            JOIN pages f ON f.id = l.from_page_id
            JOIN pages t ON t.id = l.to_page_id
-          WHERE t.slug = $1 AND t.source_id = $2 AND f.source_id = $2 AND f.deleted_at IS NULL
-            AND COALESCE(l.link_source, '') <> 'mentions'${inboundPrivacy}
-            AND ($3::text[] IS NULL OR f.acl_subject_ids IS NULL OR f.acl_subject_ids && $3::text[])
-            AND ($3::text[] IS NULL OR l.origin_page_id IS NULL OR EXISTS(SELECT 1 FROM pages origin WHERE origin.id=l.origin_page_id AND (origin.acl_subject_ids IS NULL OR origin.acl_subject_ids && $3::text[])))`,
-        [pageSlug, sourceId, aclSubjectIds ?? null],
+          WHERE t.slug = $1 AND ${inboundPolicy}
+            AND COALESCE(l.link_source, '') <> 'mentions'`,
+        inboundParams,
       )
       .then(rs => Number(rs[0]?.n ?? 0))
       .catch(() => 0),
@@ -537,7 +544,7 @@ async function assembleCard(
     ...[...inCandidates].sort((a, b) => rank(a.status) - rank(b.status)),
   ].slice(0, EDGE_CAP);
   const summary = safeSynopsis(row, { keepVisibility: remote ? ['world'] : ['private', 'world'] });
-  const relationshipNote = await loadRelationshipNotes(engine, [{ slug: pageSlug, source_id: sourceId, summary }], { excludePrivate })
+  const relationshipNote = await loadRelationshipNotes(engine, [{ slug: pageSlug, source_id: sourceId, summary }], readScope)
     .then(m => m.get(relationshipNoteKey(sourceId, pageSlug))).catch(() => undefined);
 
   // Open threads (best-effort v1): open-loop rows first (v0.47 — richest:

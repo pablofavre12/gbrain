@@ -12,7 +12,7 @@
  * shares `derived-links.ts`.
  */
 import type { LinkBatchInput, TraverseGraphOpts } from '../engine.ts';
-import type { Link, GraphNode, GraphPath } from '../types.ts';
+import type { Link, GraphNode, GraphPath, PageReadScope } from '../types.ts';
 import { executeRawJsonb } from '../sql-query.ts';
 import { sanitizeForJsonb, buildLinkRows } from '../batch-rows.ts';
 import { privatePagesFilterFragment, privateLinkOriginFilterFragment } from '../search/private-visibility.ts';
@@ -25,6 +25,8 @@ import { sqlFragment, trustedSql } from './fragment.ts';
 import { refreshRelationships, type RelationshipKey } from '../link-relationships.ts';
 import { isTemporalLinkType, relationshipFilterSql, temporalLinkJoinSql, TEMPORAL_LINK_SELECT_SQL, annotateTemporalRow } from '../link-validity.ts';
 import type { LinkReadScope } from '../link-validity.ts';
+import { temporalSqlFragment } from '../link-temporal-read-sql.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
 
 /** Bounded link reads annotate rows with relationship status (never filter) when a temporal read is requested. */
 function finishTemporal(rows: unknown[], opts?: LinkReadScope): Link[] {
@@ -38,26 +40,21 @@ function finishTemporal(rows: unknown[], opts?: LinkReadScope): Link[] {
 
 /** WHERE fragment that keeps only edges matching the caller's temporal policy (walks and fanout). */
 function temporalWalkFilter(alias: string, opts?: LinkReadScope) {
-  return opts?.temporal ? trustedSql(`AND ${relationshipFilterSql(alias, { ...opts.temporal, excludePrivate: opts.excludePrivate })}`) : sqlFragment``;
+  return opts?.temporal ? temporalSqlFragment(params => `AND ${relationshipFilterSql(alias, { ...opts.temporal, ...opts }, params)}`) : sqlFragment``;
 }
 
-const aclPageColumns = {
-  f: sqlFragment`f.acl_subject_ids`, t: sqlFragment`t.acl_subject_ids`,
-  p: sqlFragment`p.acl_subject_ids`, p2: sqlFragment`p2.acl_subject_ids`,
-  p3: sqlFragment`p3.acl_subject_ids`, pf: sqlFragment`pf.acl_subject_ids`,
-  pt: sqlFragment`pt.acl_subject_ids`,
-} as const;
-const aclOriginColumns = { l: sqlFragment`l.origin_page_id`, l2: sqlFragment`l2.origin_page_id` } as const;
-type AclPageAlias = keyof typeof aclPageColumns;
-type AclLinkAlias = keyof typeof aclOriginColumns;
+type AclPageAlias = 'f' | 't' | 'p' | 'p2' | 'p3' | 'pf' | 'pt' | 'src' | 'tgt';
+type AclLinkAlias = 'l' | 'l2';
 
-function aclPageFilter(page: AclPageAlias, subjects: string[] | undefined, link?: AclLinkAlias) {
-  if (subjects === undefined) return sqlFragment``;
-  const column = aclPageColumns[page];
-  const origin = link ? sqlFragment`AND (${aclOriginColumns[link]} IS NULL OR EXISTS (
-    SELECT 1 FROM pages acl_origin WHERE acl_origin.id=${aclOriginColumns[link]}
-    AND (acl_origin.acl_subject_ids IS NULL OR acl_origin.acl_subject_ids && ${subjects}::text[])))` : sqlFragment``;
-  return sqlFragment`AND (${column} IS NULL OR ${column} && ${subjects}::text[]) ${origin}`;
+function aclPageFilter(page: AclPageAlias, scope: LinkReadScope | undefined, link?: AclLinkAlias) {
+  if (scope?.aclSubjectIds === undefined) return sqlFragment``;
+  return temporalSqlFragment(params => {
+    const endpoint = pageReadFilter(page, scope, params, true);
+    const origin = link ? `AND (${link}.origin_page_id IS NULL OR EXISTS (
+      SELECT 1 FROM pages acl_origin WHERE acl_origin.id = ${link}.origin_page_id
+        AND ${pageReadFilter('acl_origin', scope, params, true)}))` : '';
+    return `AND ${endpoint} ${origin}`;
+  });
 }
 
 export async function addLink(
@@ -268,15 +265,14 @@ export async function removeLink(
 
 
 export async function getLinks(exec: ScopedRead, slug: string, opts?: LinkReadScope): Promise<Link[]> {
-    const privacy = sqlFragment`${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('f')} AND ${privatePagesFilterFragment('t')} AND ${privateLinkOriginFilterFragment('l')}`) : sqlFragment``} ${aclPageFilter('f', opts?.aclSubjectIds, 'l')} ${aclPageFilter('t', opts?.aclSubjectIds)}`;
+    const privacy = sqlFragment`${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('f')} AND ${privatePagesFilterFragment('t')} AND ${privateLinkOriginFilterFragment('l')}`) : sqlFragment``} ${aclPageFilter('f', opts, 'l')} ${aclPageFilter('t', opts)}`;
     const tSel = opts?.temporal ? TEMPORAL_LINK_SELECT_SQL : '';
-    const tJoin = opts?.temporal ? temporalLinkJoinSql('l', opts.excludePrivate) : '';
+    const tJoin = opts?.temporal ? temporalSqlFragment(params => temporalLinkJoinSql('l', opts, params)) : sqlFragment``;
     const finish = (rows: unknown[]) => finishTemporal(rows, opts);
       // #2200: federated grant scopes ALL THREE page endpoints — from, to, AND
       // the origin (the page that authored the edge, surfaced as origin_slug).
-      // Scoping only from+to would still leak an out-of-grant origin's slug; the
-      // origin LEFT JOIN carries the same ANY($) filter so origin_slug nulls
-      // out of grant. Remote MCP clients always land here.
+      // ACL-scoped reads reject an unreadable origin before returning its
+      // context, even when the display join would null out its slug.
       if (opts?.sourceIds && opts.sourceIds.length > 0) {
         const ids = opts.sourceIds;
         const rows = (await exec.run(sqlFragment`
@@ -288,7 +284,7 @@ export async function getLinks(exec: ScopedRead, slug: string, opts?: LinkReadSc
           FROM links l
           JOIN pages f ON f.id = l.from_page_id
           JOIN pages t ON t.id = l.to_page_id
-          LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[]) ${trustedSql(tJoin)}
+          LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[]) ${tJoin}
           WHERE ${opts?.pageId !== undefined ? sqlFragment`f.id = ${opts.pageId}` : sqlFragment`f.slug = ${slug}`} AND f.source_id = ANY(${ids}::text[]) AND t.source_id = ANY(${ids}::text[])
             AND f.deleted_at IS NULL AND t.deleted_at IS NULL ${privacy}
           ORDER BY l.id
@@ -312,7 +308,7 @@ export async function getLinks(exec: ScopedRead, slug: string, opts?: LinkReadSc
           FROM links l
           JOIN pages f ON f.id = l.from_page_id
           JOIN pages t ON t.id = l.to_page_id
-          LEFT JOIN pages o ON o.id = l.origin_page_id ${trustedSql(tJoin)}
+          LEFT JOIN pages o ON o.id = l.origin_page_id ${tJoin}
           WHERE ${opts?.pageId !== undefined ? sqlFragment`f.id = ${opts.pageId}` : sqlFragment`f.slug = ${slug}`} AND f.source_id = ${opts.sourceId}
             AND f.deleted_at IS NULL AND t.deleted_at IS NULL ${privacy}
           ORDER BY l.id
@@ -328,7 +324,7 @@ export async function getLinks(exec: ScopedRead, slug: string, opts?: LinkReadSc
         FROM links l
         JOIN pages f ON f.id = l.from_page_id
         JOIN pages t ON t.id = l.to_page_id
-        LEFT JOIN pages o ON o.id = l.origin_page_id ${trustedSql(tJoin)}
+        LEFT JOIN pages o ON o.id = l.origin_page_id ${tJoin}
         WHERE f.slug = ${slug}
           AND f.deleted_at IS NULL AND t.deleted_at IS NULL ${privacy}
         ORDER BY l.id
@@ -338,9 +334,9 @@ export async function getLinks(exec: ScopedRead, slug: string, opts?: LinkReadSc
 
 
 export async function getBacklinks(exec: ScopedRead, slug: string, opts?: LinkReadScope): Promise<Link[]> {
-    const privacy = sqlFragment`${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('f')} AND ${privatePagesFilterFragment('t')} AND ${privateLinkOriginFilterFragment('l')}`) : sqlFragment``} ${aclPageFilter('f', opts?.aclSubjectIds, 'l')} ${aclPageFilter('t', opts?.aclSubjectIds)}`;
+    const privacy = sqlFragment`${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('f')} AND ${privatePagesFilterFragment('t')} AND ${privateLinkOriginFilterFragment('l')}`) : sqlFragment``} ${aclPageFilter('f', opts, 'l')} ${aclPageFilter('t', opts)}`;
     const tSel = opts?.temporal ? TEMPORAL_LINK_SELECT_SQL : '';
-    const tJoin = opts?.temporal ? temporalLinkJoinSql('l', opts.excludePrivate) : '';
+    const tJoin = opts?.temporal ? temporalSqlFragment(params => temporalLinkJoinSql('l', opts, params)) : sqlFragment``;
     const finish = (rows: unknown[]) => finishTemporal(rows, opts);
       // #2200: federated grant scopes all three endpoints (mirrors getLinks) —
       // the referrer (from), the queried page (to), AND the origin — so neither
@@ -356,7 +352,7 @@ export async function getBacklinks(exec: ScopedRead, slug: string, opts?: LinkRe
           FROM links l
           JOIN pages f ON f.id = l.from_page_id
           JOIN pages t ON t.id = l.to_page_id
-          LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[]) ${trustedSql(tJoin)}
+          LEFT JOIN pages o ON o.id = l.origin_page_id AND o.source_id = ANY(${ids}::text[]) ${tJoin}
           WHERE ${opts?.pageId !== undefined ? sqlFragment`t.id = ${opts.pageId}` : sqlFragment`t.slug = ${slug}`} AND t.source_id = ANY(${ids}::text[]) AND f.source_id = ANY(${ids}::text[])
             AND f.deleted_at IS NULL AND t.deleted_at IS NULL ${privacy}
           ORDER BY l.id
@@ -375,7 +371,7 @@ export async function getBacklinks(exec: ScopedRead, slug: string, opts?: LinkRe
           FROM links l
           JOIN pages f ON f.id = l.from_page_id
           JOIN pages t ON t.id = l.to_page_id
-          LEFT JOIN pages o ON o.id = l.origin_page_id ${trustedSql(tJoin)}
+          LEFT JOIN pages o ON o.id = l.origin_page_id ${tJoin}
           WHERE ${opts?.pageId !== undefined ? sqlFragment`t.id = ${opts.pageId}` : sqlFragment`t.slug = ${slug}`} AND t.source_id = ${opts.sourceId}
             AND f.deleted_at IS NULL AND t.deleted_at IS NULL ${privacy}
           ORDER BY l.id
@@ -391,7 +387,7 @@ export async function getBacklinks(exec: ScopedRead, slug: string, opts?: LinkRe
         FROM links l
         JOIN pages f ON f.id = l.from_page_id
         JOIN pages t ON t.id = l.to_page_id
-        LEFT JOIN pages o ON o.id = l.origin_page_id ${trustedSql(tJoin)}
+        LEFT JOIN pages o ON o.id = l.origin_page_id ${tJoin}
         WHERE t.slug = ${slug}
           AND f.deleted_at IS NULL AND t.deleted_at IS NULL ${privacy}
         ORDER BY l.id
@@ -402,33 +398,32 @@ export async function getBacklinks(exec: ScopedRead, slug: string, opts?: LinkRe
 
 export async function listLinkSources(
   exec: ScopedRead,
-    opts?: { sourceId?: string; sourceIds?: string[] },
-  ): Promise<{ link_source: string | null; count: number }[]> {
-      // v114 (#1941): distinct provenances + counts for `gbrain link-sources`.
-      // Scope by the FROM page's source (consistent with getLinks). Federated
-      // {sourceIds} takes precedence over scalar {sourceId}; neither = unscoped.
-      const sourceCondition =
-        opts?.sourceIds && opts.sourceIds.length > 0
-          ? sqlFragment`WHERE f.source_id = ANY(${opts.sourceIds}::text[])`
-          : opts?.sourceId
-            ? sqlFragment`WHERE f.source_id = ${opts.sourceId}`
-            : sqlFragment``;
-      const rows = (await exec.run(sqlFragment`
-        SELECT l.link_source, COUNT(*)::int AS count
-        FROM links l
-        JOIN pages f ON f.id = l.from_page_id
-        ${sourceCondition}
-        GROUP BY l.link_source
-        ORDER BY count DESC, l.link_source ASC NULLS LAST
-      `)).rows;
-      return rows as unknown as { link_source: string | null; count: number }[];
-  }
+  opts?: PageReadScope,
+): Promise<{ link_source: string | null; count: number }[]> {
+  // Trusted local source-only calls retain their historical FROM-page scope.
+  // Reader policies authorize every contributing endpoint and independent origin
+  // before grouping: even a provenance label or count can disclose hidden data.
+  const filtered = opts?.aclSubjectIds !== undefined || opts?.excludePrivate || opts?.minTrust || opts?.suppressFlagged;
+  const policy = filtered ? temporalSqlFragment(params => `WHERE
+    ${pageReadFilter('f', opts, params, true)} AND ${pageReadFilter('t', opts, params, true)}
+    AND (l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM pages o
+      WHERE o.id = l.origin_page_id AND ${pageReadFilter('o', opts, params, true)}))`)
+    : opts?.sourceIds?.length ? sqlFragment`WHERE f.source_id = ANY(${opts.sourceIds}::text[])`
+      : opts?.sourceId ? sqlFragment`WHERE f.source_id = ${opts.sourceId}` : sqlFragment``;
+  const rows = (await exec.run(sqlFragment`
+    SELECT l.link_source, COUNT(*)::int AS count
+    FROM links l
+    JOIN pages f ON f.id = l.from_page_id
+    JOIN pages t ON t.id = l.to_page_id
+    ${policy}
+    GROUP BY l.link_source
+    ORDER BY count DESC, l.link_source ASC NULLS LAST
+  `)).rows;
+  return rows as unknown as { link_source: string | null; count: number }[];
+}
 
 
-export async function findOrphanPages(exec: LegacyUnscopedRead, opts?: {
-    sourceId?: string;
-    sourceIds?: string[];
-    excludePrivate?: boolean;
+export async function findOrphanPages(exec: LegacyUnscopedRead, opts?: PageReadScope & {
     mode?: 'inbound' | 'islanded';
   }): Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string }>> {
     // Soft-delete filter on BOTH sides:
@@ -440,6 +435,8 @@ export async function findOrphanPages(exec: LegacyUnscopedRead, opts?: {
     // v0.41.29.0: scope ONLY the candidate side (`p.source_id`) when opts.sourceId
     // is set. The inbound-link NOT EXISTS deliberately counts links from ANY source:
     // a page in source X linked FROM source Y is reachable, so NOT an orphan of X.
+    // Remote readers additionally require readable endpoints and evidence; hidden
+    // links must not change orphan membership or disclose restricted topology.
     // Do NOT add `src.source_id = p.source_id` here — that would be the stricter
     // intra-source-only definition we deliberately reject.
     const sourceFilter =
@@ -459,7 +456,7 @@ export async function findOrphanPages(exec: LegacyUnscopedRead, opts?: {
             FROM links l
             JOIN pages tgt ON tgt.id = l.to_page_id
             WHERE l.from_page_id = p.id
-              AND tgt.deleted_at IS NULL ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('tgt')} AND ${privateLinkOriginFilterFragment('l')}`) : sqlFragment``}
+              AND tgt.deleted_at IS NULL ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('tgt')} AND ${privateLinkOriginFilterFragment('l')}`) : sqlFragment``} ${aclPageFilter('tgt', opts, 'l')}
           )`
         : sqlFragment``;
     const rows = (await exec.run(sqlFragment`
@@ -471,14 +468,14 @@ export async function findOrphanPages(exec: LegacyUnscopedRead, opts?: {
         (NOT ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}) AS quarantined,
         p.source_id
       FROM pages p
-      WHERE p.deleted_at IS NULL ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
+      WHERE p.deleted_at IS NULL ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``} ${aclPageFilter('p', opts)}
         ${sourceFilter}
         AND NOT EXISTS (
           SELECT 1
           FROM links l
           JOIN pages src ON src.id = l.from_page_id
           WHERE l.to_page_id = p.id
-            AND src.deleted_at IS NULL ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('src')} AND ${privateLinkOriginFilterFragment('l')}`) : sqlFragment``}
+            AND src.deleted_at IS NULL ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('src')} AND ${privateLinkOriginFilterFragment('l')}`) : sqlFragment``} ${aclPageFilter('src', opts, 'l')}
         )
         ${outboundFilter}
       ORDER BY p.slug
@@ -494,7 +491,7 @@ export async function traverseGraph(
     opts?: TraverseGraphOpts,
   ): Promise<GraphNode[]> {
     const privacy = (page: AclPageAlias, link?: AclLinkAlias) => sqlFragment`${opts?.excludePrivate
-      ? trustedSql(`AND ${privatePagesFilterFragment(page)}${link ? ` AND ${privateLinkOriginFilterFragment(link)}` : ''}`) : sqlFragment``} ${aclPageFilter(page, opts?.aclSubjectIds, link)}`;
+      ? trustedSql(`AND ${privatePagesFilterFragment(page)}${link ? ` AND ${privateLinkOriginFilterFragment(link)}` : ''}`) : sqlFragment``} ${aclPageFilter(page, opts, link)}`;
     // v0.34.1 (#861 — P0 leak seal): scope visited nodes to the caller's
     // source(s). Without this, the walk follows edges into pages from
     // foreign sources, leaking topology + page metadata. The filter
@@ -600,7 +597,7 @@ export async function traversePathsDetailed(
     opts?: LinkReadScope & { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
   ): Promise<{ paths: GraphPath[]; truncated: boolean }> {
     const privacy = (page: AclPageAlias, link?: AclLinkAlias) => sqlFragment`${opts?.excludePrivate
-      ? trustedSql(`AND ${privatePagesFilterFragment(page)}${link ? ` AND ${privateLinkOriginFilterFragment(link)}` : ''}`) : sqlFragment``} ${aclPageFilter(page, opts?.aclSubjectIds, link)}`;
+      ? trustedSql(`AND ${privatePagesFilterFragment(page)}${link ? ` AND ${privateLinkOriginFilterFragment(link)}` : ''}`) : sqlFragment``} ${aclPageFilter(page, opts, link)}`;
     const depth = opts?.depth ?? 5;
     const direction = opts?.direction ?? 'out';
     const linkType = opts?.linkType ?? null;

@@ -115,13 +115,22 @@ async function seedFacts(engine: BrainEngine, sourceId: string, slug: string) {
 const MATRIX: Record<CyclePhase, Entry> = {
   timeline_apply: {
     seed: async ({ engine, sourceId }) => {
-      await put(engine, sourceId, 'companies/probe-example', page('company', 'Probe example', 'A timeline target.'));
+      const evidence = async (slug: string, date: string, body: string) => {
+        await put(engine, sourceId, slug, page('company', 'Probe example', body, `date: ${date}\n`));
+        const current = (await engine.getPage(slug, { sourceId }))!;
+        expect(new Date(current.effective_date!).toISOString().slice(0, 10)).toBe(date);
+        expect(current.effective_date_source).toBe('date');
+        const [chunk] = await engine.getChunks(slug, { sourceId });
+        expect(chunk).toBeDefined();
+        return { slug, effective_date: date, effective_date_source: 'date', chunk_id: chunk.id, text: chunk.chunk_text };
+      };
+      const a = await evidence('companies/probe-example-earlier', '2026-01-01', 'The earlier company state.');
+      const b = await evidence('companies/probe-example', '2026-02-01', 'The current company state.');
       await engine.writeContradictionsRun({ run_id: 'managed-timeline-fixture', judge_model: 'test', prompt_version: '2',
         queries_evaluated: 1, queries_with_contradiction: 0, total_contradictions_flagged: 1, wilson_ci_lower: 0,
         wilson_ci_upper: 0, judge_errors_total: 0, cost_usd_total: 0, duration_ms: 1, source_tier_breakdown: {},
         report_json: { per_query: [{ contradictions: [{ resolution_kind: 'log_timeline_change',
-          verdict: 'temporal_evolution', axis: 'fixture changed', a: { slug: 'companies/probe-example', effective_date: '2026-01-01' },
-          b: { slug: 'companies/probe-example', effective_date: '2026-02-01' } }] }] } });
+          verdict: 'temporal_evolution', axis: 'fixture changed', a, b }] }] } });
     },
     assert: async ({engine, sourceId, result}) => {
       expect(result.details.created).toBe(1);

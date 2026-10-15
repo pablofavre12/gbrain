@@ -42,7 +42,7 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
       ? `p2.slug || '|' || l.link_type || '|' || w.slug`
       : `CASE WHEN l.from_page_id = w.id THEN w.slug || '|' || l.link_type || '|' || p2.slug
               ELSE p2.slug || '|' || l.link_type || '|' || w.slug END`;
-  const temporalFilter = opts?.temporal ? `AND ${relationshipFilterSql('l', { ...opts.temporal, excludePrivate: opts.excludePrivate })}` : '';
+  const temporalFilter = opts?.temporal ? `AND ${relationshipFilterSql('l', { ...opts.temporal, ...opts }, params)}` : '';
   const recurStep = direction === 'out'
     ? 'JOIN links l ON l.from_page_id = w.id JOIN pages p2 ON p2.id = l.to_page_id'
     : direction === 'in'
@@ -127,7 +127,7 @@ export async function readChainHop(query: ReadQuery, frontier: number[], opts: C
     const pt = pageReadFilter(`${a}t`, policy, params, true);
     const og = pageReadFilter(`${a}g`, policy, params, true);
     const origin = `(${a}l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM ${byId(`${a}l.origin_page_id`)} ${a}g WHERE ${og}))`;
-    const live = opts.temporal ? `AND ${relationshipFilterSql(`${a}l`, { ...opts.temporal, excludePrivate: opts.excludePrivate })}` : '';
+    const live = opts.temporal ? `AND ${relationshipFilterSql(`${a}l`, { ...opts.temporal, ...opts }, params)}` : '';
     return `SELECT f.id AS fid, ${a}l.id AS lid, ${a}l.link_type, ${a}l.from_page_id, ${a}l.to_page_id, ${a}l.origin_page_id,
         ${a}l.link_source, ${a}f.type AS from_type, ${a}t.type AS to_type, ${a}f.source_id
       FROM f CROSS JOIN LATERAL (
@@ -145,7 +145,7 @@ export async function readChainHop(query: ReadQuery, frontier: number[], opts: C
   const inBranch = branch('to_page_id', 'i');
   const nb = pageReadFilter('nb', policy, params, true);
   const dg = pageReadFilter('dg', policy, params, true);
-  const degreeLive = opts.temporal ? `AND ${relationshipFilterSql('dl', { ...opts.temporal, excludePrivate: opts.excludePrivate })}` : '';
+  const degreeLive = opts.temporal ? `AND ${relationshipFilterSql('dl', { ...opts.temporal, ...opts }, params)}` : '';
   const ev = pageReadFilter('ev', policy, params, true);
   const textGate = requiresSafeChunks(policy) ? `AND ${safeChunksFilter('ev')} AND NOT ${protectedBodyFilter('ev')}` : '';
   params.push(opts.toward);

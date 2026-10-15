@@ -6,7 +6,7 @@
  */
 import { expect } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { OperationContext } from '../../src/core/ops/contract.ts';
@@ -36,15 +36,18 @@ export async function legacySlugLifecycle(databaseUrl?: string, opts: { sourcePa
   await managedBrain(async ({ engine, ctx, root }) => {
     const real = await mutate(ctx, 'put_page', { slug: 'people/jane-doe', content: VAULT_BYTES });
     const realFile = readFileSync(join(root, 'people', 'jane-doe.md'), 'utf8');
+    const filesBefore = readdirSync(join(root, 'people')).sort();
+    expect(filesBefore).toEqual(['Jane Doe.md', 'jane-doe.md']);
     const deleted = (await mutate(ctx, 'delete_page', { slug: LEGACY, expected_revision: await revisionOf(engine, LEGACY) })).outcome;
     expect(deleted).toMatchObject({ status: 'soft_deleted', write_through: { written: false } });
     const restored = (await mutate(ctx, 'restore_page', { slug: LEGACY, expected_revision: await revisionOf(engine, LEGACY) })).outcome;
     expect(restored.write_through).toMatchObject({ written: false });
     expect((await engine.readPageSnapshot(LEGACY, { sourceId: 'default' }))?.page.deleted_at ?? null).toBeNull();
-    expect(existsSync(join(root, 'people', 'jane doe.md'))).toBe(false);
+    expect(readdirSync(join(root, 'people')).sort()).toEqual(filesBefore);
     const purged = (await mutate(ctx, 'delete_page', { slug: LEGACY, purge: true, expected_revision: await revisionOf(engine, LEGACY) })).outcome;
     expect(purged).toMatchObject({ status: 'purged' });
     expect(await engine.readPageSnapshot(LEGACY, { sourceId: 'default', includeDeleted: true })).toBeNull();
+    expect(readdirSync(join(root, 'people')).sort()).toEqual(filesBefore);
     expect(readFileSync(join(root, 'people', 'Jane Doe.md'), 'utf8')).toBe(VAULT_BYTES);
     expect(readFileSync(join(root, 'people', 'jane-doe.md'), 'utf8')).toBe(realFile);
     expect((await engine.readPageSnapshot('people/jane-doe', { sourceId: 'default' }))?.revision).toBe((real.outcome ?? real).revision);

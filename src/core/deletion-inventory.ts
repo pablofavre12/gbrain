@@ -36,6 +36,7 @@ export interface InventoryEntry {
 type Row = [table: string, cls: InventoryClass, reason: string, columns: string, probe?: string];
 const ROWS: readonly Row[] = [
   ['access_tokens', 'out_of_scope', 'secret_material', 'name token_hash scopes permissions source_grant source_id federated_read allowed_operations takes_holders min_trust'],
+  ['authored_link_inventories', 'out_of_scope', 'probed_reported', 'source_id refs', 'refs'],
   ['budget_ledger', 'out_of_scope', 'no_memory_text', 'scope resolver_id'],
   ['budget_reservations', 'out_of_scope', 'no_memory_text', 'reservation_id scope resolver_id status'],
   ['calibration_profiles', 'out_of_scope', 'probed_reported', 'source_id holder wave_version domain_scorecards pattern_statements active_bias_tags model_id', 'pattern_statements domain_scorecards'],

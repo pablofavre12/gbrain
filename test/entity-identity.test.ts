@@ -226,6 +226,23 @@ describe('entity identity ops (v1 manual-only)', () => {
     expect(listed.identities[0]!.members).toHaveLength(1);
     expect(listed.identities[0]!.members[0]!.source_id).toBe('default');
   });
+
+  test('remote identity seeds and members obey current page ACLs', async () => {
+    await linkEntityIdentity(engine, { entityId: 'alice-chen', slug: 'people/alice', sourceId: 'default' });
+    await linkEntityIdentity(engine, { entityId: 'alice-chen', slug: 'people/alice-chen', sourceId: 'team-brain', canonical: true });
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:director'] WHERE source_id='team-brain' AND slug='people/alice-chen'");
+    const read = (subject: string, args: Record<string, unknown>) => operationsByName.entity_identity_list!.handler(
+      remoteCtx({ auth: { allowedSources: ['default', 'team-brain'], subjectIds: [subject] } as never }), args);
+    const denied = await read('user:tech', { slug: 'people/alice-chen' });
+    expect(denied).toEqual({ identities: [] });
+    const publicGroup = await read('user:tech', { entity_id: 'alice-chen' }) as { identities: Array<{ canonical: unknown; members: unknown[] }> };
+    expect(publicGroup.identities[0]!.members).toHaveLength(1);
+    expect(publicGroup.identities[0]!.canonical).toBeNull();
+    const allowed = await read('user:director', { slug: 'people/alice-chen' }) as { identities: Array<{ members: unknown[] }> };
+    expect(allowed.identities[0]!.members).toHaveLength(2);
+    await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:other'] WHERE source_id='team-brain' AND slug='people/alice-chen'");
+    expect(await read('user:director', { slug: 'people/alice-chen' })).toEqual({ identities: [] });
+  });
 });
 
 describe('flag-gated retrieval union (#4224 v1: link read ops)', () => {

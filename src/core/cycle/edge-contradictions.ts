@@ -21,6 +21,9 @@
  * different targets whose combined evidence hash has no proposal yet.
  * Bounded by max_subjects and the cycle budget meter (max_usd).
  */
+import { captureTimelinePublicationGuard, validateTimelinePublicationGuard, type TimelinePublicationGuard } from '../persistence/timeline-publication-guard.ts';
+import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { buildRelationshipState } from '../link-validity.ts';
 import { redactProviderKeys } from '../ai/key-redact.ts';
 import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
 import { applyRedaction, planRedaction } from '../secret-scan.ts';
@@ -182,9 +185,9 @@ interface CandidateRow {
   subject_slug: string; subject_title: string | null; target_slug: string; target_title: string | null;
 }
 
-interface SubjectGroup { sourceId: string; fromId: number; slug: string; title: string; linkType: string; rels: CandidateRow[] }
+interface SubjectGroup { sourceId: string; fromId: number; slug: string; title: string; linkType: string; rels: CandidateRow[]; guard?: TimelinePublicationGuard; contexts?: Map<number, string[]> }
 
-async function findCandidateGroups(engine: BrainEngine, maxSubjects: number): Promise<SubjectGroup[]> {
+async function findCandidateGroups(engine: BrainEngine, maxSubjects: number, subject?: Pick<SubjectGroup, 'fromId' | 'linkType'>): Promise<SubjectGroup[]> {
   const today = utcToday();
   // After a line-grammar change, a subject whose links have not been re-derived yet is skipped: no closure is
   // decided on a half-reconciled graph. Before any change (generation unset) every subject is eligible, as before.
@@ -194,6 +197,7 @@ async function findCandidateGroups(engine: BrainEngine, maxSubjects: number): Pr
     `WITH live AS (
        SELECT lr.* FROM link_relationships lr
         WHERE lr.scope = 'all' AND lr.semantics = 'state' AND lr.valid_ranges @> $1::date
+          AND ($4::int IS NULL OR lr.from_page_id = $4) AND ($5::text IS NULL OR lr.link_type = $5)
      ), multi AS (
        SELECT source_id, from_page_id, link_type FROM live
         GROUP BY 1, 2, 3 HAVING count(DISTINCT to_page_id) >= 2
@@ -207,7 +211,7 @@ async function findCandidateGroups(engine: BrainEngine, maxSubjects: number): Pr
          AND ($3::timestamptz IS NULL OR f.links_extracted_at >= $3::timestamptz)
        JOIN pages t ON t.id = l.to_page_id AND t.deleted_at IS NULL
       ORDER BY l.from_page_id, l.link_type, l.last_start NULLS FIRST, t.slug`,
-    [today, maxSubjects, pendingCutoff]);
+    [today, maxSubjects, pendingCutoff, subject?.fromId ?? null, subject?.linkType ?? null]);
   const groups = new Map<string, SubjectGroup>();
   for (const r of rows) {
     const key = `${r.from_page_id}\0${r.link_type}`;
@@ -215,8 +219,53 @@ async function findCandidateGroups(engine: BrainEngine, maxSubjects: number): Pr
     if (!g) { g = { sourceId: r.source_id, fromId: Number(r.from_page_id), slug: r.subject_slug, title: r.subject_title ?? r.subject_slug, linkType: r.link_type, rels: [] }; groups.set(key, g); }
     if (g.rels.length < MAX_RELATIONSHIPS_PER_SUBJECT) g.rels.push(r);
   }
-  return [...groups.values()];
+  const safe: SubjectGroup[] = [];
+  for (const group of groups.values()) {
+    const guard = await captureTimelinePublicationGuard(engine, {
+      sourceId: group.sourceId, targetPageId: group.fromId, pageIds: group.rels.map(r => Number(r.to_page_id)),
+      relationship: { fromPageId: group.fromId, linkType: group.linkType },
+      validate: tx => validateCandidateEvidence(tx, group),
+    });
+    if (guard) { group.guard = guard; safe.push(group); }
+  }
+  return safe;
 }
+
+/** Reconcile cached candidate state with actual public evidence under the
+ * publication-capture locks; stale shared aggregates never author a closure. */
+async function validateCandidateEvidence(engine: BrainEngine, group: SubjectGroup): Promise<boolean> {
+  const pages = await engine.executeRaw<{id: number; slug: string; title: string}>(
+    'SELECT id,slug,title FROM pages WHERE id=ANY($1::int[])', [[group.fromId, ...group.rels.map(r => Number(r.to_page_id))]]);
+  const subject = pages.find(p => Number(p.id) === group.fromId);
+  if (!subject) return false;
+  group.slug = subject.slug; group.title = subject.title ?? subject.slug;
+  group.contexts = new Map();
+  for (const r of group.rels) {
+    const assertions = await engine.executeRaw<{tense: 'present'|'past'; origin: number; context: string; created_at: string}>(
+      `SELECT COALESCE(assertion_tense,'present') AS tense,COALESCE(origin_page_id,from_page_id) AS origin,context,created_at::text AS created_at
+       FROM links WHERE from_page_id=$1 AND to_page_id=$2 AND link_type=$3 ORDER BY id`, [group.fromId,r.to_page_id,group.linkType]);
+    const transitions = await engine.executeRaw<{kind:'start'|'end'; date:string; origin:number|null; producer:string; created_at:string}>(
+      `SELECT kind,occurred_on::text AS date,origin_page_id AS origin,producer,created_at::text AS created_at FROM link_transitions
+       WHERE from_page_id=$1 AND to_page_id=$2 AND link_type=$3 ORDER BY id`, [group.fromId,r.to_page_id,group.linkType]);
+    if (!assertions.length && !transitions.length) return false;
+    const state = buildRelationshipState('state', assertions.map(a => ({tense:a.tense,originPageId:Number(a.origin)})),
+      transitions.map(t => ({kind:t.kind,occurredOn:t.date,producer:'timeline',originPageId:t.origin})));
+    if (JSON.stringify(state.stints) !== JSON.stringify(parseMultirange(r.valid_ranges)) || state.lastStart !== dateKey(r.last_start)) return false;
+    r.recorded_at = [...assertions, ...transitions].map(e => e.created_at).sort()[0];
+    r.evidence_hash = createHash('sha256').update([
+      ...assertions.map(a => `a:${a.origin}:${a.tense}`),
+      ...transitions.map(t => `t:${t.origin ?? 'manual'}:${t.kind}:${t.date}:${t.producer}`),
+    ].sort().join('\n')).digest('hex').slice(0,32);
+    const target = pages.find(p => Number(p.id) === Number(r.to_page_id));
+    if (!target) return false;
+    r.target_slug = target.slug; r.target_title = target.title;
+    group.contexts.set(Number(r.to_page_id), [...new Set(assertions.map(a => a.context).filter(Boolean))].slice(0,3));
+  }
+  return true;
+}
+
+const publicationDetail = (g: SubjectGroup): string | null =>
+  g.guard ? JSON.stringify({ timeline_publication_guard: g.guard }) : null;
 
 const pairHash = (a: CandidateRow, b: CandidateRow) =>
   createHash('sha256').update([a.evidence_hash, b.evidence_hash].sort().join(':')).digest('hex').slice(0, 32);
@@ -278,19 +327,19 @@ export async function runPhaseEdgeContradictions(engine: BrainEngine, opts: Edge
       [g.fromId, g.linkType, pairs.map(([a, b]) => pairHash(a, b))])) {
       const key = `${r.a}:${r.b}`;
       const attempts = r.status === 'error' ? judgeAttempts(r.detail) : 0;
+      // A relationship hash excludes page/audience revisions. Renew an obsolete
+      // proof even when that hash is unchanged; user decisions remain final.
+      if (r.status === 'stale' || (r.status === 'proposed' && r.detail !== publicationDetail(g))) continue;
       if (r.status !== 'error' || r.recent || attempts >= JUDGE_MAX_ATTEMPTS) known.add(key);
       else priorAttempts.set(key, attempts);
     }
     const fresh = pairs.filter(([a, b]) => !known.has(`${a.to_page_id}:${b.to_page_id}`));
     if (fresh.length === 0) { totals.skipped_known++; continue; }
 
-    const relationships: JudgeRelationship[] = await Promise.all(g.rels.map(async (r, i) => ({
+    const relationships: JudgeRelationship[] = g.rels.map((r, i) => ({
       index: i + 1, link_type: r.link_type, target: r.target_slug, target_title: r.target_title ?? r.target_slug,
-      since: dateKey(r.last_start),
-      contexts: (await engine.executeRaw<{ context: string }>(
-        `SELECT DISTINCT context FROM links WHERE from_page_id = $1 AND to_page_id = $2 AND link_type = $3 AND context <> '' LIMIT 3`,
-        [r.from_page_id, r.to_page_id, r.link_type])).map(c => c.context),
-    })));
+      since: dateKey(r.last_start), contexts: g.contexts?.get(Number(r.to_page_id)) ?? [],
+    }));
     const prompt = buildEdgeJudgePrompt(g, relationships);
     const check = meter.check({ modelId: model, estimatedInputTokens: Math.ceil(prompt.length / 4), maxOutputTokens: JUDGE_MAX_OUTPUT_TOKENS, label: `edge_contradictions:${g.slug}` });
     if (!check.allowed) { budgetExhausted = true; break; }
@@ -361,6 +410,11 @@ async function loadSingleValueMode(engine: BrainEngine): Promise<SingleValueMode
   return raw === 'apply' || raw === 'off' ? raw : 'propose';
 }
 
+const singleValuePlan = (g: SubjectGroup) => planSingleValueClosures(g.rels.map(r => ({
+  to_page_id: Number(r.to_page_id), lastStart: dateKey(r.last_start), stints: parseMultirange(r.valid_ranges) as Stint[],
+  recordedAt: r.recorded_at instanceof Date ? r.recorded_at : r.recorded_at == null ? null : String(r.recorded_at),
+})));
+
 /**
  * Groups whose relation the source's pack declares `cardinality: one_per_from`
  * are closed by the chain rule (link-single-value.ts) without a model: each
@@ -380,23 +434,36 @@ async function runDeclaredSingleValue(
     handled.add(g);
     totals.groups++;
     const byTo = new Map(g.rels.map(r => [Number(r.to_page_id), r]));
-    const plan = planSingleValueClosures(g.rels.map(r => ({
-      to_page_id: Number(r.to_page_id), lastStart: dateKey(r.last_start), stints: parseMultirange(r.valid_ranges) as Stint[],
-      recordedAt: r.recorded_at instanceof Date ? r.recorded_at : r.recorded_at == null ? null : String(r.recorded_at),
-    })));
-    const record = async (a: CandidateRow, b: CandidateRow, p: Parameters<typeof recordProposal>[5]) => {
+    const plan = singleValuePlan(g);
+    const record = async (a: CandidateRow, b: CandidateRow, p: Parameters<typeof recordProposal>[5], group = g) => {
       const [x, y] = ordered(a, b);
-      return recordProposal(engine, g, x, y, pairHash(x, y), p);
+      return recordProposal(engine, group, x, y, pairHash(x, y), p);
     };
+    let published = false;
     for (const c of plan.closures) {
-      const ending = byTo.get(c.ending)!, successor = byTo.get(c.successor)!;
+      let current = g;
+      if (published) {
+        // Each canonical closure changes the subject and invalidates the prior
+        // proof. Recompute the deterministic rule from newly captured evidence;
+        // never attach a fresh proof to an unchecked earlier decision.
+        const [fresh] = await findCandidateGroups(engine, 1, g);
+        if (!fresh || !(await declaredSingleValueTypes(engine, g.sourceId)).has(g.linkType)) break;
+        if (!singleValuePlan(fresh).closures.some(next => next.ending === c.ending && next.successor === c.successor
+          && next.closeDate === c.closeDate && next.bornClosed === c.bornClosed)) continue;
+        current = fresh;
+      }
+      const ending = current.rels.find(r => Number(r.to_page_id) === c.ending)!;
+      const successor = current.rels.find(r => Number(r.to_page_id) === c.successor)!;
       const id = await record(ending, successor, {
         status: 'proposed', model: SINGLE_VALUE_MODEL, confidence: 1, endingTo: c.ending, closeDate: c.closeDate,
         bornClosed: c.bornClosed, line: dreamClosureLine(g.linkType, ending.target_slug, successor.target_slug),
-      });
+      }, current);
       if (id === null) continue;
       totals.proposed++;
-      if (mode === 'apply' && (await (opts.applier ?? applyEdgeProposal)(engine, id)).status === 'applied') totals.applied++;
+      if (mode === 'apply' && (await (opts.applier ?? applyEdgeProposal)(engine, id)).status === 'applied') {
+        totals.applied++;
+        published = true;
+      }
     }
     const dated = g.rels.filter(r => dateKey(r.last_start));
     for (const to of plan.undated) {
@@ -440,10 +507,11 @@ async function recordProposal(
        status = EXCLUDED.status, ending_to_page_id = EXCLUDED.ending_to_page_id, close_date = EXCLUDED.close_date,
        born_closed = EXCLUDED.born_closed, model = EXCLUDED.model, confidence = EXCLUDED.confidence,
        generated_line = EXCLUDED.generated_line, detail = EXCLUDED.detail, updated_at = now()
-     WHERE link_edge_proposals.status = 'error'
+     WHERE link_edge_proposals.status IN ('error', 'stale')
+        OR (link_edge_proposals.status = 'proposed' AND link_edge_proposals.detail IS DISTINCT FROM $15::text)
      RETURNING id`,
     [g.sourceId, g.fromId, Number(a.to_page_id), Number(b.to_page_id), g.linkType, hash, p.status,
-      p.endingTo ?? null, p.closeDate ?? null, p.bornClosed ?? false, p.model, p.confidence ?? null, p.line ?? null, p.detail ?? null]);
+      p.endingTo ?? null, p.closeDate ?? null, p.bornClosed ?? false, p.model, p.confidence ?? null, p.line ?? null, p.status === 'proposed' && g.guard ? publicationDetail(g) : p.detail ?? null, publicationDetail(g)]);
   return rows[0] ? Number(rows[0].id) : null;
 }
 
@@ -461,13 +529,13 @@ export type ApplyOutcome = { status: 'applied' | 'stale' | 'not_found' | 'refuse
 
 interface ProposalRow {
   id: number; source_id: string; status: string; from_page_id: number; ending_to_page_id: number | null;
-  link_type: string; close_date: unknown; generated_line: string | null; subject_slug: string; ending_slug: string | null;
+  detail: string | null; link_type: string; close_date: unknown; generated_line: string | null; subject_slug: string; ending_slug: string | null;
 }
 
 async function loadProposal(engine: BrainEngine, id: number): Promise<ProposalRow | null> {
   const [row] = await engine.executeRaw<ProposalRow>(
     `SELECT p.id, p.source_id, p.status, p.from_page_id, p.ending_to_page_id, p.link_type, p.close_date::text AS close_date,
-            p.generated_line, f.slug AS subject_slug, t.slug AS ending_slug
+            p.generated_line, p.detail, f.slug AS subject_slug, t.slug AS ending_slug
        FROM link_edge_proposals p JOIN pages f ON f.id = p.from_page_id LEFT JOIN pages t ON t.id = p.ending_to_page_id
       WHERE p.id = $1`, [id]);
   return row ?? null;
@@ -495,6 +563,15 @@ export async function applyEdgeProposal(engine: BrainEngine, id: number): Promis
   if (p.status === 'applied') return { status: 'applied', reason: 'already applied' };
   if (p.status !== 'proposed') return { status: 'refused', reason: `proposal is ${p.status}` };
   if (!p.ending_slug || !p.generated_line) return { status: 'refused', reason: 'proposal has no closure to apply' };
+  let guard: TimelinePublicationGuard | undefined;
+  try { guard = JSON.parse(p.detail ?? '{}').timeline_publication_guard; } catch { /* legacy proposals lack provenance */ }
+  if (!guard) return { status: 'refused', reason: 'proposal lacks publication provenance; re-run the inference' };
+  try {
+    await engine.transaction(tx => validateTimelinePublicationGuard(tx, guard, { sourceId: p.source_id, pageId: Number(p.from_page_id) }));
+  } catch {
+    await engine.executeRaw(`UPDATE link_edge_proposals SET status='stale',updated_at=now() WHERE id=$1`, [id]);
+    return { status: 'stale', reason: 'the inference evidence or its audience changed; re-run the inference' };
+  }
   const [current] = await engine.executeRaw<{ a: string; b: string }>(
     `SELECT la.evidence_hash AS a, lb.evidence_hash AS b FROM link_edge_proposals pr
        JOIN link_relationships la ON la.from_page_id = pr.from_page_id AND la.to_page_id = pr.a_to_page_id AND la.link_type = pr.link_type AND la.scope = 'all'
@@ -506,7 +583,11 @@ export async function applyEdgeProposal(engine: BrainEngine, id: number): Promis
     await engine.executeRaw(`UPDATE link_edge_proposals SET status = 'stale', updated_at = now() WHERE id = $1`, [id]);
     return { status: 'stale', reason: 'the relationships changed since the judgment; the next dream cycle re-judges them' };
   }
-  await appendTimelineLine(engine, p.source_id, p.subject_slug, String(dateKey(p.close_date)), p.generated_line);
+  try {
+    await appendTimelineLine(engine, p.source_id, p.subject_slug, String(dateKey(p.close_date)), p.generated_line, guard);
+  } catch {
+    return { status: 'refused', reason: 'canonical publication refused the inference; re-run it against current evidence' };
+  }
   await rederivePage(engine, p.source_id, p.subject_slug);
   const landed = await closureLanded(engine, p);
   await engine.executeRaw(`UPDATE link_edge_proposals SET status = $2, updated_at = now() WHERE id = $1`, [id, landed ? 'applied' : 'proposed']);
@@ -549,10 +630,11 @@ async function trustedCtx(engine: BrainEngine, sourceId: string) {
   } as unknown as import('../operations.ts').OperationContext;
 }
 
-async function appendTimelineLine(engine: BrainEngine, sourceId: string, slug: string, date: string, summary: string): Promise<void> {
-  const { operations } = await import('../operations.ts');
-  const op = operations.find(o => o.name === 'add_timeline_entry')!;
-  await op.handler(await trustedCtx(engine, sourceId), { slug, date, summary, source: DREAM_TIMELINE_SOURCE });
+async function appendTimelineLine(engine: BrainEngine, sourceId: string, slug: string, date: string, summary: string, guard: TimelinePublicationGuard): Promise<void> {
+  const receipt = await submitPageMutation(await trustedCtx(engine, sourceId), {
+    operation: 'add_timeline_entry', params: { slug, date, summary, source: DREAM_TIMELINE_SOURCE }, timelinePublicationGuard: guard,
+  });
+  if (receipt.status === 'pending' || receipt.error) throw new Error('Timeline inference has not completed canonical publication');
 }
 
 async function removeTimelineLine(engine: BrainEngine, sourceId: string, slug: string, date: string, summary: string): Promise<boolean> {
