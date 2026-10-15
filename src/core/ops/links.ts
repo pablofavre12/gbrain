@@ -426,13 +426,14 @@ const get_backlinks: Operation = {
   },
   handler: async (ctx, p) => {
     if (!wantsPagedBacklinks(p)) return readLinkEdges(ctx, p, 'get_backlinks', 'in');
+    const root = await resolveGraphPageRef(ctx, p);
+    const resolvedParams = { ...p, slug: root.slug, page_id: root.id };
     if (p.group !== undefined) {
-      const root = await resolveGraphPageRef(ctx, p);
       const { policy } = await resolveLinkReadScope(ctx, p, 'get_backlinks');
-      return readBacklinkPage(ctx, { ...p, slug: root.slug, page_id: root.id }, policy);
+      return readBacklinkPage(ctx, resolvedParams, policy);
     }
-    const links = await readLinkEdges(ctx, p, 'get_backlinks', 'in');
-    return filterBacklinkRows(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy, links);
+    const links = await readLinkEdges(ctx, resolvedParams, 'get_backlinks', 'in');
+    return filterBacklinkRows(ctx, resolvedParams, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy, links);
   },
   scope: 'read',
   cliHints: { name: 'backlinks', positional: ['slug'] },

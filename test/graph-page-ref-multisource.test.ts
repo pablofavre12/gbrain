@@ -140,3 +140,22 @@ test('typed hops start only at the requested page identity across homonymous roo
     expect(result.answers.map((answer: any) => answer.slug)).toEqual([expected]);
   }
 });
+
+
+test('typed backlinks preserve page_id and source-qualified homonymous roots', async () => {
+  const targetA = await put('default', 'people/typed-target');
+  const targetB = await put('src-b', 'people/typed-target');
+  for (const [sourceId, target] of [['default', targetA], ['src-b', targetB]] as const) {
+    await put(sourceId, `notes/ref-${sourceId}`);
+    await engine.addLinksBatch([{from_slug:`notes/ref-${sourceId}`, to_slug:target.slug,
+      from_source_id:sourceId, to_source_id:sourceId, link_type:'mentions'}]);
+  }
+  for (const target of [targetA, targetB]) {
+    for (const identity of [{page_id:target.id}, {slug:target.slug, source_id:target.source_id}]) {
+      const result = await backlinks.handler(ctx(['default','src-b']), {...identity, type:'note'}) as any[];
+      expect(result).toHaveLength(1);
+      expect(result[0].to_page_id).toBe(target.id);
+      expect(result[0].from_source_id).toBe(target.source_id);
+    }
+  }
+});

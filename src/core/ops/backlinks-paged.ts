@@ -126,7 +126,7 @@ export async function filterBacklinkRows(ctx: OperationContext, p: Record<string
     const notice: Notice = {
       code: 'listing_truncated', kind: 'info',
       why: `${rows.length} link rows match; ${limit} were returned. For one row per referring page with a cursor, use group: "page".`,
-      fix: { mcp: { tool: 'get_backlinks', arguments: { slug: p.slug, ...(p.source_id !== undefined ? { source_id: p.source_id } : {}),
+      fix: { mcp: { tool: 'get_backlinks', arguments: { slug: p.slug, ...(p.page_id !== undefined ? { page_id: p.page_id } : {}), ...(p.source_id !== undefined ? { source_id: p.source_id } : {}),
         ...(type ? { type } : {}), group: 'page', limit } }, consent: [], actor: 'agent', requires_exclusive: false,
         why: 'Pages through every referring page, newest first, without dropping rows.' },
     };

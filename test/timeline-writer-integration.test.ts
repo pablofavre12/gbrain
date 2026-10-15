@@ -158,7 +158,7 @@ test('local derived instructions retain a write-gate receipt', async () => {
   expect(replay).toMatchObject({created: 0});
 });
 
-for (const scenario of ['allowed', 'denied predecessor', 'denied target', 'foreign source', 'federated foreign source', 'legacy provenance', 'changed evidence'] as const) {
+for (const scenario of ['allowed', 'denied predecessor', 'denied target', 'foreign source', 'federated foreign source', 'legacy provenance', 'changed evidence', 'allowed take', 'invalidated take', 'below-floor take', 'below-floor chunk'] as const) {
   test(`remote cached timeline: ${scenario}`, async () => {
     await truncateAll();
     await engine.executeRaw("INSERT INTO sources(id,name) VALUES('other','Other') ON CONFLICT DO NOTHING");
@@ -177,25 +177,59 @@ for (const scenario of ['allowed', 'denied predecessor', 'denied target', 'forei
     if (scenario === 'denied predecessor' || scenario === 'denied target') {
       await engine.executeRaw("UPDATE pages SET acl_subject_ids=ARRAY['user:owner']::text[] WHERE slug=$1", [scenario === 'denied predecessor' ? older : newer]);
     }
+    const takeEvidence = scenario.endsWith('take');
+    const allowed = scenario === 'allowed' || scenario === 'allowed take';
+    let takeA: number | null = null; let takeB: number | null = null;
+    if (takeEvidence) {
+      for (const slug of [older, newer]) {
+        const page = (await engine.getPage(slug))!;
+        await engine.addTakesBatch([{page_id:page.id, row_num:1, claim:text, kind:'take', holder:'world', weight:0.7}]);
+      }
+      takeA = (await engine.listTakes({page_slug:older}))[0].id;
+      takeB = (await engine.listTakes({page_slug:newer}))[0].id;
+      if (scenario === 'invalidated take') await engine.executeRaw(
+        "INSERT INTO needs_rederive(derived_table,derived_id,source_id,reason) VALUES('takes',$1,'default','fixture')", [String(takeA)]);
+      if (scenario === 'below-floor take') await engine.executeRaw("UPDATE takes SET trust_tier='external_untrusted' WHERE id=$1", [takeA]);
+    }
+    if (scenario === 'below-floor chunk') await engine.executeRaw("UPDATE pages SET trust_tier='external_untrusted' WHERE slug=$1", [older]);
     await seedRun('remote-fixture', newer, '2026-01-01', '2026-02-01');
     const report = {per_query: [{contradictions: [{verdict: 'temporal_evolution', resolution_kind: 'log_timeline_change',
       axis: 'PRIVATE-REPORT-CANARY',
-      a: {slug: older, chunk_id: scenario === 'legacy provenance' ? undefined : aChunk.id, take_id: null,
+      a: {slug: older, chunk_id: scenario === 'legacy provenance' ? undefined : takeEvidence ? null : aChunk.id, take_id: takeA,
         text: scenario === 'changed evidence' ? 'Old content no longer readable' : text, effective_date: '2026-01-01'},
-      b: {slug: newer, chunk_id: bChunk.id, take_id: null, text, effective_date: '2026-02-01'},
+      b: {slug: newer, chunk_id: takeEvidence ? null : bChunk.id, take_id: takeB, text, effective_date: '2026-02-01'},
     }]}]};
     await engine.executeRaw('UPDATE eval_contradictions_runs SET report_json=$1::jsonb WHERE run_id=$2', [JSON.stringify(report), 'remote-fixture']);
     const context: import('../src/core/operations.ts').OperationContext = {engine, remote: true, sourceId: 'default', dryRun: false,
       config: {engine: 'pglite', embedding_disabled: true}, logger: console,
       auth: {token: 'fixture', clientId: 'timeline-reader', scopes: ['read','write'], sourceId: 'default',
-        principal: {kind: 'oauth_client', id: 'timeline-reader'}, allowedSources: scenario === 'federated foreign source' ? ['default','other'] : ['default'], subjectIds: ['user:reader']}};
+        principal: {kind: 'oauth_client', id: 'timeline-reader'}, ...(scenario.startsWith('below-floor') ? {minTrust: 'operator_curated' as const} : {}), allowedSources: scenario === 'federated foreign source' ? ['default','other'] : ['default'], subjectIds: ['user:reader']}};
+    if (takeEvidence) {
+      const listed = await operations.find(op => op.name === 'takes_list')!.handler(context, {page_slug:older}) as unknown[];
+      expect(listed.length).toBe(allowed ? 1 : 0);
+    }
     const operation = operations.find(op => op.name === 'apply_timeline_from_contradictions')!;
     for (const dry_run of [true, false]) {
       const result = await operation.handler(context, {dry_run});
-      expect(JSON.stringify(result).includes('PRIVATE-REPORT-CANARY')).toBe(scenario === 'allowed');
-      if (scenario !== 'allowed') expect(result).toMatchObject({entries: [], considered: 0, created: 0, run_id: null});
+      expect(JSON.stringify(result).includes('PRIVATE-REPORT-CANARY')).toBe(allowed);
+      if (!allowed) expect(result).toMatchObject({entries: [], considered: 0, created: 0, run_id: null});
     }
     const persisted = await engine.executeRaw<{summary: string}>('SELECT summary FROM timeline_entries');
-    expect(persisted.length).toBe(scenario === 'allowed' ? 1 : 0);
+    expect(persisted.length).toBe(allowed ? 1 : 0);
   });
 }
+
+
+test('timeline idempotency does not replay a receipt for a deleted page identity', async () => {
+  await truncateAll();
+  const slug = 'companies/recreated';
+  const first = await engine.putPage(slug, companyPage('First incarnation'));
+  await seedRun('recreated-fixture', slug, '2026-01-01', '2026-02-01');
+  expect((await writeTimelineFromContradictions(engine)).created).toBe(1);
+  expect((await writeTimelineFromContradictions(engine)).created).toBe(0);
+  await engine.executeRaw('DELETE FROM pages WHERE id=$1', [first.id]);
+  const second = await engine.putPage(slug, companyPage('Second incarnation'));
+  expect(second.id).not.toBe(first.id);
+  expect((await writeTimelineFromContradictions(engine)).created).toBe(1);
+  expect(await engine.getTimeline(slug)).toHaveLength(1);
+});

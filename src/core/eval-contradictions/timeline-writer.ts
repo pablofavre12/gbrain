@@ -1,5 +1,6 @@
 import type { OperationContext } from '../ops/contract.ts';
 import { federatedSearchScope, readPolicyOpts } from '../ops/context.ts';
+import { resolveReadEligibility, type ReadEligibility } from '../eligibility/policy.ts';
 import type { PageReadPolicy } from '../types.ts';
 /**
  * eval-contradictions/timeline-writer - materialize temporal findings as
@@ -214,7 +215,7 @@ export interface WriteResult extends BuildResult {
  * findings as idempotent timeline entries. No new probe is triggered; this
  * consumes whatever `gbrain eval suspected-contradictions` last wrote.
  */
-async function visibleReportSide(engine: BrainEngine, side: ReportFindingSide | undefined, policy: PageReadPolicy, sourceId: string): Promise<boolean> {
+async function visibleReportSide(engine: BrainEngine, side: ReportFindingSide | undefined, policy: PageReadPolicy, sourceId: string, eligibility: ReadEligibility): Promise<boolean> {
   if (!side || typeof side.slug !== 'string' || typeof side.text !== 'string') return false;
   // Resolve immutable evidence ids, never a same-slug substitute in another room.
   if (Number.isSafeInteger(side.chunk_id) && Number(side.chunk_id) > 0 && side.take_id == null) {
@@ -222,17 +223,17 @@ async function visibleReportSide(engine: BrainEngine, side: ReportFindingSide | 
       'SELECT page_id,chunk_index,chunk_source FROM content_chunks WHERE id=$1', [side.chunk_id]);
     if (!ref) return false;
     const windows = await engine.getChunkWindows([{page_id: Number(ref.page_id), from_index: Number(ref.chunk_index),
-      to_index: Number(ref.chunk_index), priority: 0}], {...policy, chunkSources: [ref.chunk_source], maxRows: 1});
+      to_index: Number(ref.chunk_index), priority: 0}], {...policy, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged, chunkSources: [ref.chunk_source], maxRows: 1});
     return windows.some(page => page.source_id === sourceId && page.slug === side.slug && page.sealed && page.chunks.some(chunk => chunk.id === side.chunk_id && chunk.chunk_text === side.text));
   }
   if (Number.isSafeInteger(side.take_id) && Number(side.take_id) > 0 && side.chunk_id == null) {
     const [ref] = await engine.executeRaw<{page_id: number}>('SELECT page_id FROM takes WHERE id=$1', [side.take_id]);
     if (!ref) return false;
-    const snapshot = await engine.readPageSnapshot(side.slug, {...policy, pageId: Number(ref.page_id), requireLiveSource: true});
+    const snapshot = await engine.readPageSnapshot(side.slug, {...policy, pageId: Number(ref.page_id), requireLiveSource: true, minTrust: eligibility.floor});
     if (!snapshot || snapshot.page.source_id !== sourceId) return false;
     // Bound work on old reports; unverifiable, changed or revoked evidence stays hidden.
     for (let offset = 0; offset < 10_000; offset += 500) {
-      const takes = await engine.listTakes({...policy, page_id: Number(ref.page_id), active: true, limit: 500, offset});
+      const takes = await engine.listTakes({...policy, page_id: Number(ref.page_id), active: true, limit: 500, offset, eligibility});
       const take = takes.find(take => take.id === side.take_id);
       if (take) return take.claim === side.text;
       if (takes.length < 500) break;
@@ -243,11 +244,23 @@ async function visibleReportSide(engine: BrainEngine, side: ReportFindingSide | 
 
 async function authorizedReport(engine: BrainEngine, report: Record<string, unknown>, context: OperationContext, sourceId: string) {
   const policy = await readPolicyOpts(context, federatedSearchScope(context, sourceId));
+  const eligibility = await resolveReadEligibility(context);
+  const verified = new Map<string, Promise<boolean>>();
+  const visible = (side: ReportFindingSide | undefined) => {
+    const key = JSON.stringify(side ?? null);
+    let result = verified.get(key);
+    if (!result) {
+      result = visibleReportSide(engine, side, policy, sourceId, eligibility);
+      verified.set(key, result);
+    }
+    return result;
+  };
   const perQuery = Array.isArray(report.per_query) ? report.per_query as Array<{contradictions?: unknown}> : [];
   const contradictions: ReportFinding[] = [];
   for (const query of perQuery) {
     for (const finding of Array.isArray(query?.contradictions) ? query.contradictions as ReportFinding[] : []) {
-      if (await visibleReportSide(engine, finding?.a, policy, sourceId) && await visibleReportSide(engine, finding?.b, policy, sourceId)) contradictions.push(finding);
+      if (!TEMPORAL_RESOLUTION_KINDS.has(String(finding?.resolution_kind))) continue;
+      if (await visible(finding?.a) && await visible(finding?.b)) contradictions.push(finding);
     }
   }
   return {per_query: [{contradictions}]};
@@ -274,12 +287,13 @@ export async function writeTimelineFromContradictions(
       const operation = operations.filter(op => !op.localOnly).find(op => op.name === 'add_timeline_entry')!;
       for (const entry of built.entries) {
         const sourceId = entry.source_id ?? 'default';
-        if (!await engine.getPage(entry.slug, { sourceId })) continue;
+        const target = await engine.getPage(entry.slug, { sourceId });
+        if (!target) continue;
         const existing = await engine.executeRaw(`SELECT 1 FROM timeline_entries t JOIN pages p ON p.id=t.page_id
           WHERE p.source_id=$1 AND p.slug=$2 AND t.date=$3::date AND t.summary=$4 AND t.source=$5 LIMIT 1`,
           [sourceId, entry.slug, entry.date, entry.summary, entry.source]);
         if (existing.length) continue;
-        const requestId = 'timeline-probe-' + createHash('sha256').update(JSON.stringify(entry)).digest('hex');
+        const requestId = 'timeline-probe-' + createHash('sha256').update(JSON.stringify({page_id: target.id, entry})).digest('hex');
         await operation.handler(opts.context ? { ...opts.context, sourceId } : { engine, sourceId, remote: false, dryRun: false,
           config: { engine: engine.kind, embedding_disabled: true }, logger: console },
           { slug: entry.slug, date: entry.date, summary: entry.summary, detail: entry.detail,
