@@ -1,3 +1,6 @@
+import type { OperationContext } from '../ops/contract.ts';
+import { federatedSearchScope, readPolicyOpts } from '../ops/context.ts';
+import type { PageReadPolicy } from '../types.ts';
 /**
  * eval-contradictions/timeline-writer - materialize temporal findings as
  * idempotent timeline entries.
@@ -40,6 +43,7 @@
  * no engine. `writeTimelineFromContradictions` is the thin DB-touching wrapper.
  */
 
+import { createHash } from 'node:crypto';
 import type { BrainEngine, TimelineBatchInput } from '../engine.ts';
 
 /**
@@ -56,6 +60,9 @@ const TEMPORAL_RESOLUTION_KINDS = new Set(['log_timeline_change', 'temporal_supe
 interface ReportFindingSide {
   slug?: unknown;
   effective_date?: unknown;
+  chunk_id?: unknown;
+  take_id?: unknown;
+  text?: unknown;
 }
 interface ReportFinding {
   verdict?: unknown;
@@ -207,9 +214,48 @@ export interface WriteResult extends BuildResult {
  * findings as idempotent timeline entries. No new probe is triggered; this
  * consumes whatever `gbrain eval suspected-contradictions` last wrote.
  */
+async function visibleReportSide(engine: BrainEngine, side: ReportFindingSide | undefined, policy: PageReadPolicy, sourceId: string): Promise<boolean> {
+  if (!side || typeof side.slug !== 'string' || typeof side.text !== 'string') return false;
+  // Resolve immutable evidence ids, never a same-slug substitute in another room.
+  if (Number.isSafeInteger(side.chunk_id) && Number(side.chunk_id) > 0 && side.take_id == null) {
+    const [ref] = await engine.executeRaw<{page_id: number; chunk_index: number; chunk_source: string}>(
+      'SELECT page_id,chunk_index,chunk_source FROM content_chunks WHERE id=$1', [side.chunk_id]);
+    if (!ref) return false;
+    const windows = await engine.getChunkWindows([{page_id: Number(ref.page_id), from_index: Number(ref.chunk_index),
+      to_index: Number(ref.chunk_index), priority: 0}], {...policy, chunkSources: [ref.chunk_source], maxRows: 1});
+    return windows.some(page => page.source_id === sourceId && page.slug === side.slug && page.sealed && page.chunks.some(chunk => chunk.id === side.chunk_id && chunk.chunk_text === side.text));
+  }
+  if (Number.isSafeInteger(side.take_id) && Number(side.take_id) > 0 && side.chunk_id == null) {
+    const [ref] = await engine.executeRaw<{page_id: number}>('SELECT page_id FROM takes WHERE id=$1', [side.take_id]);
+    if (!ref) return false;
+    const snapshot = await engine.readPageSnapshot(side.slug, {...policy, pageId: Number(ref.page_id), requireLiveSource: true});
+    if (!snapshot || snapshot.page.source_id !== sourceId) return false;
+    // Bound work on old reports; unverifiable, changed or revoked evidence stays hidden.
+    for (let offset = 0; offset < 10_000; offset += 500) {
+      const takes = await engine.listTakes({...policy, page_id: Number(ref.page_id), active: true, limit: 500, offset});
+      const take = takes.find(take => take.id === side.take_id);
+      if (take) return take.claim === side.text;
+      if (takes.length < 500) break;
+    }
+  }
+  return false;
+}
+
+async function authorizedReport(engine: BrainEngine, report: Record<string, unknown>, context: OperationContext, sourceId: string) {
+  const policy = await readPolicyOpts(context, federatedSearchScope(context, sourceId));
+  const perQuery = Array.isArray(report.per_query) ? report.per_query as Array<{contradictions?: unknown}> : [];
+  const contradictions: ReportFinding[] = [];
+  for (const query of perQuery) {
+    for (const finding of Array.isArray(query?.contradictions) ? query.contradictions as ReportFinding[] : []) {
+      if (await visibleReportSide(engine, finding?.a, policy, sourceId) && await visibleReportSide(engine, finding?.b, policy, sourceId)) contradictions.push(finding);
+    }
+  }
+  return {per_query: [{contradictions}]};
+}
+
 export async function writeTimelineFromContradictions(
   engine: BrainEngine,
-  opts: { sourceId?: string; dryRun?: boolean; days?: number } = {},
+  opts: { sourceId?: string; dryRun?: boolean; days?: number; context?: OperationContext } = {},
 ): Promise<WriteResult> {
   const rows = await engine.loadContradictionsTrend(opts.days ?? 30);
   if (rows.length === 0) {
@@ -219,19 +265,35 @@ export async function writeTimelineFromContradictions(
     };
   }
   const latest = rows[0];
-  const built = buildTimelineEntriesFromReport(latest.report_json, { sourceId: opts.sourceId });
-
+  const remote = opts.context && opts.context.remote !== false;
+  const report = remote ? await authorizedReport(engine, latest.report_json, opts.context!, opts.sourceId ?? 'default') : latest.report_json;
+  const built = buildTimelineEntriesFromReport(report, { sourceId: opts.sourceId });
   let created = 0;
   if (!opts.dryRun && built.entries.length > 0) {
-    created = await engine.addTimelineEntriesBatch(built.entries, { auditSite: 'timeline-writer.contradictions' });
+      const { operations } = await import('../operations.ts');
+      const operation = operations.filter(op => !op.localOnly).find(op => op.name === 'add_timeline_entry')!;
+      for (const entry of built.entries) {
+        const sourceId = entry.source_id ?? 'default';
+        if (!await engine.getPage(entry.slug, { sourceId })) continue;
+        const existing = await engine.executeRaw(`SELECT 1 FROM timeline_entries t JOIN pages p ON p.id=t.page_id
+          WHERE p.source_id=$1 AND p.slug=$2 AND t.date=$3::date AND t.summary=$4 AND t.source=$5 LIMIT 1`,
+          [sourceId, entry.slug, entry.date, entry.summary, entry.source]);
+        if (existing.length) continue;
+        const requestId = 'timeline-probe-' + createHash('sha256').update(JSON.stringify(entry)).digest('hex');
+        await operation.handler(opts.context ? { ...opts.context, sourceId } : { engine, sourceId, remote: false, dryRun: false,
+          config: { engine: engine.kind, embedding_disabled: true }, logger: console },
+          { slug: entry.slug, date: entry.date, summary: entry.summary, detail: entry.detail,
+            source: entry.source, request_id: requestId });
+        created++;
+      }
   }
 
   return {
     ...built,
-    run_id: latest.run_id,
-    ran_at: latest.ran_at,
+    run_id: remote && !built.considered ? null : latest.run_id,
+    ran_at: remote && !built.considered ? null : latest.ran_at,
     created,
-    no_run: false,
+    no_run: Boolean(remote && !built.considered),
     dry_run: !!opts.dryRun,
   };
 }

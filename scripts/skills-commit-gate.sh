@@ -7,7 +7,7 @@
 #   2. check-resolvable --strict (MECE overlap, DRY delegation, filing audit,
 #      routing-eval fixtures)
 #   3. skills.lock.json regen + freshness
-#   4. check-skill-refs (dangling refs, donor remnants, CLI refs warn-only)
+#   4. check-skill-refs (dangling refs, donor remnants, CLI refs, links that leave skills/)
 #
 # Optional: pass changed .md file paths as arguments to also run the harvest
 # privacy linter over them (the merge-lane lint — harvest can't lint merges).
@@ -25,7 +25,8 @@ step() {
   fi
 }
 
-step "conformance + resolver + plugin-manifest tests" bun test --timeout=60000 test/skills-conformance.test.ts test/resolver.test.ts test/openclaw-plugin-manifest.test.ts
+step "conformance + resolver + plugin-manifest tests" bun test --timeout=60000 test/skills-conformance.test.ts test/resolver.test.ts test/openclaw-plugin-manifest.test.ts test/codex-plugin-manifest.test.ts
+step "plugin-tree drift" bash "$(dirname "$0")/check-plugin-tree.sh"
 step "check-resolvable --strict" bun src/cli.ts check-resolvable --strict --skills-dir skills/
 step "skills.lock regen" bun run scripts/generate-skills-manifest.ts
 # The regen may have rewritten the lock on disk. Two stale shapes, both fail:

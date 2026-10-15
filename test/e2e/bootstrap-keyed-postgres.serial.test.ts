@@ -19,14 +19,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
-import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import type { PostgresEngine } from '../../src/core/postgres-engine.ts';
+
 import { addSource } from '../../src/core/sources-ops.ts';
+import { claimWorktree } from '../../src/core/persistence/ownership.ts';
 import { loadCorpusPages } from '../helpers/bootstrap-corpus.ts';
 import { runEmbedCore } from '../../src/commands/embed.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
-import { runSchemaTransition } from '../../src/core/retrieval-upgrade-planner.ts';
+import { runSchemaTransition } from '../../src/core/embedding-migration.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 import { extractTakesFromPages } from '../../src/core/extract-takes-from-pages.ts';
-import { configureGateway, resetGateway } from '../../src/core/ai/gateway.ts';
+import {
+  configureGateway,
+  resetGateway,
+  __unconfigureGatewayForTests,
+} from '../../src/core/ai/gateway.ts';
 import {
   verifyWorkspace,
   VERIFY_PROBE_SLUG,
@@ -34,6 +41,10 @@ import {
   VERIFY_MAGIC_TOKEN,
 } from '../../src/core/bootstrap/verify.ts';
 import type { CapabilityReport } from '../../src/core/capability.ts';
+
+// Cold-path opt-out (conservative): runs runSchemaTransition (embedding-width
+// schema migration) on top of a fresh engine — the base must be cold-built.
+delete process.env.GBRAIN_PGLITE_SNAPSHOT;
 
 const OPENAI = process.env.OPENAI_API_KEY;
 const VOYAGE = process.env.VOYAGE_API_KEY;
@@ -218,6 +229,12 @@ describe.skipIf(!OPENAI && !ANTHROPIC)('keyed auto fact-extraction (LLM takes)',
       title: 'Keyed Extraction Probe',
       compiled_truth: PROSE,
     });
+    // #4473: takes are md-first — the probe page needs a real markdown home
+    // (a page with no locatable .md is skipped, never written DB-only).
+    const repo = join(root, 'brain');
+    mkdirSync(join(repo, 'concepts'), { recursive: true });
+    writeFileSync(join(repo, `${SLUG}.md`), `# Keyed Extraction Probe\n\n${PROSE}\n`, 'utf-8');
+    await engine.setConfig('sync.repo_path', repo);
   }, 120_000);
 
   afterAll(async () => {
@@ -230,7 +247,15 @@ describe.skipIf(!OPENAI && !ANTHROPIC)('keyed auto fact-extraction (LLM takes)',
 
   test('keyless → llm_unavailable, zero claims; keyed → a real fact/take lands', async () => {
     // Keyless contrast: no chat gateway ⇒ the sweep cannot extract anything.
-    resetGateway();
+    // NOT resetGateway(): since #3554 that re-applies the preload's test
+    // baseline, whose factory captures env: { ...process.env } — including
+    // the very ANTHROPIC/OPENAI key this describe is gated on (run-e2e.sh
+    // keeps provider keys via GBRAIN_TEST_KEEP_PROVIDER_KEYS=1). The gateway
+    // would come back chat-available and llm_unavailable could never be true.
+    // __unconfigureGatewayForTests() is the #3554 seam for asserting genuine
+    // no-gateway behavior; the preload's beforeEach restores the baseline
+    // before the next test.
+    __unconfigureGatewayForTests();
     const keyless = await extractTakesFromPages(engine, { bootstrapEnabled: true });
     expect(keyless.llm_unavailable).toBe(true);
     expect(keyless.claims_extracted).toBe(0);
@@ -266,6 +291,7 @@ describe.skipIf(!OPENAI && !ANTHROPIC)('keyed auto fact-extraction (LLM takes)',
 // ───────────────────────────────────────────────────────────────────────────
 describe.skipIf(!DATABASE_URL)('Postgres bootstrap verify (real Postgres)', () => {
   let engine: PostgresEngine;
+  let database: Awaited<ReturnType<typeof isolatedPersistencePostgres>> | undefined;
   let home: string;
   let root: string;
   let ws: string;
@@ -281,18 +307,23 @@ describe.skipIf(!DATABASE_URL)('Postgres bootstrap verify (real Postgres)', () =
     prevHome = process.env.GBRAIN_HOME;
     process.env.GBRAIN_HOME = root;
 
-    engine = new PostgresEngine();
-    await engine.connect({ database_url: DATABASE_URL! });
-    await engine.initSchema();
+    // Source deletion retains durable owner/incarnation bindings. Give this
+    // bootstrap workspace its own brain instead of reusing the shard's owner.
+    database = await isolatedPersistencePostgres(DATABASE_URL!);
+    engine = database.engine;
     await addSource(engine, { id: 'workspace', localPath: join(ws, 'brain'), force: true });
+    await claimWorktree(engine, 'workspace', join(ws, 'brain'));
   }, 60_000);
 
   afterAll(async () => {
-    try { await engine.disconnect(); } catch { /* noop */ }
-    if (prevHome === undefined) delete process.env.GBRAIN_HOME;
-    else process.env.GBRAIN_HOME = prevHome;
-    rmSync(root, { recursive: true, force: true });
-    rmSync(ws, { recursive: true, force: true });
+    try {
+      await database?.close();
+    } finally {
+      if (prevHome === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = prevHome;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(ws, { recursive: true, force: true });
+    }
   });
 
   test('roundtrip + graph_floor + magic_moment pass on Postgres; probes cleaned up', async () => {
@@ -305,13 +336,21 @@ describe.skipIf(!DATABASE_URL)('Postgres bootstrap verify (real Postgres)', () =
     });
 
     // The three probes the task targets — each must pass on real Postgres.
-    for (const c of res.checks.filter((c) => c.id === 'roundtrip')) expect(c.ok).toBe(true);
+    for (const c of res.checks.filter((c) => c.id === 'roundtrip')) expect(c.ok, c.detail).toBe(true);
     const graph = res.checks.find((c) => c.id === 'graph_floor');
     expect(graph?.ok).toBe(true);
     const magic = res.checks.find((c) => c.id === 'magic_moment');
     expect(magic?.ok).toBe(true);
 
-    // Probe cleanup [G13] must hold on the Postgres DDL path too.
+    // Probe cleanup [G13] must hold on the Postgres DDL path too. Since
+    // v0.46.6.0 (#4170, closing #4142) verify's probe cleanup HARD-deletes
+    // via the trusted engine primitive — probes are not user content and
+    // verify is a trusted local caller; the old soft-delete path left
+    // tombstones in user brains until the 72h purge. Assert NO probe rows
+    // remain at all, active or tombstoned. (This hunk shipped in #4171
+    // still asserting the pre-#4170 soft-delete contract — the merge-base
+    // collision flagged in that PR's review thread — and broke the Postgres
+    // e2e lane on master; repaired here.)
     const probePages = await engine.executeRaw<{ n: number }>(
       `SELECT COUNT(*)::int AS n FROM pages WHERE source_id = $1 AND slug IN ($2, $3)`,
       ['workspace', VERIFY_PROBE_SLUG, VERIFY_PROBE_ENTITY_SLUG],

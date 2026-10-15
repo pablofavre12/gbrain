@@ -50,11 +50,11 @@ let buildFailReason = '';
     built = true;
   }
   if (!built) {
-    // On CI (or wherever GBRAIN_REQUIRE_COMPILE=1 is set) a failed compile
+    // On CI (or wherever GBRAIN_TEST_REQUIRE_COMPILE=1 is set) a failed compile
     // must be a loud red — skipIf(!built) would otherwise become a PERMANENT
     // silent skip the moment `bun build --compile` breaks. Dev boxes keep
     // the graceful skip.
-    if (process.env.GITHUB_ACTIONS || process.env.GBRAIN_REQUIRE_COMPILE === '1') {
+    if (process.env.GITHUB_ACTIONS || process.env.GBRAIN_TEST_REQUIRE_COMPILE === '1') {
       throw new Error(`[bootstrap-compiled-binary] compile is required in this environment but failed: ${buildFailReason}`);
     }
     console.error(`[bootstrap-compiled-binary] SKIPPING: ${buildFailReason}`);
@@ -141,6 +141,41 @@ describe('bootstrap compiled-binary render [ENG-6] (serial e2e)', () => {
     // as done and not as a crash.
     const render = parsed.phases.find((p) => p.id === 'render')!;
     expect(render.state).toBe('partial');
+  }, 180_000);
+
+  // #4266: bundled schema packs must ride the compiled binary the same way
+  // the bootstrap templates do. Pre-fix, the import.meta-relative pack paths
+  // pointed at directories absent from /$bunfs, so EVERY bundled pack lookup
+  // failed: `schema active` printed `unknown schema pack: gbrain-base` and
+  // `schema show <bundled>` printed `Unknown pack`.
+  test.skipIf(!built)('compiled `schema active` + `schema show` resolve bundled packs (#4266)', () => {
+    // Exercises load-active.ts:defaultPackLocator (default pack gbrain-base).
+    const active = spawnSync(binPath, ['schema', 'active'], {
+      cwd: emptyWs,
+      env: childEnv,
+      encoding: 'utf8',
+      timeout: 120_000,
+    });
+    expect(active.error).toBeUndefined();
+    if (active.status !== 0) {
+      throw new Error(`schema active exited ${active.status}\nstdout: ${active.stdout}\nstderr: ${active.stderr}`);
+    }
+    expect(active.stdout).toContain('Active pack: gbrain-base');
+
+    // Exercises schema.ts:packPathByName (explicit bundled-pack lookup).
+    const show = spawnSync(binPath, ['schema', 'show', 'gbrain-base-v2', '--json'], {
+      cwd: emptyWs,
+      env: childEnv,
+      encoding: 'utf8',
+      timeout: 120_000,
+    });
+    expect(show.error).toBeUndefined();
+    if (show.status !== 0) {
+      throw new Error(`schema show exited ${show.status}\nstdout: ${show.stdout}\nstderr: ${show.stderr}`);
+    }
+    const manifest = JSON.parse(show.stdout) as { name: string; page_types: unknown[] };
+    expect(manifest.name).toBe('gbrain-base-v2');
+    expect(manifest.page_types.length).toBeGreaterThan(0);
   }, 180_000);
 
   test.skipIf(built)('SKIPPED: bun build --compile unavailable in this environment', () => {

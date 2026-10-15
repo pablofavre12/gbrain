@@ -190,6 +190,18 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
     requiresSeededEntity: true,
     expect: [{ path: 'card.open_threads', absentOrNotContains: 'PRIVATE-SENTINEL' }],
   },
+  {
+    name: 'entity without the required name param is invalid_params with a suggestion',
+    verb: 'entity',
+    params: {},
+    // Unlike the remember missing-provenance case above (expectSuggestion:
+    // false — a bare transport-level rejection is tolerated there), this case
+    // holds servers to the full protocol envelope: any server that answers
+    // with `error: "invalid_params"` JSON is speaking MEMORY_VERBS v1, and
+    // v1 mandates a POPULATED suggestion on every verb error (F-D).
+    expectErrorCode: 'invalid_params',
+    expectSuggestion: true,
+  },
 
   // ── forget: idempotency + not_found ─────────────────────────────────────
   {
@@ -207,6 +219,17 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
     expect: [{ path: 'expired', equals: false }],
   },
   {
+    name: 'remember of the forgotten claim is refused invalid_params with a suggestion (a withdrawn object, when present, is schema-valid)',
+    verb: 'remember',
+    params: {
+      fact: 'conformance {{marker}}: expiring fact',
+      provenance: 'conformance run {{marker}}',
+      entity: 'people/conformance-{{marker}}',
+    },
+    expectErrorCode: 'invalid_params',
+    expectSuggestion: true,
+  },
+  {
     name: 'forget unknown id returns not_found with a suggestion',
     verb: 'forget',
     params: { id: '999999999' },
@@ -222,6 +245,25 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
     requiresSynthesizeFlag: true,
     // Either a schema-valid answer (key configured) or a clean unavailable
     // error (no key). The runner accepts both; anything else fails.
+    // v0.45.x: the answer path also validates the additive compose-status
+    // fields (synthesis_status enum incl. extractive_fallback, pages_gathered,
+    // takes_gathered, warnings) via RESPONSE_SCHEMAS.synthesize — present on
+    // post-v0.45.x servers, never required (additive-forever).
+  },
+  {
+    name: 'synthesize without an LLM is a clean unavailable error (never a raw throw) — cost-gated, pass --synthesize',
+    verb: 'synthesize',
+    params: { question: 'Conformance {{marker}}: keyless error-path probe' },
+    requiresSynthesizeFlag: true,
+    // The ERROR-path fixture for synthesize. Dual-mode by necessity (a keyed
+    // external server legitimately answers, and the runner's synthesize
+    // branch accepts that arm): what this case pins is the KEYLESS arm — a
+    // server with no configured LLM MUST convert that state into the protocol
+    // envelope `error: "unavailable"` with a non-empty suggestion and
+    // protocol_version 1 (validated via ERROR_SCHEMA), never a raw throw or a
+    // fabricated answer. CI self-certification runs the suite keyless with
+    // the flag ON (memory-verbs-conformance.test.ts), so the error arm is
+    // exactly what CI asserts.
   },
 
   // ── v0.45.7 additive verbs: context_pack + delta ──────────────────────────
@@ -235,6 +277,13 @@ export const CONFORMANCE_CASES: ConformanceCase[] = [
     expect: [
       { path: 'protocol_version', equals: 1 },
     ],
+  },
+  {
+    name: 'context_pack with a malformed since is invalid_params with a suggestion',
+    verb: 'context_pack',
+    params: { entities: 'conformance-nonexistent-{{marker}}', since: 'not-a-timestamp' },
+    expectErrorCode: 'invalid_params',
+    expectSuggestion: true,
   },
   {
     name: 'delta with an explicit epoch since returns a schema-valid delta',

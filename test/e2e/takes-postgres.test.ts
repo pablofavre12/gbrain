@@ -13,7 +13,7 @@
  * - MCP dispatch with per-token allow-list (defense-in-depth Codex P0 #3)
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { setupDB, teardownDB, hasDatabase, getEngine } from './helpers.ts';
+import { setupLegacyEmbeddingDB, teardownDB, hasDatabase, getEngine } from './helpers.ts';
 import { extractTakesFromDb } from '../../src/core/cycle/extract-takes.ts';
 import { dispatchToolCall } from '../../src/mcp/dispatch.ts';
 import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../../src/core/takes-fence.ts';
@@ -26,7 +26,7 @@ let acmePageId: number;
 
 beforeAll(async () => {
   if (!RUN) return;
-  const engine = await setupDB();
+  const engine = await setupLegacyEmbeddingDB();
   const alice = await engine.putPage('people/alice-example', {
     title: 'Alice', type: 'person', compiled_truth: '## Takes\n',
   });
@@ -179,6 +179,9 @@ d('v0.28 takes engine — Postgres', () => {
     const stale = await engine.listStaleTakes();
     expect(stale.length).toBe(count);
     expect(stale[0]).toHaveProperty('take_id');
+    expect(typeof stale[0]!.take_id).toBe('number');
+    expect(typeof stale[0]!.row_num).toBe('number');
+    expect(() => JSON.stringify(stale)).not.toThrow();
   });
 });
 

@@ -1,0 +1,260 @@
+{
+  "golden": {
+    "domain": "timeline",
+    "methods": {
+      "addTimelineEntriesBatch": {
+        "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "object"
+            ],
+            "sql": "INSERT INTO timeline_entries (page_id, date, source, summary, detail) SELECT p.id, v.date::date, v.source, v.summary, v.detail FROM jsonb_to_recordset(($1::jsonb)->'rows') AS v(slug text, date text, source text, summary text, detail text, source_id text) JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id AND p.deleted_at IS NULL ON CONFLICT (page_id, date, md5(summary), source) DO NOTHING RETURNING 1",
+            "textSha256": "92426c186138e36392752cd6048f9f7aabce12980de33ed4ec77c6f10c38a259"
+          }
+        ]
+      },
+      "addTimelineEntry": {
+        "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "WITH page_state AS ( SELECT id FROM pages WHERE slug = $1 AND source_id = $2 FOR KEY SHARE ), inserted AS ( INSERT INTO timeline_entries (page_id, date, source, summary, detail) SELECT id, $3::date, $4, $5, $6 FROM page_state ON CONFLICT (page_id, date, md5(summary), source) DO NOTHING RETURNING 1 ) SELECT EXISTS(SELECT 1 FROM page_state) AS page_exists, EXISTS(SELECT 1 FROM inserted) AS inserted",
+            "textSha256": "a98b104c08f207cb480189e9ff85daec3e2363e4e4295637333ba0ac02b94e4f"
+          }
+        ]
+      },
+      "applyTimelineBaseline": {
+        "empty": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string"
+            ],
+            "sql": "SELECT p.slug,p.source_id,to_char(COALESCE((SELECT min(v.snapshot_at) FROM page_versions v WHERE v.page_id=p.id),p.created_at),'YYYY-MM-DD') AS date FROM pages p WHERE p.type IN ('person','company') AND p.deleted_at IS NULL AND ($1::text IS NULL OR p.source_id=$2) AND NOT EXISTS(SELECT 1 FROM timeline_entries t WHERE t.page_id=p.id) ORDER BY p.source_id,p.id",
+            "textSha256": "da3507ca83e2acb84c374f7c93e02e947aac56e616df41269196df3402b59087"
+          }
+        ]
+      },
+      "getLastSeen": {
+        "asof+sourceId": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "SELECT te.date::text AS last_date, ep.slug AS last_event_slug FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id AND ep.source_id = $1 WHERE (te.event_page_id IS NULL OR ep.deleted_at IS NULL) AND te.date <= $2::date AND ( p.slug = $3 OR (ep.id IS NOT NULL AND EXISTS ( SELECT 1 FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(ep.frontmatter->'event'->'who') = 'array' THEN ep.frontmatter->'event'->'who' ELSE '[]'::jsonb END ) AS w(name) WHERE w.name = $4 OR w.name LIKE $5 ESCAPE '\\' OR w.name LIKE $6 ESCAPE '\\' )) ) AND p.source_id = $7 ORDER BY te.date DESC, COALESCE(ep.effective_date, te.date::timestamptz) DESC, te.id DESC LIMIT 1",
+            "textSha256": "313661eb986d22f2f118956a5418bd8c00800a5ce754aedd05ee34a0ae1d11c1"
+          }
+        ],
+        "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "SELECT te.date::text AS last_date, ep.slug AS last_event_slug FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id WHERE (te.event_page_id IS NULL OR ep.deleted_at IS NULL) AND te.date <= current_date AND ( p.slug = $1 OR (ep.id IS NOT NULL AND EXISTS ( SELECT 1 FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(ep.frontmatter->'event'->'who') = 'array' THEN ep.frontmatter->'event'->'who' ELSE '[]'::jsonb END ) AS w(name) WHERE w.name = $2 OR w.name LIKE $3 ESCAPE '\\' OR w.name LIKE $4 ESCAPE '\\' )) ) ORDER BY te.date DESC, COALESCE(ep.effective_date, te.date::timestamptz) DESC, te.id DESC LIMIT 1",
+            "textSha256": "6c4eae9ea70ed537a4e8fdf700fc37dd074fe80eeea853db49db88e206fac7de"
+          }
+        ]
+      },
+      "getOnThisDay": {
+        "date+sourceIds": [
+          {
+            "lane": "pool",
+            "params": [
+              "array<string>",
+              "string",
+              "string",
+              "string",
+              "array<string>",
+              "number"
+            ],
+            "sql": "SELECT te.date::text AS date, te.summary, te.detail, te.source, te.page_id, p.slug AS page_slug, te.event_page_id, ep.slug AS event_slug, ep.effective_date::text AS effective_date, ep.frontmatter->'event'->>'kind' AS kind FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id AND ep.source_id = ANY($1::text[]) WHERE EXTRACT(MONTH FROM te.date) = EXTRACT(MONTH FROM $2::date) AND EXTRACT(DAY FROM te.date) = EXTRACT(DAY FROM $3::date) AND te.date < $4::date AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL) AND p.source_id = ANY($5::text[]) ORDER BY te.date DESC, te.id ASC LIMIT $6",
+            "textSha256": "6c088cf61240d78e60b1924b9b4689473de81a2fe36861df242839969e78bf7c"
+          }
+        ],
+        "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "number"
+            ],
+            "sql": "SELECT te.date::text AS date, te.summary, te.detail, te.source, te.page_id, p.slug AS page_slug, te.event_page_id, ep.slug AS event_slug, ep.effective_date::text AS effective_date, ep.frontmatter->'event'->>'kind' AS kind FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id WHERE EXTRACT(MONTH FROM te.date) = EXTRACT(MONTH FROM current_date) AND EXTRACT(DAY FROM te.date) = EXTRACT(DAY FROM current_date) AND te.date < current_date AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL) ORDER BY te.date DESC, te.id ASC LIMIT $1",
+            "textSha256": "49e2f39a4681e0b4c3ff7b76c7a1c2eb10905a26e19f309b78ad17b318b942c8"
+          }
+        ]
+      },
+      "getSince": {
+        "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.date::text AS date, te.summary, te.detail, te.source, te.page_id, p.slug AS page_slug, te.event_page_id, ep.slug AS event_slug, ep.effective_date::text AS effective_date, ep.frontmatter->'event'->>'kind' AS kind FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id WHERE te.date >= $1::date AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL) ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC LIMIT $2",
+            "textSha256": "f35737d9a69d30238abfacbffde869fbdb1da8249df7df9112a365e5632f6295"
+          }
+        ],
+        "kind+sourceId": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.date::text AS date, te.summary, te.detail, te.source, te.page_id, p.slug AS page_slug, te.event_page_id, ep.slug AS event_slug, ep.effective_date::text AS effective_date, ep.frontmatter->'event'->>'kind' AS kind FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id AND ep.source_id = $1 WHERE te.date >= $2::date AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL) AND ep.frontmatter->'event'->>'kind' = $3 AND p.source_id = $4 ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC LIMIT $5",
+            "textSha256": "6ba76a89e218ef56af4be3b5f9018f99371ae5e8f4d40b781d22daa65bad880c"
+          }
+        ]
+      },
+      "getTimeline": {
+        "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.* FROM sources s CROSS JOIN LATERAL (SELECT * FROM pages WHERE source_id = s.id AND slug = $1 OFFSET 0) p JOIN timeline_entries te ON te.page_id = p.id WHERE p.slug = $2 ORDER BY te.date DESC, te.id DESC LIMIT $3",
+            "textSha256": "5382374e710882e34fbaa198e47fae8a284f19aea93319c2b59087ae538275a0"
+          }
+        ],
+        "excludePrivate": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.* FROM sources s CROSS JOIN LATERAL (SELECT * FROM pages WHERE source_id = s.id AND slug = $1 OFFSET 0) p JOIN timeline_entries te ON te.page_id = p.id WHERE p.slug = $2 AND ((COALESCE(p.frontmatter->>'visibility', CASE WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(p.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN p.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = p.source_id AND derived_origin.slug = p.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = p.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN p.type = 'event' AND p.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = p.source_id AND chronicle_origin.slug = p.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = p.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') = 'array' THEN p.frontmatter->'derived_from' ELSE jsonb_build_array(p.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) AND (te.event_page_id IS NULL OR EXISTS ( SELECT 1 FROM pages event_private WHERE event_private.id = te.event_page_id AND ((COALESCE(event_private.frontmatter->>'visibility', CASE WHEN (event_private.type IN ('atom', 'question') OR (event_private.type = 'concept' AND event_private.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(event_private.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN event_private.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = event_private.source_id AND derived_origin.slug = event_private.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (event_private.type IN ('atom', 'question') OR (event_private.type = 'concept' AND event_private.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = event_private.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN event_private.type = 'event' AND event_private.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = event_private.source_id AND chronicle_origin.slug = event_private.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(event_private.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = event_private.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(event_private.frontmatter->'derived_from') = 'array' THEN event_private.frontmatter->'derived_from' ELSE jsonb_build_array(event_private.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) )) ORDER BY te.date DESC, te.id DESC LIMIT $3",
+            "textSha256": "63d80850f44a48e533da073f6ff33cd726b09ae2646b1181bcbd44c89c8e00d8"
+          }
+        ],
+        "sourceId": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.* FROM timeline_entries te JOIN pages p ON p.id = te.page_id WHERE p.slug = $1 AND p.source_id = $2 ORDER BY te.date DESC, te.id DESC LIMIT $3",
+            "textSha256": "f9eb63cd436bf0e6268fa2ea2cfaab1cd728a4a1dfe312316788c30f7b028c75"
+          }
+        ],
+        "sourceIds+after+before": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "array<string>",
+              "string",
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.* FROM timeline_entries te JOIN pages p ON p.id = te.page_id WHERE p.slug = $1 AND p.source_id = ANY($2::text[]) AND te.date >= $3::date AND te.date <= $4::date ORDER BY te.date DESC, te.id DESC LIMIT $5",
+            "textSha256": "53c9053a21716e890173cb008cd12796667cfb4b1112450805b3637fe1aa8f03"
+          }
+        ]
+      },
+      "getTimelineForDate": {
+        "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.date::text AS date, te.summary, te.detail, te.source, te.page_id, p.slug AS page_slug, te.event_page_id, ep.slug AS event_slug, ep.effective_date::text AS effective_date, ep.frontmatter->'event'->>'kind' AS kind FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id WHERE te.date >= $1::date AND te.date <= $2::date AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL) ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC LIMIT $3",
+            "textSha256": "bd8d9354132110a759743a7cdd52ec0708ac841f8cc73400da9f6d7aadbb2d0e"
+          }
+        ],
+        "excludePrivate": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.date::text AS date, te.summary, te.detail, te.source, te.page_id, p.slug AS page_slug, te.event_page_id, ep.slug AS event_slug, ep.effective_date::text AS effective_date, ep.frontmatter->'event'->>'kind' AS kind FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id WHERE te.date >= $1::date AND te.date <= $2::date AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL) AND ((COALESCE(p.frontmatter->>'visibility', CASE WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(p.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN p.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = p.source_id AND derived_origin.slug = p.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = p.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN p.type = 'event' AND p.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = p.source_id AND chronicle_origin.slug = p.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = p.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') = 'array' THEN p.frontmatter->'derived_from' ELSE jsonb_build_array(p.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) AND (te.event_page_id IS NULL OR EXISTS ( SELECT 1 FROM pages event_private WHERE event_private.id = te.event_page_id AND ((COALESCE(event_private.frontmatter->>'visibility', CASE WHEN (event_private.type IN ('atom', 'question') OR (event_private.type = 'concept' AND event_private.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(event_private.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN event_private.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = event_private.source_id AND derived_origin.slug = event_private.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (event_private.type IN ('atom', 'question') OR (event_private.type = 'concept' AND event_private.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = event_private.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN event_private.type = 'event' AND event_private.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = event_private.source_id AND chronicle_origin.slug = event_private.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(event_private.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = event_private.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(event_private.frontmatter->'derived_from') = 'array' THEN event_private.frontmatter->'derived_from' ELSE jsonb_build_array(event_private.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) )) ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC LIMIT $3",
+            "textSha256": "0e6e190e1f528402704dbfb67e5ef82d16736b66ba50312b7cacc53dbebdac38"
+          }
+        ],
+        "sourceIds+excludePrivate": [
+          {
+            "lane": "pool",
+            "params": [
+              "array<string>",
+              "string",
+              "string",
+              "array<string>",
+              "number"
+            ],
+            "sql": "SELECT te.date::text AS date, te.summary, te.detail, te.source, te.page_id, p.slug AS page_slug, te.event_page_id, ep.slug AS event_slug, ep.effective_date::text AS effective_date, ep.frontmatter->'event'->>'kind' AS kind FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id AND ep.source_id = ANY($1::text[]) WHERE te.date >= $2::date AND te.date <= $3::date AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL) AND p.source_id = ANY($4::text[]) AND ((COALESCE(p.frontmatter->>'visibility', CASE WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(p.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN p.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = p.source_id AND derived_origin.slug = p.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = p.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN p.type = 'event' AND p.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = p.source_id AND chronicle_origin.slug = p.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = p.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') = 'array' THEN p.frontmatter->'derived_from' ELSE jsonb_build_array(p.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) AND (te.event_page_id IS NULL OR EXISTS ( SELECT 1 FROM pages event_private WHERE event_private.id = te.event_page_id AND ((COALESCE(event_private.frontmatter->>'visibility', CASE WHEN (event_private.type IN ('atom', 'question') OR (event_private.type = 'concept' AND event_private.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(event_private.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN event_private.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = event_private.source_id AND derived_origin.slug = event_private.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (event_private.type IN ('atom', 'question') OR (event_private.type = 'concept' AND event_private.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = event_private.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN event_private.type = 'event' AND event_private.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = event_private.source_id AND chronicle_origin.slug = event_private.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(event_private.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = event_private.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(event_private.frontmatter->'derived_from') = 'array' THEN event_private.frontmatter->'derived_from' ELSE jsonb_build_array(event_private.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) )) ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC LIMIT $5",
+            "textSha256": "1f0546580644cc796457cedbe96d9267109ce3b2e9852d8579b83ead44bc6d05"
+          }
+        ],
+        "week+sourceId": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string",
+              "number"
+            ],
+            "sql": "SELECT te.date::text AS date, te.summary, te.detail, te.source, te.page_id, p.slug AS page_slug, te.event_page_id, ep.slug AS event_slug, ep.effective_date::text AS effective_date, ep.frontmatter->'event'->>'kind' AS kind FROM timeline_entries te JOIN pages p ON p.id = te.page_id AND p.deleted_at IS NULL LEFT JOIN pages ep ON ep.id = te.event_page_id AND ep.source_id = $1 WHERE te.date >= date_trunc('week', $2::date)::date AND te.date <= (date_trunc('week', $3::date) + interval '6 days')::date AND (te.event_page_id IS NULL OR ep.deleted_at IS NULL) AND p.source_id = $4 ORDER BY COALESCE(ep.effective_date, te.date::timestamptz) ASC, te.id ASC LIMIT $5",
+            "textSha256": "d93fda11f284babc3085f16c7a68f80472355b5537d14d571d41934d18a40a47"
+          }
+        ]
+      },
+      "upsertEventProjection": {
+        "default": [
+          {
+            "lane": "pool",
+            "params": [
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string",
+              "string"
+            ],
+            "sql": "INSERT INTO timeline_entries (page_id, date, source, summary, detail, event_page_id) SELECT dp.id, $1::date, $2, $3, $4, ep.id FROM pages dp, pages ep WHERE dp.slug = $5 AND dp.source_id = $6 AND ep.slug = $7 AND ep.source_id = $8 ON CONFLICT (event_page_id, date) WHERE event_page_id IS NOT NULL DO UPDATE SET summary = EXCLUDED.summary, detail = EXCLUDED.detail, page_id = EXCLUDED.page_id, source = EXCLUDED.source RETURNING id",
+            "textSha256": "f169a96fdc2a8f3a145af8736a4b48d3efd00c7df600b72f0f53f3f4c663497e"
+          }
+        ]
+      }
+    }
+  },
+  "normalizer": "sql-text-v1"
+}

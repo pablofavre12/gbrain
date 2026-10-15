@@ -18,6 +18,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { installFixtureChunks } from '../helpers/page-projection.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import {
   awaitPendingSearchCacheWrites,
@@ -29,7 +30,7 @@ import {
   resetGateway,
   __setEmbedTransportForTests,
 } from '../../src/core/ai/gateway.ts';
-import type { PageInput, SearchOpts } from '../../src/core/types.ts';
+import type { PageInput, SearchOpts, SearchResult } from '../../src/core/types.ts';
 import type { RerankInput, RerankResult } from '../../src/core/ai/gateway.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -83,7 +84,7 @@ beforeAll(async () => {
   ];
   for (const [slug, page, chunkText] of pages) {
     await engine.putPage(slug, page);
-    await engine.upsertChunks(slug, [
+    await installFixtureChunks(engine, slug, [
       { chunk_index: 0, chunk_text: chunkText, chunk_source: 'compiled_truth' },
     ]);
   }
@@ -115,7 +116,7 @@ beforeAll(async () => {
       subject: 'Vector-first exact subject',
     },
   });
-  await engine.upsertChunks('mail/vector-first', [{
+  await installFixtureChunks(engine, 'mail/vector-first', [{
     chunk_index: 0,
     chunk_text: 'vector first duplicate metadata evidence',
     chunk_source: 'compiled_truth',
@@ -130,6 +131,40 @@ afterAll(async () => {
   if (prevGbrainHome === undefined) delete process.env.GBRAIN_HOME;
   else process.env.GBRAIN_HOME = prevGbrainHome;
   rmSync(isolatedHome, { recursive: true, force: true });
+});
+
+// Value: protects=vector and hybrid retrieval exclude inaccessible text before reranking;
+// fails_when=the vector arm or hybrid candidate propagation drops page ACL subjects;
+// why_new=keyword ACL and cache-key tests never seed vectors or inspect reranker input;
+// seam=none; no_claim=live provider acceptance, semantic quality or relational retrieval.
+test('real vector candidates enforce page ACL before reaching the reranker', async () => {
+  const fixtures = [
+    {slug:'notes/acl-vector-hidden',text:'HIDDENVECTORSECRET',subjects:['user:alice'],embedding:FAKE_EMB},
+    {slug:'notes/acl-vector-visible',text:'VISIBLEVECTORCONTROL',subjects:null,embedding:FAKE_EMB.map((n,i)=>i===1?n+0.1:n)},
+  ];
+  try {
+    for (const f of fixtures) {
+      await engine.putPage(f.slug,{type:'note',title:f.text,compiled_truth:f.text,acl_subject_ids:f.subjects});
+      await installFixtureChunks(engine,f.slug,[{chunk_index:0,chunk_text:f.text,chunk_source:'compiled_truth',embedding:Float32Array.from(f.embedding)}]);
+    }
+    const vector = Float32Array.from(FAKE_EMB);
+    const own = await engine.searchVector(vector,{sourceId:'default',aclSubjectIds:['user:alice'],limit:30});
+    expect(own.some(row=>row.slug==='notes/acl-vector-hidden')).toBe(true);
+    const other = await engine.searchVector(vector,{sourceId:'default',aclSubjectIds:['user:bob'],limit:30});
+    expect(other.some(row=>row.slug==='notes/acl-vector-hidden')).toBe(false);
+    expect(other.some(row=>row.slug==='notes/acl-vector-visible')).toBe(true);
+    let documents:string[]=[];
+    const results = await hybridSearch(engine,'query with no matching lexical fixture',{sourceId:'default',aclSubjectIds:['user:bob'],limit:30,
+      queryEmbedFn:async()=>vector,reranker:{enabled:true,topNIn:30,topNOut:null,rerankerFn:async input=>{
+        documents=input.documents;return input.documents.map((_,index)=>({index,relevanceScore:1-index/100}));
+      }}});
+    expect(documents.join('\n')).toContain('VISIBLEVECTORCONTROL');
+    expect(documents.join('\n')).not.toContain('HIDDENVECTORSECRET');
+    expect(results.some(row=>row.slug==='notes/acl-vector-visible')).toBe(true);
+    expect(results.some(row=>row.slug==='notes/acl-vector-hidden')).toBe(false);
+  } finally {
+    await engine.executeRaw('DELETE FROM pages WHERE slug=ANY($1::text[])',[fixtures.map(f=>f.slug)]);
+  }
 });
 
 describe('hybridSearch — reranker disabled (pass-through)', () => {
@@ -151,7 +186,7 @@ describe('hybridSearch — reranker disabled (pass-through)', () => {
 });
 
 describe('hybridSearchCached — email metadata through vector-first fusion', () => {
-  test('fresh cache miss preserves metadata through vector-first RRF duplicate handling', async () => {
+  test('fresh uncached retrieval preserves metadata through vector-first RRF duplicate handling', async () => {
     await engine.executeRaw(`DELETE FROM query_cache`);
     let cacheStatus: string | undefined;
     const out = await hybridSearchCached(engine, 'vector first duplicate metadata evidence', {
@@ -162,13 +197,14 @@ describe('hybridSearchCached — email metadata through vector-first fusion', ()
       onMeta: (meta) => { cacheStatus = meta.cache?.status; },
     });
 
-    expect(cacheStatus).toBe('miss');
+    expect(cacheStatus).toBe('disabled');
     const matches = out.filter(r => r.slug === 'mail/vector-first');
     expect(matches).toHaveLength(1);
     expect(matches[0].message_id).toBe('<vector-first@example.com>');
     expect(matches[0].thread_id).toBe('thread-vector-first');
     expect(matches[0].source_subject).toBe('Vector-first exact subject');
     await awaitPendingSearchCacheWrites();
+    expect(await engine.executeRaw('SELECT id FROM query_cache')).toHaveLength(0);
   });
 });
 
@@ -279,6 +315,99 @@ describe('hybridSearch — reranker enabled (reorder)', () => {
   });
 });
 
+describe('hybridSearch — onRerankPool fires with the PRE-AUTOCUT returnPool (ranker wave D24, adversarial finding)', () => {
+  // The hook used to fire right after applyReranker, BEFORE the alias hop /
+  // exact-lookup tier / adaptive-return trim — so the captured pool was not
+  // the `returnPool` applyAutocut cuts and the replay could not reproduce
+  // live decisions. It now fires immediately before applyAutocut.
+  const scoringReranker = {
+    enabled: true,
+    topNIn: 30,
+    topNOut: null,
+    rerankerFn: async (input: RerankInput): Promise<RerankResult[]> =>
+      input.documents.map((_, i) => ({ index: i, relevanceScore: 0.9 - i * 0.05 })),
+  };
+
+  test('pool reflects the adaptive-return trim (post-adaptive), preRerank is the full deduped pre-rerank order', async () => {
+    let pool: readonly SearchResult[] | undefined;
+    let pre: readonly SearchResult[] | undefined;
+    let poolLenAtCall = -1;
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      autocut: false,
+      reranker: scoringReranker,
+      // Trim to 2 before autocut/limit. Pre-fix the hook saw the untrimmed
+      // reranked set (4 pages), i.e. NOT autocut's input.
+      adaptiveReturn: { enabled: true, entityMax: 2, otherMax: 2, minKeep: 1 },
+      onRerankPool: (p, preRerank) => { pool = p; pre = preRerank; poolLenAtCall = p.length; },
+    });
+    expect(pool).toBeDefined();
+    expect(pre!.length).toBeGreaterThanOrEqual(3);
+    expect(poolLenAtCall).toBe(2);
+    expect(pool!.length).toBeLessThan(pre!.length);
+    // Reranker ran BEFORE the hook: every pooled row carries a rerank_score.
+    for (const r of pool!) expect(Number.isFinite((r as any).rerank_score)).toBe(true);
+    // With autocut off and limit ≥ pool, the returned rows ARE the pool.
+    expect(out.map(r => r.slug)).toEqual(pool!.map(r => r.slug));
+  });
+
+  test('pool is byte-identical to applyAutocut input: meta.autocut.total === pool.length and kept ⊆ pool', async () => {
+    let pool: readonly SearchResult[] | undefined;
+    let meta: import('../../src/core/types.ts').HybridSearchMeta | undefined;
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      // Per-call autocut is a boolean (the knobs come from the bundle: jump 0.2,
+      // minTop 0.35); the bundle default is OFF since rule R2, so opt in here.
+      autocut: true,
+      reranker: {
+        ...scoringReranker,
+        // A dramatic cliff after the first two documents so autocut cuts.
+        rerankerFn: async (input: RerankInput): Promise<RerankResult[]> =>
+          input.documents.map((_, i) => ({ index: i, relevanceScore: i < 2 ? 0.95 - i * 0.01 : 0.05 })),
+      },
+      onRerankPool: (p) => { pool = [...p]; },
+      onMeta: (m) => { meta = m; },
+    });
+    expect(pool).toBeDefined();
+    expect(meta?.autocut).toBeDefined();
+    expect(meta!.autocut!.total).toBe(pool!.length);
+    expect(meta!.autocut!.kept).toBeLessThan(pool!.length);
+    expect(out.length).toBe(meta!.autocut!.kept);
+    const poolSlugs = new Set(pool!.map(r => r.slug));
+    for (const r of out) expect(poolSlugs.has(r.slug)).toBe(true);
+  });
+
+  test('pool INCLUDES the unscored exact-lookup injection (post exact-lookup tier)', async () => {
+    let sawExactLookupAtCallTime = false;
+    let sawUnscoredRow = false;
+    // Slug-shaped query → structural exact-lookup tier injects/promotes the
+    // page with `exact_lookup` set and no rerank_score. Pre-fix the hook fired
+    // before the tier, so the stamp was absent at call time.
+    await hybridSearch(engine, 'notes/alpha', {
+      limit: 10,
+      autocut: false,
+      reranker: scoringReranker,
+      onRerankPool: (p) => {
+        sawExactLookupAtCallTime = p.some(r => r.exact_lookup !== undefined);
+        sawUnscoredRow = p.some(r => r.exact_lookup !== undefined && !Number.isFinite((r as any).rerank_score));
+      },
+    });
+    expect(sawExactLookupAtCallTime).toBe(true);
+    // Documented contract: injected identity rows arrive unscored and are
+    // part of the pool (autocut's preserve predicate keeps them).
+    expect(sawUnscoredRow).toBe(true);
+  });
+
+  test('a throwing hook never breaks the search', async () => {
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      reranker: scoringReranker,
+      onRerankPool: () => { throw new Error('hook boom'); },
+    });
+    expect(out.length).toBeGreaterThan(0);
+  });
+});
+
 describe('hybridSearch — fail-open contract end-to-end', () => {
   test('rerankerFn throws → results still come back (RRF order preserved)', async () => {
     const baseline = await hybridSearch(engine, 'alpha keyword', { limit: 10 });
@@ -294,4 +423,143 @@ describe('hybridSearch — fail-open contract end-to-end', () => {
     // Same items, same order — applyReranker fail-open.
     expect(reranked.map(r => r.slug)).toEqual(baseline.map(r => r.slug));
   });
+
+  test('#4648: empty rerank result set stamps degraded[] with rerank_passthrough', async () => {
+    const auditDir = mkdtempSync(join(tmpdir(), 'gbrain-rerank-meta-'));
+    const prevAudit = process.env.GBRAIN_AUDIT_DIR;
+    process.env.GBRAIN_AUDIT_DIR = auditDir;
+    try {
+      let degraded: Array<{ stage: string; reason?: string }> = [];
+      const out = await hybridSearch(engine, 'alpha keyword', {
+        limit: 10,
+        reranker: {
+          enabled: true,
+          topNIn: 30,
+          topNOut: null,
+          // HTTP 200 with `{"results":[]}` — the issue's live-verified shape.
+          rerankerFn: async () => [],
+        },
+        onMeta: (meta) => { degraded = meta.degraded ?? []; },
+      });
+      expect(out.length).toBeGreaterThan(0);
+      // Raw RRF order, no scores — and, post-#4648, a visible stamp.
+      expect(out.every(r => r.rerank_score === undefined)).toBe(true);
+      expect(degraded).toContainEqual({ stage: 'rerank_passthrough', reason: 'empty_result_set' });
+    } finally {
+      if (prevAudit === undefined) delete process.env.GBRAIN_AUDIT_DIR;
+      else process.env.GBRAIN_AUDIT_DIR = prevAudit;
+      rmSync(auditDir, { recursive: true, force: true });
+    }
+  });
+
+  test('read-path audit #5: a hard reranker failure stamps degraded[] with rerank_failed', async () => {
+    const auditDir = mkdtempSync(join(tmpdir(), 'gbrain-rerank-failed-'));
+    const prevAudit = process.env.GBRAIN_AUDIT_DIR;
+    process.env.GBRAIN_AUDIT_DIR = auditDir;
+    try {
+      let degraded: Array<{ stage: string; reason?: string }> = [];
+      const out = await hybridSearch(engine, 'alpha keyword', {
+        limit: 10,
+        reranker: {
+          enabled: true,
+          topNIn: 30,
+          topNOut: null,
+          rerankerFn: async () => { throw new Error('HTTP 503 upstream'); },
+        },
+        onMeta: (meta) => { degraded = meta.degraded ?? []; },
+      });
+      expect(out.length).toBeGreaterThan(0);
+      expect(out.every(r => r.rerank_score === undefined)).toBe(true);
+      expect(degraded).toContainEqual({ stage: 'rerank_failed', reason: 'provider_error' });
+    } finally {
+      if (prevAudit === undefined) delete process.env.GBRAIN_AUDIT_DIR;
+      else process.env.GBRAIN_AUDIT_DIR = prevAudit;
+      rmSync(auditDir, { recursive: true, force: true });
+    }
+  });
+
+  test('#4648 contrast: reranker DISABLED pass-through does NOT stamp degraded[]', async () => {
+    let degraded: Array<{ stage: string; reason?: string }> = [];
+    const out = await hybridSearch(engine, 'alpha keyword', {
+      limit: 10,
+      reranker: {
+        enabled: false,
+        topNIn: 30,
+        topNOut: null,
+        rerankerFn: async () => [],
+      },
+      onMeta: (meta) => { degraded = meta.degraded ?? []; },
+    });
+    expect(out.length).toBeGreaterThan(0);
+    expect(degraded.some(d => d.stage === 'rerank_passthrough')).toBe(false);
+  });
+});
+
+describe('#4648 malformed pass-through — meta stamp + caller onPassThrough chain', () => {
+  test('rerankerFn returning null stamps rerank_passthrough/malformed_shape AND chains the caller spy', async () => {
+    const auditDir = mkdtempSync(join(tmpdir(), 'gbrain-rerank-malformed-'));
+    const prevAudit = process.env.GBRAIN_AUDIT_DIR;
+    process.env.GBRAIN_AUDIT_DIR = auditDir;
+    try {
+      let degraded: Array<{ stage: string; reason?: string }> = [];
+      const spy: string[] = [];
+      // Caller-supplied callback: hybridSearch wraps it to stamp meta and MUST
+      // still invoke it (the chain is what lets an eval harness or telemetry
+      // sink observe the pass-through per call). SearchOpts.reranker's declared
+      // shape doesn't list onPassThrough — hybrid.ts reads it through a cast —
+      // so the test hands it over the same way.
+      const rerankerWithSpy = {
+        enabled: true,
+        topNIn: 30,
+        topNOut: null,
+        // A non-array body (e.g. `{"error": "..."}` on HTTP 200) — the
+        // malformed_shape class, distinct from the empty-array class.
+        rerankerFn: (async () => null) as unknown as () => Promise<RerankResult[]>,
+        onPassThrough: (reason: string) => { spy.push(reason); },
+      } as unknown as NonNullable<SearchOpts['reranker']>;
+      const out = await hybridSearch(engine, 'alpha keyword', {
+        limit: 10,
+        reranker: rerankerWithSpy,
+        onMeta: (meta) => { degraded = meta.degraded ?? []; },
+      });
+      expect(out.length).toBeGreaterThan(0);
+      expect(out.every(r => r.rerank_score === undefined)).toBe(true);
+      expect(degraded).toContainEqual({ stage: 'rerank_passthrough', reason: 'malformed_shape' });
+      expect(spy).toEqual(['malformed_shape']);
+    } finally {
+      if (prevAudit === undefined) delete process.env.GBRAIN_AUDIT_DIR;
+      else process.env.GBRAIN_AUDIT_DIR = prevAudit;
+      rmSync(auditDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Value: protects=hybrid exact-slug and alias identity injection obey caller ACL;
+// fails_when=identity tier or hydration drops aclSubjectIds;
+// why_new=direct identity tests cover privacy but not ACL propagation from hybrid;
+// seam=none; no_claim=live embedding or reranking (existing deterministic fixture).
+test('hybrid identity tiers cannot inject ACL-restricted pages', async () => {
+  const slug = 'notes/acl-identity-target';
+  const alias = 'unfindable identity alias';
+  const marker = 'IDENTITYACLSECRETEVIDENCE';
+  await engine.putPage(slug, { type: 'note', title: 'Identity fixture', compiled_truth: marker, acl_subject_ids: ['user:alice'] });
+  await engine.setPageAliases(slug, 'default', [alias]);
+  try {
+    for (const query of [slug, alias]) {
+      const search = (subject: string) => hybridSearch(engine, query, {
+        sourceId: 'default', aclSubjectIds: [subject], limit: 10,
+        queryEmbedFn: () => Float32Array.from(FAKE_EMB), expansion: false,
+        reranker: { enabled: false, topNIn: 30, topNOut: null },
+      });
+      const authorized = await search('user:alice');
+      const identity = authorized.find(r => r.slug === slug);
+      expect(identity?.chunk_text).toContain(marker);
+      expect(query === slug ? identity?.exact_lookup : identity?.alias_hit).toBe(query === slug ? 'slug' : true);
+      const denied = await search('user:bob');
+      expect(denied.map(r => r.slug)).not.toContain(slug);
+      expect(JSON.stringify(denied)).not.toContain(marker);
+    }
+  } finally {
+    await engine.executeRaw('DELETE FROM pages WHERE source_id=$1 AND slug=$2', ['default', slug]);
+  }
 });

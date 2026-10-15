@@ -11,7 +11,14 @@
  * It is intentionally pure: no engine call, no I/O. Inputs are the parsed
  * facts plus the page-level binding (entity slug + source_id). Output is
  * a `FenceExtractedFact[]` — structural superset of `NewFact` that
- * carries the v51 fence columns (`row_num`, `source_markdown_slug`).
+ * carries the v51 fence columns (`row_num`, `source_markdown_slug`) and,
+ * for struck rows, the v0.46 (#3014) supersession-transport fields:
+ *   - `expired_at` stamped on every inactive row (superseded / forgotten
+ *     / inactive-unrecognized) so the row exits active views — there is
+ *     no DB derivation from `valid_until`, so the mapper sets it here.
+ *   - `superseded_by_row` carrying the page-local `superseded by #N`
+ *     reference for the engine's insert-time resolution to a fact id
+ *     (resolver: `src/core/facts/supersede-resolve.ts`).
  *
  * Codex Q7 resolution: engines stay markdown-unaware. The cycle phase
  * (commit 7) and the backstop rewrite (commit 5) call this function to
@@ -19,18 +26,19 @@
  * batch insert.
  *
  * Strikethrough → date derivation:
- *   - `forgotten` rows get `valid_until = today` so the DB's existing
- *     `expired_at = valid_until + now()` rule produces the same forget
- *     state after `gbrain rebuild` (v0.32.3) as before.
+ *   - `forgotten` rows get `valid_until = today` (and `expired_at`) so the
+ *     row is inactive after reconcile.
  *   - `supersededBy` rows preserve their existing `validUntil` if set;
- *     otherwise leave `valid_until = null` (the consolidator phase fills
- *     this in based on the newer row's `valid_from`).
+ *     otherwise leave `valid_until = null`. `expired_at` is set to
+ *     `valid_until ?? today` regardless, so the struck row exits active
+ *     views and satisfies `listSupersessions`.
  *   - Inactive rows with neither flag (parser-tolerated hand-edits) are
  *     treated like `forgotten` for DB-derivation purposes — the user's
  *     strikethrough intent is honored; the lost reason is a JSONL
  *     warning surfaced by extract-facts, not a parse failure.
  */
 
+import { attributionCompatible } from './attribution.ts';
 import type { NewFact, FactKind, FactVisibility } from '../engine.ts';
 import type { ParsedFact } from '../facts-fence.ts';
 
@@ -43,6 +51,14 @@ import type { ParsedFact } from '../facts-fence.ts';
 export type FenceExtractedFact = NewFact & {
   row_num: number;
   source_markdown_slug: string;
+  /**
+   * v0.46 (#3014) — page-local row reference parsed from `~~claim~~` +
+   * `superseded by #N` (the `#N`). NOT a fact id: `facts.superseded_by`
+   * is a FK to `facts.id`, so `insertFacts` resolves this row number to
+   * the target row's id in a second pass. undefined when the row is not
+   * a supersession.
+   */
+  superseded_by_row?: number;
 };
 
 /**
@@ -55,6 +71,27 @@ export type FenceExtractedFact = NewFact & {
  * fencing pre-v51 DB facts that have no `source` recorded.
  */
 export const FENCE_SOURCE_DEFAULT = 'fence:reconcile';
+
+/**
+ * #1781: duplicate ACTIVE fence rows (same claim and source) index once.
+ * Rows two different known speakers asserted are not duplicates (attribution.ts).
+ * Returns the row numbers of the later copies, which extract_facts leaves
+ * out of the index. A struck history row never collapses with an active row
+ * that carries the same text, so a claim that reverts to an earlier value
+ * stays active.
+ */
+export function duplicateActiveFenceRows(facts: ParsedFact[]): Set<number> {
+  const seen = new Map<string, Array<ParsedFact['attributedTo']>>();
+  const duplicates = new Set<number>();
+  for (const f of facts) {
+    if (!f.active) continue;
+    const key = `${f.claim}\u0000${f.source ?? FENCE_SOURCE_DEFAULT}`;
+    const speakers = seen.get(key) ?? [];
+    if (speakers.some(s => attributionCompatible(s, f.attributedTo))) duplicates.add(f.rowNum);
+    else seen.set(key, [...speakers, f.attributedTo]);
+  }
+  return duplicates;
+}
 
 function parseValidDate(s: string | undefined): Date | undefined {
   if (!s) return undefined;
@@ -204,6 +241,15 @@ export function extractFactsFromFenceText(
       validUntil = null;
     }
 
+    // v0.46 (#3014) — struck rows carry their expiry + supersession
+    // reference into the DB. `expired_at` has no DB derivation from
+    // `valid_until` (no trigger, sweep, or read-time coalesce), so the
+    // mapper stamps it explicitly for EVERY inactive row (superseded,
+    // forgotten, or inactive-unrecognized) — that is how a struck row
+    // exits active views. `valid_until ?? today` keeps it deterministic
+    // under nowOverride. Active rows leave it null.
+    const expiredAt: Date | null = !f.active ? (validUntil ?? today) : null;
+
     const row: FenceExtractedFact = {
       fact: f.claim,
       kind: f.kind as FactKind,
@@ -213,10 +259,15 @@ export function extractFactsFromFenceText(
       context: f.context ?? null,
       valid_from: validFrom,
       valid_until: validUntil,
+      expired_at: expiredAt,
       source: f.source ?? FENCE_SOURCE_DEFAULT,
       confidence: f.confidence,
       row_num: f.rowNum,
       source_markdown_slug: slug,
+      // v0.46 (#3014) — carry the page-local `superseded by #N` reference
+      // for insertFacts to resolve to a fact id. undefined for non-struck
+      // rows and for struck rows with no supersession context.
+      superseded_by_row: f.supersededBy,
       // v0.35.4 (D-CDX-5) — typed-claim threading. Metric label normalized
       // here so the DB-side index hits use the canonical name; value /
       // unit / period stored verbatim.
@@ -224,6 +275,7 @@ export function extractFactsFromFenceText(
       claim_value:  f.claimValue ?? null,
       claim_unit:   f.claimUnit ?? null,
       claim_period: f.claimPeriod ?? null,
+      attributed_to: f.attributedTo ?? null,
     };
     return row;
   });

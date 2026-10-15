@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite } from '../persistence/filesystem-guard.ts';
 // v0.40.6.0 Schema Cathedral v3 — pack mutation primitives.
 //
 //                  ┌──────────────────────────────────────────────────────┐
@@ -59,7 +60,7 @@ import type {
   SchemaPackManifest,
 } from './manifest-v1.ts';
 import { PACK_PRIMITIVES } from './manifest-v1.ts';
-import { loadPackFromFile, parseYamlMini } from './loader.ts';
+import { loadPackFromFile, parseYamlMini, SchemaPackLoaderError } from './loader.ts';
 import { invalidatePackCache } from './registry.ts';
 import { invalidateQueryCache } from './query-cache-invalidator.ts';
 import { logMutationFailure, logMutationSuccess, type MutationActor, type MutationOp } from './mutate-audit.ts';
@@ -74,13 +75,16 @@ export class SchemaPackMutationError extends Error {
   readonly code:
     | 'PACK_NOT_FOUND'
     | 'PACK_READONLY'
+    | 'INVALID_PACK_NAME'
     | 'PACK_CORRUPT'
     | 'TYPE_EXISTS'
     | 'TYPE_NOT_FOUND'
     | 'INVALID_PRIMITIVE'
     | 'INVALID_RESULT'
     | 'IO_ERROR'
-    | 'STILL_REFERENCED';
+    | 'STILL_REFERENCED'
+    | 'EMIT_MISMATCH'
+    | 'PACK_TOO_LARGE';
   readonly details?: Record<string, unknown>;
   constructor(
     code: SchemaPackMutationError['code'],
@@ -125,11 +129,40 @@ export interface MutateOpts extends PackLockOpts {
 // ────────────────────────────────────────────────────────────────────────
 
 /**
+ * SECURITY: shared pack-name guard for every caller-supplied pack name that
+ * gets joined into a filesystem path under $GBRAIN_HOME/schema-packs/ — the
+ * mutate path below (locateMutablePackFile, remote-reachable via the admin
+ * schema_apply_mutations op) AND the read path (schema_lint in
+ * ops/schema-packs.ts, remote-reachable at read scope). A traversal-shaped
+ * name (`../`, absolute, separators, NUL) would escape the packs dir; the
+ * leading-alnum requirement blocks '.', '..' and dotfiles, and the charset
+ * blocks every path separator + NUL, so every derived path stays contained
+ * by construction.
+ *
+ * Dots and underscores are deliberately ADMITTED: the manifest schema itself
+ * blesses /^[a-z0-9._-]+$/ (manifest-v1.ts), and `gbrain schema init`/`fork`
+ * never validated names — so packs like 'my_pack' / 'notes.v2' exist legally
+ * and refusing them here would permanently brick their mutation/lint.
+ */
+export function isValidPackName(name: string): boolean {
+  return name.length > 0 && name.length <= 128 && /^[a-z0-9][a-z0-9._-]*$/.test(name);
+}
+
+/**
  * Locate a user-mutable pack file. Bundled packs (gbrain-base,
  * gbrain-recommended) are explicitly refused per D6 — they live inside
  * the installed module and edits would be lost on upgrade.
  */
 export function locateMutablePackFile(name: string): { path: string; format: PackFileFormat } {
+  // SECURITY: isValidPackName (above) keeps the join contained. The message
+  // never echoes a resolved path (existence-oracle discipline).
+  if (!isValidPackName(name)) {
+    throw new SchemaPackMutationError(
+      'INVALID_PACK_NAME',
+      `pack name must be a lowercase slug starting with [a-z0-9] (matching ^[a-z0-9][a-z0-9._-]*$, max 128 chars); got ${JSON.stringify(name.slice(0, 64))}`,
+      { pack: name.slice(0, 64) },
+    );
+  }
   if (BUNDLED_PACK_NAMES.has(name)) {
     throw new SchemaPackMutationError(
       'PACK_READONLY',
@@ -163,7 +196,7 @@ export function locateMutablePackFile(name: string): { path: string; format: Pac
 // Does NOT preserve comments or original formatting (documented in plan).
 // ────────────────────────────────────────────────────────────────────────
 
-function emitYaml(value: unknown): string {
+export function emitYaml(value: unknown): string {
   return emitYamlNode(value, 0).trimEnd() + '\n';
 }
 
@@ -283,20 +316,55 @@ function writeAtomic(path: string, body: string): void {
   }
 }
 
-function writePackManifest(
+/** Key-order-insensitive canonical form for the emit guard. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const o = value as Record<string, unknown>;
+    return `{${Object.keys(o).sort().filter(k => o[k] !== undefined).map(k => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** The first top-level key whose canonical form differs, for the EMIT_MISMATCH message. */
+function firstDivergingKey(a: unknown, b: unknown): string | null {
+  const ao = (a ?? {}) as Record<string, unknown>;
+  const bo = (b ?? {}) as Record<string, unknown>;
+  for (const k of new Set([...Object.keys(ao), ...Object.keys(bo)])) {
+    if (canonicalJson(ao[k]) !== canonicalJson(bo[k])) return k;
+  }
+  return null;
+}
+
+/**
+ * Publication boundary for a mutated manifest. The emitted text is parsed
+ * back and compared to the manifest as normalized structures (key order is
+ * free; values are not) before the atomic write, so an emitter/parser
+ * asymmetry (#6432: a quoted scalar whose backslashes doubled) refuses with
+ * `EMIT_MISMATCH` and the file on disk keeps its bytes. `emit` is the test
+ * seam for an emitter that drops or reorders a key.
+ */
+export function writePackManifest(
   path: string,
   manifest: SchemaPackManifest,
   format: PackFileFormat,
+  emit: (m: SchemaPackManifest) => string = emitYaml,
 ): void {
+  assertManagedFilesystemWrite(path);
   // Validate the manifest shape BEFORE write so an invalid manifest can never
   // hit disk (the in-memory manifest must round-trip cleanly first).
-  parseSchemaPackManifest(manifest, { path });
+  const expected = parseSchemaPackManifest(manifest, { path });
   if (format === 'yaml') {
-    const yaml = emitYaml(manifest);
-    // Belt-and-suspenders: re-parse what we're about to write to catch
-    // any emitter bugs before the rename.
-    const reparsed = parseYamlMini(yaml);
-    parseSchemaPackManifest(reparsed, { path });
+    const yaml = emit(manifest);
+    const reparsed = parseSchemaPackManifest(parseYamlMini(yaml), { path });
+    if (canonicalJson(reparsed) !== canonicalJson(expected)) {
+      const key = firstDivergingKey(expected, reparsed) ?? '(unknown)';
+      throw new SchemaPackMutationError(
+        'EMIT_MISMATCH',
+        `refusing to write ${path}: the emitted YAML does not read back as the manifest (first difference under \`${key}\`). The file on disk is unchanged. Run \`gbrain errors schema_pack_emit_mismatch\` for the recovery steps.`,
+        { path, key },
+      );
+    }
     writeAtomic(path, yaml);
     return;
   }
@@ -348,11 +416,14 @@ export async function withMutation(
       current = loadPackFromFile(path);
       prevSha8 = await computeManifestSha8(current);
     } catch (e) {
-      const err = new SchemaPackMutationError(
-        'PACK_CORRUPT',
-        `cannot read or parse pack file at ${path}: ${(e as Error).message}`,
-        { path },
-      );
+      // #6432: the size refusal keeps its typed code (an agent must not read it as corruption).
+      const err = e instanceof SchemaPackLoaderError && e.code === 'PACK_TOO_LARGE'
+        ? new SchemaPackMutationError('PACK_TOO_LARGE', e.message, { path })
+        : new SchemaPackMutationError(
+          'PACK_CORRUPT',
+          `cannot read or parse pack file at ${path}: ${(e as Error).message}`,
+          { path },
+        );
       await logMutationFailure({ op, pack: packName, actor, ...primitiveContext, reason: err.code });
       throw err;
     }
@@ -491,7 +562,10 @@ function checkNoReferences(manifest: SchemaPackManifest, typeName: string): void
 export interface AddTypeOpts {
   name: string;
   primitive: PackPrimitive;
-  prefix: string;
+  /** Required unless `noPrefix` is set. */
+  prefix?: string;
+  /** Declare a frontmatter-only type (`path_prefixes: []`, #6135). */
+  noPrefix?: boolean;
   extractable?: boolean;
   expertRouting?: boolean;
   aliases?: string[];
@@ -504,10 +578,22 @@ export interface AddTypeOpts {
 // (batch path, below) reuses the SAME builders so single-call and batched
 // mutations can never drift in what they accept or reject.
 
+function validateNoPrefix(opts: AddTypeOpts): void {
+  const conflict = opts.prefix !== undefined
+    ? 'a frontmatter-only type takes a prefix or noPrefix, not both'
+    : opts.extractable
+      ? 'a frontmatter-only type cannot be extractable: extractable types are checked through their path prefixes (lint rule extractable_empty_corpus)'
+      : opts.expertRouting
+        ? 'a frontmatter-only type cannot use expert routing: expert routing without a path prefix silently misses content (lint rule expert_routing_without_prefix)'
+        : null;
+  if (conflict) throw new SchemaPackMutationError('INVALID_RESULT', `${conflict} (type: ${JSON.stringify(opts.name)})`);
+}
+
 function buildAddTypeMutator(opts: AddTypeOpts): (m: SchemaPackManifest) => SchemaPackManifest {
   validateTypeName(opts.name);
   validatePrimitive(opts.primitive);
-  validatePrefix(opts.prefix);
+  if (opts.noPrefix) validateNoPrefix(opts);
+  else validatePrefix(opts.prefix);
   return (m) => {
     if (m.page_types.some((pt) => pt.name === opts.name)) {
       throw new SchemaPackMutationError(
@@ -519,7 +605,7 @@ function buildAddTypeMutator(opts: AddTypeOpts): (m: SchemaPackManifest) => Sche
     const newType: PackPageType = {
       name: opts.name,
       primitive: opts.primitive,
-      path_prefixes: [opts.prefix],
+      path_prefixes: opts.noPrefix ? [] : [opts.prefix!],
       aliases: opts.aliases ?? [],
       extractable: opts.extractable ?? false,
       expert_routing: opts.expertRouting ?? false,
@@ -737,7 +823,8 @@ function buildBatchMutator(
         mutate: buildAddTypeMutator({
           name: m.name as string,
           primitive: m.primitive as never,
-          prefix: m.prefix as string,
+          prefix: m.prefix as string | undefined,
+          noPrefix: m.no_prefix === true,
           extractable: m.extractable as boolean | undefined,
           expertRouting: m.expert_routing as boolean | undefined,
           aliases: m.aliases as string[] | undefined,
@@ -819,11 +906,13 @@ export async function applyMutationsAtomic(
       current = loadPackFromFile(path);
       batchPrevSha8 = await computeManifestSha8(current);
     } catch (e) {
-      const err = new SchemaPackMutationError(
-        'PACK_CORRUPT',
-        `cannot read or parse pack file at ${path}: ${(e as Error).message}`,
-        { path },
-      );
+      const err = e instanceof SchemaPackLoaderError && e.code === 'PACK_TOO_LARGE'
+        ? new SchemaPackMutationError('PACK_TOO_LARGE', e.message, { path })
+        : new SchemaPackMutationError(
+          'PACK_CORRUPT',
+          `cannot read or parse pack file at ${path}: ${(e as Error).message}`,
+          { path },
+        );
       await logMutationFailure({ op: firstOp, pack: packName, actor, reason: err.code, batch_id: opts.batchId });
       throw err;
     }

@@ -11,7 +11,7 @@
  *   pathToSlug()  →  convert file paths to page slugs
  */
 
-import { SLUG_WORD_CHARS } from './cjk.ts';
+import { SLUG_WORD_CHARS, SLUG_VARIATION_SELECTORS_RE } from './cjk.ts';
 // v0.37.7.0 #1169 submodule-detection helpers. Bottom-of-file already
 // aliases existsSync as `_existsSync` for other purposes; the top-of-file
 // import keeps the pruneDir helper's deps near its callsite.
@@ -33,11 +33,24 @@ export interface RawManifestEntry {
 }
 
 export type SyncStrategy = 'markdown' | 'code' | 'auto';
+/** Every SyncStrategy; the only values `sources.config.strategy` may hold. */
+export const SYNC_STRATEGIES: readonly SyncStrategy[] = ['markdown', 'code', 'auto'];
+export function isSyncStrategy(value: unknown): value is SyncStrategy {
+  return typeof value === 'string' && (SYNC_STRATEGIES as readonly string[]).includes(value);
+}
 
 interface SyncableOptions {
   strategy?: SyncStrategy;
   include?: string[];
   exclude?: string[];
+  /**
+   * Repeatable `--include-hidden <glob>` patterns (same glob dialect as
+   * `include`/`exclude`, matched against the same path form `classifySync`
+   * receives). Waives the leading-dot prune heuristic in `isPathPruned` for
+   * paths that match — see that function's doc comment for exactly what is
+   * and isn't waivable.
+   */
+  includeHidden?: string[];
 }
 
 // v0.19.0 shipped a 9-extension allowlist (ts/tsx/js/jsx/mjs/cjs/py/rb/go). The
@@ -76,6 +89,7 @@ const CODE_EXTENSIONS = new Set<string>([
   '.sh', '.bash',
   '.css',
   '.html', '.htm',
+  '.astro', '.svelte',
   '.vue',
   '.json',
   '.yaml', '.yml',
@@ -256,12 +270,20 @@ export function isMarkdownFilePath(path: string): boolean {
   return path.endsWith('.md') || path.endsWith('.mdx');
 }
 
-function isMultimodalEnabled(): boolean {
-  return process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+/** The image side of the brain is on: the sync walker admits images, managed sync imports them (#6529) and `embed --stale` sweeps them. */
+export function isMultimodalEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
 }
 
 function isAllowedByStrategy(path: string, strategy: SyncStrategy): boolean {
-  if (strategy === 'markdown') return isMarkdownFilePath(path);
+  // #2683: mirror import.ts's isCollectibleForWalker — the full-sync walker
+  // admits images under the (default) 'markdown' strategy when multimodal is
+  // on, but this incremental gate used to be markdown-only, so a committed
+  // image NEVER imported incrementally (it only landed via `sync --full`).
+  // Full and incremental must agree on the admission set.
+  if (strategy === 'markdown') {
+    return isMarkdownFilePath(path) || (isMultimodalEnabled() && isImageFilePath(path));
+  }
   if (strategy === 'code') return isCodeFilePath(path);
   // 'auto' / default: markdown + code, plus images when multimodal is on.
   return (
@@ -387,6 +409,49 @@ export function pruneDir(name: string, parentDir?: string): boolean {
 }
 
 /**
+ * Path-string form of the exclusion `pruneDir` enforces during a live
+ * directory descent, evaluated per-segment against a full path — the
+ * canonical gate for the two PURE classifiers that never walk a real
+ * directory tree: `classifySync` (drives `sync`'s incremental + full-sync
+ * dry-run/reconcile paths) and `isCollectibleForWalker` in `commands/
+ * import.ts` (drives `import`'s git-ls-files fast path, which is what
+ * every git-tracked source — the common case — actually uses). Both used
+ * to reimplement this segment loop independently; funnelling them through
+ * one function is what keeps a future change from fixing one and leaving
+ * the other silently pruning differently, the way #923/#202 drifted before
+ * `PRUNE_DIR_NAMES` existed.
+ *
+ * `includeHidden`: repeatable `--include-hidden <glob>` patterns (same
+ * glob dialect as `include`/`exclude`, matched against the full `path`
+ * argument as given — callers are responsible for passing the same path
+ * form their other include/exclude matching already uses). When a path is
+ * pruned ONLY because a segment is dot-prefixed (`.dira/entries/x.md`) and
+ * the full path matches one of these globs, the dot-prune is waived. The
+ * `PRUNE_DIR_NAMES` / `*.raw` exclusions are NEVER waivable — this flag
+ * reaches past the leading-dot heuristic specifically (`.git`, `.dira`,
+ * `.obsidian`, …), not past generated/vendored-tree exclusions.
+ *
+ * SCOPE: this only reaches the two pure-string classifiers above. It does
+ * NOT reach `pruneDir`'s other, live-filesystem-walk callers — `import`'s
+ * fallback walker for non-git directories, and `storage.ts`'s
+ * `walkBrainRepo` — which decide per-directory during real recursive
+ * descent and would need prefix-of-a-glob reasoning to honor the same
+ * waiver safely (a directory named `.dira` must stay open for descent to
+ * reach `.dira/entries/*.md` even though `.dira` alone doesn't match that
+ * glob). Every `gbrain sources add`'d git repository — which is virtually
+ * all of them, including every hq-shaped brain — goes through the
+ * git-listing fast path this function guards, so the gap is scoped to
+ * importing a bare (non-git) directory.
+ */
+export function isPathPruned(path: string, includeHidden?: string[]): boolean {
+  const segments = path.split('/');
+  if (segments.some((seg) => PRUNE_DIR_NAMES.has(seg) || seg.endsWith('.raw'))) return true;
+  const dotPruned = segments.some((seg) => seg.startsWith('.'));
+  if (!dotPruned) return false;
+  return !(includeHidden && includeHidden.length > 0 && matchesAnyGlob(path, includeHidden));
+}
+
+/**
  * Discriminator for WHY a path is not syncable. Returned by `unsyncableReason`
  * so the sync cleanup loop in `commands/sync.ts` can distinguish "metafile we
  * intentionally exclude" from "user removed this file from the strategy".
@@ -403,7 +468,63 @@ export type SyncableReason =
   | 'strategy'
   | 'pruned-dir'
   | 'include-glob-miss'
-  | 'exclude-glob-hit';
+  | 'exclude-glob-hit'
+  | 'malformed-path';
+
+/**
+ * Path segments that can never be legitimate page filenames: square brackets
+ * (the signature of markdown-link syntax leaking into a literal filename —
+ * files named `[atoms/foo.md](https:/...)` were minted by misbehaving
+ * producers and polluted search because slugifySegment STRIPS brackets
+ * instead of rejecting them, yielding plausible-looking slugs) and ASCII
+ * control characters. Parentheses are deliberately allowed — `meeting (1).md`
+ * is a legitimate filename shape.
+ *
+ * Two-tier design (cross-model adversarial finding — both reviewers flagged
+ * blanket-bracket collateral):
+ *   - ADMISSION (hasMalformedPathSegment): control chars reject on ANY path;
+ *     brackets reject only on MARKDOWN paths (.md/.mdx). Code-strategy lanes
+ *     keep indexing framework paths like `app/[id]/page.tsx`, which are
+ *     ubiquitous and legitimate.
+ *   - DESTRUCTION (isPoisonedPath): sync's row-DELETING lanes (reconcile,
+ *     modified-lane cleanup) act only on the actual injection signature —
+ *     `](` or control chars. A bare-bracket markdown file (`notes [draft].md`)
+ *     imported by a pre-gate release keeps its indexed row (it just can't
+ *     re-import until renamed; doctor's malformed_path_pages carries the
+ *     hint). Hard-deleting it on a routine post-upgrade full sync while the
+ *     file still exists would be silent data loss.
+ *
+ * IMPORTANT: these are PATH checks only. `](` inside file BODIES is normal
+ * markdown and must never trip them.
+ */
+export const MALFORMED_PATH_SEGMENT_RE = /[\[\]\x00-\x1f]/;
+
+/** The injection signature that marks a path as sweepable junk. */
+export const POISONED_PATH_RE = /\]\(|[\x00-\x1f]/;
+
+/** Admission check: control chars anywhere; brackets on markdown paths. */
+export function hasMalformedPathSegment(path: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f]/.test(path)) return true;
+  return /[\[\]]/.test(path) && /\.(md|mdx)$/i.test(path);
+}
+
+/** Destruction gate: only paths matching the poison signature may have their DB rows swept. */
+export function isPoisonedPath(path: string): boolean {
+  return POISONED_PATH_RE.test(path);
+}
+
+/**
+ * Strip control characters (and cap length) before echoing a malformed path
+ * to a terminal — these paths contain control bytes BY DEFINITION, and a
+ * crafted filename must not be able to inject ANSI escapes into sync output.
+ * Brackets stay: they're printable and the informative part of the name.
+ */
+export function sanitizePathForDisplay(path: string): string {
+  // eslint-disable-next-line no-control-regex
+  const cleaned = path.replace(/[\x00-\x1f\x7f]/g, '\ufffd');
+  return cleaned.length > 200 ? `${cleaned.slice(0, 197)}...` : cleaned;
+}
 
 /**
  * Canonical metafile basenames the markdown sync strategy intentionally
@@ -425,6 +546,21 @@ export type SyncableReason =
 export const SYNC_SKIP_FILES = ['schema.md', 'index.md', 'log.md', 'README.md', 'RESOLVER.md'] as const;
 
 /**
+ * #5186 (W14 P1.5b): `gbrain harden` scaffolds these at the source root as
+ * agent instructions, not brain content. Metafiles at depth 0 only: a
+ * `docs/AGENTS.md` is an ordinary page.
+ */
+export const SYNC_ROOT_SKIP_FILES = ['AGENTS.md', 'CLAUDE.md'] as const;
+
+/** Whether a repo-relative path is directory scaffolding sync never imports (`SYNC_SKIP_FILES` anywhere, `SYNC_ROOT_SKIP_FILES` at the root). */
+export function isSyncMetafile(path: string): boolean {
+  const segments = path.split('/');
+  const basename = segments[segments.length - 1] || '';
+  return (SYNC_SKIP_FILES as readonly string[]).includes(basename)
+    || (segments.length === 1 && (SYNC_ROOT_SKIP_FILES as readonly string[]).includes(basename));
+}
+
+/**
  * Internal classifier. Returns null when the path IS syncable, or a tagged
  * SyncableReason explaining why it isn't. The single source of truth that
  * both `isSyncable` (boolean) and `unsyncableReason` (tagged) call.
@@ -438,15 +574,20 @@ function classifySync(path: string, opts: SyncableOptions = {}): SyncableReason 
 
   if (!isAllowedByStrategy(path, strategy)) return 'strategy';
 
+  // Reject filenames that can't be legitimate pages (bracket/control chars —
+  // markdown-link syntax as a literal filename). Checked after `strategy` so
+  // only files that would otherwise be admitted change classification.
+  if (hasMalformedPathSegment(path)) return 'malformed-path';
+
   // Skip every path segment that pruneDir would block walkers from descending
   // into. Catches hidden dirs (`.git`, `.obsidian`), `.raw/` sidecars, and
   // vendor/generated trees (`node_modules/`, `vendor/`, …) at any depth.
-  const segments = path.split('/');
-  if (segments.some(p => !pruneDir(p))) return 'pruned-dir';
+  // `opts.includeHidden` can waive the leading-dot part of this — see
+  // `isPathPruned`'s doc comment for exactly what is and isn't waivable.
+  if (isPathPruned(path, opts.includeHidden)) return 'pruned-dir';
 
   // Skip meta files that aren't pages
-  const basename = segments[segments.length - 1] || '';
-  if ((SYNC_SKIP_FILES as readonly string[]).includes(basename)) return 'metafile';
+  if (isSyncMetafile(path)) return 'metafile';
 
   if (opts.include && opts.include.length > 0 && !matchesAnyGlob(path, opts.include)) return 'include-glob-miss';
   if (opts.exclude && opts.exclude.length > 0 && matchesAnyGlob(path, opts.exclude)) return 'exclude-glob-hit';
@@ -506,7 +647,19 @@ export function slugifySegment(segment: string): string {
   return segment
     .normalize('NFD')                     // Decompose accented chars
     .replace(/[\u0300-\u036f]/g, '')      // Strip accent marks
+    // #3700: Hebrew niqqud (vowel points) + cantillation are optional
+    // diacritics \u2014 the same word appears pointed and bare across filenames
+    // and must land on ONE slug (the Hebrew analog of caf\u00e9 \u2192 cafe). Scoped
+    // to U+0591\u2013U+05C7 only; \p{M} stays in SLUG_WORD_CHARS so Devanagari
+    // matras, Thai vowels, Arabic text etc. keep their #3417 behavior.
+    // Runs in NFD space so precomposed presentation forms (U+FB1D\u2013FB4F)
+    // are already decomposed and their points strip too.
+    .replace(/[\u0591-\u05c7]/g, '')      // Strip Hebrew niqqud + cantillation
     .normalize('NFC')                     // Recompose Hangul Jamo back to Syllables (v0.32.7)
+    // Strip variation selectors (emoji VS16, ideographic IVS): Mn invisibles
+    // that survive \p{M}, so `🗂️ entities` forked a `<U+FE0F>-entities` twin of
+    // the clean-slug page. Shared with normalizeBasename via cjk.ts (#4985).
+    .replace(SLUG_VARIATION_SELECTORS_RE, '')
     .toLowerCase()
     .replace(SLUGIFY_KEEP_RE, '')         // Keep alnum, dots, spaces, _-, and CJK (v0.32.7)
     .replace(/[\s]+/g, '-')              // Spaces → hyphens
@@ -592,6 +745,7 @@ export {
   classifyErrorCode,
   summarizeFailuresByCode,
   formatCodeBreakdown,
+  formatFailedFileList,
   syncFailuresPath,
   loadSyncFailures,
   unacknowledgedSyncFailures,
@@ -599,16 +753,23 @@ export {
   acknowledgeSyncFailures,
   recordFailures,
   clearFailures,
+  restoreFailures,
   acknowledgeFailures,
   autoSkipFailures,
   withLedgerLock,
   resolveAutoSkipThreshold,
   isSkippablePath,
   decideGateAction,
+  EMBEDDING_INFRA_CODES,
+  isEmbeddingInfraCode,
   decideSyncFailureSeverity,
   applySyncFailureGate,
   DEFAULT_SOURCE_ID,
   SENTINEL_PREFIX,
+  RENAME_SENTINEL_PREFIX,
+  renameSentinelPath,
+  renameReconcileErrorMessage,
+  parseRenameReconcileFrom,
   DEFAULT_AUTOSKIP_AFTER,
 } from './sync-failure-ledger.ts';
 export type {

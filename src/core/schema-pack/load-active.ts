@@ -38,6 +38,8 @@ import {
   type ResolutionResult,
 } from './registry.ts';
 import { isBundledPackName } from './bundled.ts';
+import { isValidPackName } from './mutate.ts';
+import { bundledPackPath } from './bundled-assets.ts';
 
 /**
  * Inputs the caller (operations.ts handler / engine query path) provides.
@@ -109,8 +111,13 @@ export function _resetPackLocatorForTests(): void {
  */
 function defaultPackLocator(name: string): string | null {
   if (isBundledPackName(name)) {
-    // Resolve bundled YAML relative to this source file. Works in both
-    // direct-bun execution and bun --compile binaries.
+    // Statically bundled asset path [ENG-6] (#4266): resolves in dev AND
+    // inside `bun build --compile` binaries, where the import.meta-relative
+    // paths below don't exist.
+    const asset = bundledPackPath(name);
+    if (asset) return asset;
+    // Resolve bundled YAML relative to this source file — fallback for
+    // direct-bun execution should the asset path ever be unreadable.
     const here = dirname(fileURLToPath(import.meta.url));
     const bundledPath = join(here, 'base', `${name}.yaml`);
     if (existsSync(bundledPath)) return bundledPath;
@@ -120,7 +127,11 @@ function defaultPackLocator(name: string): string | null {
     if (existsSync(repoRootFallback)) return repoRootFallback;
     return null;
   }
-  // User-installed pack at ~/.gbrain/schema-packs/<name>/pack.{yaml,json}
+  // User-installed pack at ~/.gbrain/schema-packs/<name>/pack.{yaml,json}.
+  // SECURITY: `name` can come from the tier-4/5 DB or gbrain.yml string —
+  // gate it (same slug grammar as locateMutablePackFile) BEFORE the join so
+  // a path-shaped value can't reach anything outside schema-packs/.
+  if (!isValidPackName(name)) return null;
   const baseDir = gbrainPath('schema-packs', name);
   const candidates = ['pack.yaml', 'pack.yml', 'pack.json'];
   for (const c of candidates) {
@@ -162,6 +173,18 @@ export async function loadActivePack(input: LoadActivePackInput): Promise<Resolv
   const cached = tryCachedPack(resolution.pack_name);
   if (cached) return cached;
   const manifest = await loadPackManifestByName(resolution.pack_name);
+  return await resolveLoadedPack(manifest);
+}
+
+/**
+ * Resolve an already-loaded manifest's extends/borrow chain through the
+ * same locator `loadActivePack` uses (bundled assets + ~/.gbrain/schema-packs
+ * + the test seam). Named-pack consumers that already hold a loaded manifest
+ * (the MCP schema_lint op's own file lookup) call this so they lint the
+ * MERGED manifest, matching validate/use/active (#4373; CLI `schema lint
+ * <name>` resolves by name via loadResolvedPackByName, #4501).
+ */
+export async function resolveLoadedPack(manifest: SchemaPackManifest): Promise<ResolvedPack> {
   // Thread the locator so resolvePack can snapshot file paths + mtimes
   // for the stat-TTL gate on subsequent calls (codex C6 + D11 + D13).
   return await resolvePack(manifest, loadPackManifestByName, {
@@ -170,44 +193,20 @@ export async function loadActivePack(input: LoadActivePackInput): Promise<Resolv
 }
 
 /**
- * Engine-aware active-pack boundary.
- *
- * DB-plane config cannot be discovered by the pure resolver above. Runtime
- * callers with an engine MUST use this helper so tier 3
- * `schema_pack.source.<id>` and tier 4 `schema_pack` participate in the
- * documented resolution chain. Config read failures propagate: silently
- * falling back to a different pack would make writes use the wrong schema.
+ * Load + resolve a pack BY NAME — extends chain walked, borrow_from
+ * resolved, child-wins merge applied — without touching the active-pack
+ * resolution chain. `gbrain schema lint <name>` uses this (#4501) so a
+ * named pack is linted against the same merged manifest it would serve
+ * when active; a child that references inherited parent types must not
+ * fail raw-manifest lint. Throws the same errors as `loadActivePack`
+ * (UnknownPackError, ExtendsChainTooDeepError, AliasCycleError,
+ * SchemaPackManifestError).
  */
-export async function loadActivePackForEngine(
-  input: LoadActivePackForEngineInput,
-): Promise<ActivePackForEngine> {
-  const readConfig = async (key: string): Promise<string | undefined> => {
-    if (typeof (input.engine as Partial<SchemaPackConfigReader>).getConfig !== 'function') return undefined;
-    try {
-      return normalizeConfigValue(await input.engine.getConfig(key));
-    } catch (error) {
-      if (/relation ["']?config["']? does not exist/i.test((error as Error).message)) return undefined;
-      throw error;
-    }
-  };
-  const dbConfig = await readConfig('schema_pack');
-  const perSourceDb = new Map<string, string>();
-  if (input.sourceId) {
-    const sourcePack = await readConfig(`schema_pack.source.${input.sourceId}`);
-    if (sourcePack) perSourceDb.set(input.sourceId, sourcePack);
-  }
-  const hydrated: LoadActivePackInput = {
-    cfg: input.cfg,
-    remote: input.remote,
-    perCall: input.perCall,
-    sourceId: input.sourceId,
-    gbrainYml: input.gbrainYml,
-    dbConfig,
-    perSourceDb,
-  };
-  const resolution = resolveActivePackNameOnly(hydrated);
-  const pack = await loadActivePack(hydrated);
-  return { pack, resolution };
+export async function loadResolvedPackByName(name: string): Promise<ResolvedPack> {
+  const manifest = await loadPackManifestByName(name);
+  return await resolvePack(manifest, loadPackManifestByName, {
+    loadByPath: (n) => _packLocator(n),
+  });
 }
 
 /**
@@ -333,4 +332,14 @@ function buildResolutionInput(input: LoadActivePackInput): ResolutionInput {
 function normalizeConfigValue(value: string | null | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized || undefined;
+}
+
+export async function loadActivePackForEngine(input: LoadActivePackForEngineInput): Promise<ActivePackForEngine> {
+  const perSourceDb = new Map<string, string>();
+  if (input.sourceId) {
+    const value = normalizeConfigValue(await input.engine.getConfig(`schema_pack.source.${input.sourceId}`));
+    if (value) perSourceDb.set(input.sourceId, value);
+  }
+  const resolved = { ...input, dbConfig: normalizeConfigValue(await input.engine.getConfig('schema_pack')), perSourceDb };
+  return { pack: await loadActivePack(resolved), resolution: resolveActivePackNameOnly(resolved) };
 }

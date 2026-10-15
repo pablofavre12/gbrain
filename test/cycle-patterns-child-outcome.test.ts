@@ -5,14 +5,14 @@
  * zero pattern pages written (e.g. when no subagent-capable worker slot was
  * free for the whole wait window) — a silent no-op for days.
  *
- * A later fix added runPgliteSubagentsInline to this phase (patterns.ts
+ * A later fix added the shared inline drain (now runSubagentsInline) to this phase (patterns.ts
  * previously submitted a job and waited without anything ever claiming it on
  * PGLite — synthesize.ts already had this inline drain, patterns.ts didn't).
  * So a fake ANTHROPIC_API_KEY here now gets claimed and actually attempted;
  * the real Anthropic call fails immediately, exhausting max_attempts and
  * landing the job in 'dead' (not 'timeout' — nothing ever times out, the
  * failure is immediate). The #2782 status-reflects-outcome contract this
- * test exists to pin is unchanged: any non-'complete' outcome with zero
+ * test exists to pin is unchanged: any non-'completed' outcome with zero
  * writes must still surface as status 'fail', just under the outcome that
  * actually occurs now that the job is drained instead of left stuck in
  * 'waiting' for the full wait window.
@@ -94,11 +94,13 @@ describe('runPhasePatterns child-outcome status (#2782)', () => {
         runPhasePatterns(engine, { brainDir, dryRun: false }),
       );
 
-      const jobs = await engine.executeRaw<{ timeout_ms: string | number | null }>(
-        `SELECT timeout_ms FROM minion_jobs WHERE name = 'subagent' ORDER BY id DESC LIMIT 1`,
+      const jobs = await engine.executeRaw<{ timeout_ms: string | number | null; data: Record<string, unknown> }>(
+        `SELECT timeout_ms, data FROM minion_jobs WHERE name = 'subagent' ORDER BY id DESC LIMIT 1`,
       );
       expect(jobs).toHaveLength(1);
       expect(Number(jobs[0]!.timeout_ms)).toBe(600000);
+      expect(jobs[0]!.data.require_writes).toBe(true);
+      expect(jobs[0]!.data.allow_clean_zero_writes).toBe(true);
     } finally {
       rmSync(brainDir, { recursive: true, force: true });
     }

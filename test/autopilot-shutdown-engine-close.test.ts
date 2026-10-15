@@ -19,13 +19,11 @@
  * these static-shape regressions pin the load-bearing wiring instead.
  */
 import { describe, expect, it } from 'bun:test';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
 
-const AUTOPILOT_SRC = readFileSync(
-  join(import.meta.dir, '..', 'src', 'commands', 'autopilot.ts'),
-  'utf8',
-);
+// W4 autopilot: containment reads the autopilot surface; positional spans name the module that holds the daemon code.
+const AUTOPILOT_SRC = surfaceSource('autopilot');
+const DAEMON_SRC = surfaceFileSource('autopilot', 'src/commands/autopilot-daemon.ts');
 
 describe('autopilot.ts graceful engine shutdown (#1872)', () => {
   it('registers an engine-close callback in the process-cleanup registry (SIGTERM path)', () => {
@@ -43,7 +41,7 @@ describe('autopilot.ts graceful engine shutdown (#1872)', () => {
   it('closeEngine aborts the in-flight inline cycle then disconnects the engine', () => {
     // Abort first (runCycle checks the signal between phases and threads it
     // into phase sub-work), bounded drain, then disconnect.
-    expect(AUTOPILOT_SRC).toMatch(
+    expect(DAEMON_SRC).toMatch(
       /const closeEngine = async \(\) => \{[\s\S]{0,900}shutdownAbort\.abort\([\s\S]{0,900}engine\.disconnect\(\)/,
     );
   });
@@ -55,9 +53,27 @@ describe('autopilot.ts graceful engine shutdown (#1872)', () => {
     expect(AUTOPILOT_SRC).toMatch(/inflightInlineCycle\s*=\s*cyclePromise/);
   });
 
-  it('shutdown() awaits closeEngine() before process.exit(0) (SIGINT + internal-stop path)', () => {
+  it('shutdown() awaits closeEngine() before process.exit (SIGINT + internal-stop path)', () => {
+    expect(DAEMON_SRC).toMatch(
+      /await closeEngine\(\);[\s\S]{0,400}process\.exit\(/,
+    );
+  });
+
+  it('exits non-zero when the daemon gives up after repeated failures (#2234)', () => {
+    expect(AUTOPILOT_SRC).toContain(
+      "process.exit(sig === 'max_crashes' || sig === 'cycle-failure-cap' ? 1 : 0);",
+    );
+  });
+
+  it('keeps operator stops and intentional relaunch stops clean', () => {
     expect(AUTOPILOT_SRC).toMatch(
-      /await closeEngine\(\);[\s\S]{0,400}process\.exit\(0\)/,
+      /process\.on\('SIGTERM', \(\) => \{ void shutdown\('SIGTERM'\); \}\);/,
+    );
+    expect(AUTOPILOT_SRC).toMatch(
+      /process\.on\('SIGINT',\s+\(\) => \{ void shutdown\('SIGINT'\);\s+\}\);/,
+    );
+    expect(AUTOPILOT_SRC).toContain(
+      "await shutdown('engine-config-changed');",
     );
   });
 });

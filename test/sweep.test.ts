@@ -21,10 +21,16 @@ import {
   type SweepReport,
 } from '../src/core/sweep.ts';
 import { isTotalFailure, runSweep, SWEEP_HELP } from '../src/commands/sweep.ts';
+import { importFromContent } from '../src/core/import-file.ts';
 import { currentExitCode, _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
+import { _resetStdoutRedirectForTests } from '../src/core/console-prefix.ts';
 import type { CapabilityReport } from '../src/core/capability.ts';
 import { __setChatTransportForTests, type ChatResult } from '../src/core/ai/gateway.ts';
 import { runServe, type ServeOptions } from '../src/commands/serve.ts';
+import { spoolPath } from './helpers/corpus-spool.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { runExtract } from '../src/commands/extract.ts';
+import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 
 const KEYLESS: CapabilityReport = {
   embeddings: { available: false },
@@ -68,6 +74,14 @@ beforeEach(async () => {
 
 afterEach(() => {
   __setChatTransportForTests(null);
+  // The ENG-5 harness drives the real runServe(), whose stdio path flips
+  // console-prefix's module-global stdout→stderr redirect (#3844). bun runs
+  // every test file in one process, so without this reset the flag stays on
+  // and poisons any later file that pins slog's stdout routing
+  // (test/sync-all-parallel.test.ts, test/console-prefix.test.ts) — whether
+  // it bites depends on CI shard composition. Same reset the donor harness
+  // (test/serve-stdio-lifecycle.test.ts) already carries.
+  _resetStdoutRedirectForTests();
 });
 
 async function seedPage(slug: string, type: string, body: string, timeline = '') {
@@ -200,11 +214,175 @@ describe('runMaintenanceSweep — link/timeline extraction [CX-P0.3]', () => {
       await engine.setConfig('auto_timeline', 'true');
     }
   });
+
+  // #3757: the sweep shares resolveCandidateSources with `extract links
+  // --source db` but never received the #2589 `link_resolution.cross_source`
+  // opt-in, so a page linking a target that exists only in another source
+  // was dropped silently — and the reconcile then deleted the very edge the
+  // CLI extract had created.
+  describe('cross-source opt-in (#3757)', () => {
+    const CROSS = { GBRAIN_LINK_RESOLUTION_CROSS_SOURCE: '1' };
+    const sweep = () => runMaintenanceSweep(engine, {
+      sourceId: 'default', capabilities: KEYLESS, budgetMs: 30_000,
+    });
+    const toSources = () => engine.executeRaw<{ source_id: string }>(
+      `SELECT pt.source_id FROM links l
+         JOIN pages pf ON pf.id = l.from_page_id
+         JOIN pages pt ON pt.id = l.to_page_id
+        WHERE pf.slug = 'notes/n1'`,
+    );
+    beforeEach(async () => {
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name) VALUES ('vault-a', 'vault-a') ON CONFLICT (id) DO NOTHING`,
+      );
+      await engine.executeRaw(
+        `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+         VALUES ('people/alice-example', 'vault-a', 'person', 'Alice', 'A person page.', '')`,
+      );
+      await seedPage('notes/n1', 'note', 'Talked to [[people/alice-example]] today.');
+    });
+
+    test('flag ON: the edge into the other source is created', async () => {
+      const r = await withEnv(CROSS, sweep);
+      expect(r.linksExtracted).toBe(1);
+      expect(await toSources()).toEqual([{ source_id: 'vault-a' }]);
+    });
+
+    test('flag ON: an edge the CLI extract created survives the sweep reconcile', async () => {
+      await engine.addLinksBatch([{
+        from_slug: 'notes/n1', to_slug: 'people/alice-example', link_type: 'mentions',
+        context: 'ctx', link_source: 'markdown',
+        from_source_id: 'default', to_source_id: 'vault-a', origin_source_id: 'default',
+      }]);
+      const r = await withEnv(CROSS, sweep);
+      expect(r.linksRemoved).toBe(0);
+      expect(await toSources()).toEqual([{ source_id: 'vault-a' }]);
+    });
+
+    test('flag OFF: the drop is counted in the skip ledger, not silent', async () => {
+      const r = await withEnv({ GBRAIN_LINK_RESOLUTION_CROSS_SOURCE: undefined }, sweep);
+      expect(await toSources()).toEqual([]);
+      expect(r.skipped).toContainEqual({ reason: 'cross_source_link', count: 1 });
+    });
+  });
+});
+
+describe('runMaintenanceSweep — watermark progress + link reconciliation (#4196)', () => {
+  // Seed with an explicit updated_at so batch-selection order is deterministic.
+  async function seedPageAt(slug: string, body: string, updatedAtIso: string) {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, updated_at)
+       VALUES ($1, 'default', 'note', $1, $2, $3::timestamptz)`,
+      [slug, body, updatedAtIso],
+    );
+  }
+  const minsAgo = (n: number) => new Date(Date.now() - n * 60_000).toISOString();
+
+  test('repeated bounded sweeps make forward progress past batchLimit', async () => {
+    // Newest two pages fill a batchLimit=2 selection; the oldest writer is
+    // starved unless the selection honors links_extracted_at.
+    await seedPageAt('prog/target', 'Target page.', minsAgo(1));
+    await seedPageAt('prog/w-new', 'See [T](prog/target).', minsAgo(2));
+    await seedPageAt('prog/w-old', 'Also see [T](prog/target).', minsAgo(3));
+
+    const sweep = () => runMaintenanceSweep(engine, {
+      sourceId: 'default', capabilities: KEYLESS, batchLimit: 2, budgetMs: 30_000,
+    });
+    await sweep();
+    await sweep();
+
+    const oldEdge = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM links l
+         JOIN pages pf ON pf.id = l.from_page_id
+        WHERE pf.slug = 'prog/w-old'`,
+    );
+    expect(parseInt(oldEdge[0].n, 10)).toBeGreaterThanOrEqual(1);
+
+    // Every swept page is stamped at its own updated_at (extract.ts D4/#1768
+    // discipline), so the engines' shared stale predicate clears fully.
+    const stale = await engine.countStalePagesForExtraction({ sourceId: 'default' });
+    expect(stale).toBe(0);
+  });
+
+  test('a link removed via the remote put_page path is reconciled away', async () => {
+    const page = (t: string, b: string) => `---\ntitle: ${t}\ntype: note\n---\n\n${b}\n`;
+    const write = (slug: string, c: string) =>
+      importFromContent(engine, slug, c, { noEmbed: true, sourceId: 'default' });
+    const sweep = () => runMaintenanceSweep(engine, {
+      sourceId: 'default', capabilities: KEYLESS, budgetMs: 30_000,
+    });
+    const edges = async (slug: string) => engine.executeRaw<{ to_slug: string; link_source: string | null }>(
+      `SELECT pt.slug AS to_slug, l.link_source FROM links l
+         JOIN pages pf ON pf.id = l.from_page_id
+         JOIN pages pt ON pt.id = l.to_page_id
+        WHERE pf.slug = $1 ORDER BY pt.slug`,
+      [slug],
+    );
+
+    await write('concepts/target-a', page('Target A', 'Target page.'));
+    await write('concepts/writer-a', page('Writer A', 'References [Target A](concepts/target-a).'));
+    await sweep();
+    expect((await edges('concepts/writer-a')).map(e => e.to_slug)).toEqual(['concepts/target-a']);
+
+    // Non-sweep-owned provenances on the same page must survive reconciliation.
+    await engine.addLink('concepts/writer-a', 'concepts/target-a', '', 'manual-ref', 'manual');
+    await engine.addLink('concepts/writer-a', 'concepts/target-a', '', 'mention', 'mentions');
+
+    await write('concepts/writer-a', page('Writer A', 'The reference is gone.'));
+    await sweep();
+
+    const after = await edges('concepts/writer-a');
+    expect(after.map(e => e.link_source).sort()).toEqual(['manual', 'mentions']);
+  });
+
+  test('#4873: a ./-relative markdown edge from the FS extractor survives reconcile', async () => {
+    // The FS path (sync / `extract links`) resolves `[Beta](./beta.md)` via
+    // join(fileDir, target) and writes the edge with link_source NULL. The
+    // sweep's desired set must contain it or #4196 prunes a live edge on the
+    // first updated_at bump that doesn't re-run the FS extractor.
+    await seedPageAt('wiki/notes/beta', 'Beta page.', minsAgo(2));
+    await seedPageAt('wiki/notes/alpha', 'See [Beta](./beta.md).', minsAgo(1));
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+       SELECT f.id, t.id, 'mentions', 'markdown link: [Beta]', NULL
+         FROM pages f, pages t
+        WHERE f.slug = 'wiki/notes/alpha' AND t.slug = 'wiki/notes/beta'`,
+    );
+    const report = await runMaintenanceSweep(engine, {
+      sourceId: 'default', capabilities: KEYLESS, budgetMs: 30_000,
+    });
+    expect(report.linksRemoved).toBe(0);
+    const edges = await engine.getLinks('wiki/notes/alpha', { sourceId: 'default' });
+    expect(edges.map(e => e.to_slug)).toContain('wiki/notes/beta');
+  });
+
+  test('reconciliation never touches pages outside the sweep batch', async () => {
+    // A page last updated outside the recentDays window keeps its edges even
+    // though the sweep runs over the same source.
+    await seedPageAt('cold/target', 'Cold target.', minsAgo(1));
+    await seedPageAt('cold/writer', 'See [T](cold/target).', minsAgo(2));
+    await runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYLESS, budgetMs: 30_000 });
+    await engine.executeRaw(
+      `UPDATE pages SET updated_at = now() - interval '30 days',
+                        links_extracted_at = now() - interval '30 days'
+        WHERE slug = 'cold/writer'`,
+    );
+    // Rewrite the page body so the edge would be stale IF the page were swept.
+    await engine.executeRaw(
+      `UPDATE pages SET compiled_truth = 'Reference removed.' WHERE slug = 'cold/writer'`,
+    );
+    await runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYLESS, budgetMs: 30_000 });
+    const n = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM links l JOIN pages pf ON pf.id = l.from_page_id
+        WHERE pf.slug = 'cold/writer'`,
+    );
+    expect(parseInt(n[0].n, 10)).toBe(1);
+  });
 });
 
 describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
   test('keyless: skipped with reason keyless, sidecar NOT written', async () => {
-    writeFileSync(join(corpusDir, 'session-1.txt'), 'User said something notable.\n');
+    writeFileSync(spoolPath(corpusDir, 'session-1.txt'), 'User said something notable.\n');
 
     const r = await runMaintenanceSweep(engine, {
       sourceId: 'default',
@@ -212,7 +390,7 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
     });
     expect(r.corpusIngested).toBe(0);
     expect(r.skipped).toContainEqual({ reason: 'keyless', count: 1 });
-    expect(existsSync(join(corpusDir, 'session-1.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'session-1.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
   });
 
   test('keyed: transcript runs through the real pipeline; sidecar written AFTER success; exactly-once', async () => {
@@ -220,7 +398,7 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
     // operator-set default inside the shared pipeline.
     await engine.setConfig('facts.default_visibility', 'world');
     writeFileSync(
-      join(corpusDir, 'fresh.txt'),
+      spoolPath(corpusDir, 'fresh.txt'),
       'Alice committed to shipping the beta in March.\n',
     );
 
@@ -252,7 +430,7 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
       });
       expect(r1.corpusIngested).toBe(1);
       expect(chatCalls).toBe(1);
-      expect(existsSync(join(corpusDir, 'fresh.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
+      expect(existsSync(spoolPath(corpusDir, 'fresh.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
 
       const facts = await engine.executeRaw<{ fact: string; visibility: string; source: string }>(
         `SELECT fact, visibility, source FROM facts WHERE source = 'sweep:corpus'`,
@@ -275,8 +453,8 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
   });
 
   test('pre-existing sidecar marker → file never touches the pipeline', async () => {
-    writeFileSync(join(corpusDir, 'done.txt'), 'Already processed content.\n');
-    writeFileSync(join(corpusDir, 'done.txt' + CORPUS_INGESTED_SUFFIX), '{}\n');
+    writeFileSync(spoolPath(corpusDir, 'done.txt'), 'Already processed content.\n');
+    writeFileSync(spoolPath(corpusDir, 'done.txt' + CORPUS_INGESTED_SUFFIX), '{}\n');
 
     let chatCalls = 0;
     __setChatTransportForTests(async (): Promise<ChatResult> => {
@@ -293,17 +471,59 @@ describe('runMaintenanceSweep — corpus ingest [CX-P0.1, CX-P0.5]', () => {
     expect(r.skipped).toContainEqual({ reason: 'already_ingested', count: 1 });
   });
 
+  test('a claude-cli self-capture is retired with a terminal sidecar and never extracted; a user session still is (#5413)', async () => {
+    const claudeHome = mkdtempSync(join(tmpdir(), 'gbrain-sweep-claude-'));
+    tmpDirs.push(claudeHome);
+    const selfId = '11111111-2222-4333-8444-555555555555';
+    const userId = '66666666-7777-4888-9999-000000000000';
+    const selfProject = join(claudeHome, 'projects', '-tmp-gbrain-claude-cli-cwd-4242');
+    const userProject = join(claudeHome, 'projects', '-home-user-app');
+    mkdirSync(selfProject, { recursive: true });
+    mkdirSync(userProject, { recursive: true });
+    writeFileSync(join(selfProject, `${selfId}.jsonl`), '{"type":"user"}\n');
+    writeFileSync(join(userProject, `${userId}.jsonl`), '{"type":"user"}\n');
+    const selfFiles = [`${selfId}.txt`, `${selfId}.seg-aaaaaaaaaaaa.txt`, `${selfId}.wb-bbbbbbbbbbbbbbbbbbbbbbbb.txt`];
+    for (const f of selfFiles) writeFileSync(spoolPath(corpusDir, f), 'User: <turn>extract facts from this page</turn>\n');
+    writeFileSync(spoolPath(corpusDir, `${userId}.txt`), 'Alice committed to shipping the beta in March.\n');
+
+    let chatCalls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      chatCalls += 1;
+      return {
+        text: JSON.stringify({ facts: [] }),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:test-stub',
+        providerId: 'anthropic',
+      };
+    });
+
+    const r1 = await withEnv({ CLAUDE_CONFIG_DIR: claudeHome }, () =>
+      runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYED }));
+    expect(chatCalls).toBe(1);
+    expect(r1.corpusIngested).toBe(1);
+    expect(r1.skipped).toContainEqual({ reason: 'self_capture', count: 3 });
+    for (const f of selfFiles) expect(existsSync(spoolPath(corpusDir, f + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    expect(existsSync(spoolPath(corpusDir, `${userId}.txt` + CORPUS_INGESTED_SUFFIX))).toBe(true);
+
+    const r2 = await withEnv({ CLAUDE_CONFIG_DIR: claudeHome }, () =>
+      runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYED }));
+    expect(chatCalls).toBe(1);
+    expect(r2.corpusIngested).toBe(0);
+  });
+
   test('extraction_enabled=false spend gate skips without sidecars', async () => {
     await engine.setConfig('facts.extraction_enabled', 'false');
     try {
-      writeFileSync(join(corpusDir, 'gated.txt'), 'Gated content.\n');
+      writeFileSync(spoolPath(corpusDir, 'gated.txt'), 'Gated content.\n');
       const r = await runMaintenanceSweep(engine, {
         sourceId: 'default',
         capabilities: KEYED,
       });
       expect(r.corpusIngested).toBe(0);
       expect(r.skipped).toContainEqual({ reason: 'extraction_disabled', count: 1 });
-      expect(existsSync(join(corpusDir, 'gated.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
+      expect(existsSync(spoolPath(corpusDir, 'gated.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
     } finally {
       await engine.setConfig('facts.extraction_enabled', 'true');
     }
@@ -323,8 +543,8 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
   });
 
   test('two concurrent sweeps on one corpus dir ingest each file exactly once', async () => {
-    writeFileSync(join(corpusDir, 'race-a.txt'), 'Alice will demo the widget on Monday.\n');
-    writeFileSync(join(corpusDir, 'race-b.txt'), 'Bob owns the acme-example follow-up.\n');
+    writeFileSync(spoolPath(corpusDir, 'race-a.txt'), 'Alice will demo the widget on Monday.\n');
+    writeFileSync(spoolPath(corpusDir, 'race-b.txt'), 'Bob owns the acme-example follow-up.\n');
 
     let chatCalls = 0;
     __setChatTransportForTests(async (): Promise<ChatResult> => {
@@ -342,16 +562,16 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     // The whole point: one LLM call per FILE, never per (file × sweep).
     expect(chatCalls).toBe(2);
     expect(r1.corpusIngested + r2.corpusIngested).toBe(2);
-    expect(existsSync(join(corpusDir, 'race-a.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
-    expect(existsSync(join(corpusDir, 'race-b.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    expect(existsSync(spoolPath(corpusDir, 'race-a.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    expect(existsSync(spoolPath(corpusDir, 'race-b.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
     // No claim leftovers — success replaces the claim with the .ingested sidecar.
-    expect(existsSync(join(corpusDir, 'race-a.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
-    expect(existsSync(join(corpusDir, 'race-b.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'race-a.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'race-b.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
   });
 
   test('a fresh claim held by another sweep skips the file — zero LLM spend, claim untouched', async () => {
-    writeFileSync(join(corpusDir, 'claimed.txt'), 'Claimed elsewhere.\n');
-    const claim = join(corpusDir, 'claimed.txt' + CORPUS_CLAIM_SUFFIX);
+    writeFileSync(spoolPath(corpusDir, 'claimed.txt'), 'Claimed elsewhere.\n');
+    const claim = spoolPath(corpusDir, 'claimed.txt' + CORPUS_CLAIM_SUFFIX);
     writeFileSync(claim, '{}\n');
 
     let chatCalls = 0;
@@ -366,12 +586,12 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     expect(r.skipped).toContainEqual({ reason: 'corpus_in_progress', count: 1 });
     // The live claim belongs to the other sweep — this run must not release it.
     expect(existsSync(claim)).toBe(true);
-    expect(existsSync(join(corpusDir, 'claimed.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'claimed.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
   });
 
   test('a stale claim (>1h, dead sweep) is reclaimed and the file ingested', async () => {
-    writeFileSync(join(corpusDir, 'stale-claim.txt'), 'Left behind by a crashed sweep.\n');
-    const claim = join(corpusDir, 'stale-claim.txt' + CORPUS_CLAIM_SUFFIX);
+    writeFileSync(spoolPath(corpusDir, 'stale-claim.txt'), 'Left behind by a crashed sweep.\n');
+    const claim = spoolPath(corpusDir, 'stale-claim.txt' + CORPUS_CLAIM_SUFFIX);
     writeFileSync(claim, '{}\n');
     const old = (Date.now() - 2 * 3600 * 1000) / 1000;
     utimesSync(claim, old, old);
@@ -385,7 +605,7 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     const r = await runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYED });
     expect(r.corpusIngested).toBe(1);
     expect(chatCalls).toBe(1);
-    expect(existsSync(join(corpusDir, 'stale-claim.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    expect(existsSync(spoolPath(corpusDir, 'stale-claim.txt' + CORPUS_INGESTED_SUFFIX))).toBe(true);
     expect(existsSync(claim)).toBe(false);
   });
 
@@ -393,7 +613,7 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     // A directory named like a corpus file: readFile throws EISDIR after the
     // claim is acquired — a deterministic mid-ingest failure (runFactsPipeline
     // itself absorbs provider errors, so a throwing transport won't do).
-    mkdirSync(join(corpusDir, 'flaky.txt'));
+    mkdirSync(spoolPath(corpusDir, 'flaky.txt'));
     __setChatTransportForTests(async (): Promise<ChatResult> => {
       throw new Error('must not be reached');
     });
@@ -402,8 +622,8 @@ describe('runMaintenanceSweep — corpus claim fencing (concurrent sweeps)', () 
     expect(r.corpusIngested).toBe(0);
     expect(r.skipped).toContainEqual({ reason: 'corpus_file_error', count: 1 });
     // Neither sidecar remains: no .ingested (it failed), no claim (released).
-    expect(existsSync(join(corpusDir, 'flaky.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
-    expect(existsSync(join(corpusDir, 'flaky.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'flaky.txt' + CORPUS_CLAIM_SUFFIX))).toBe(false);
+    expect(existsSync(spoolPath(corpusDir, 'flaky.txt' + CORPUS_INGESTED_SUFFIX))).toBe(false);
   });
 });
 
@@ -451,15 +671,24 @@ describe('runMaintenanceSweep — bounded link resolution (no listAllPageRefs)',
       ['# TL', '', '## Timeline', '', '- **2026-03-04** | timeline only entry', ''].join('\n'),
     );
     const log: string[] = [];
-    const r = await runMaintenanceSweep(loggingEngine(engine, log), {
+    // A fresh GBRAIN_HOME holds no local CLI registration. Snapshot brains in
+    // one test process share a brain_id, so a registration another file wrote
+    // into the shared test home would add its verification query here.
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-sweep-home-'));
+    tmpDirs.push(home);
+    const r = await withEnv({ GBRAIN_HOME: home }, () => runMaintenanceSweep(loggingEngine(engine, log), {
       sourceId: 'default',
       capabilities: KEYLESS,
-    });
+    }));
     expect(r.timelineExtracted).toBe(1);
     expect(log).not.toContain('listAllPageRefs');
-    // Exactly two raw queries: the pass-1 fence scan and the pass-2 recency
-    // scan. No candidates ⇒ no third (ref-lookup) query.
-    expect(log.filter((m) => m === 'executeRaw').length).toBe(2);
+    // Exactly four raw queries: the pass-1 fence scan, the pass-2 recency
+    // scan, the managed-brain check that picks the timeline write path (a
+    // managed brain publishes per page through the coordinator) and the
+    // maintenance principal's brain_id lookup the attributed timeline batch
+    // makes (an installation with a CLI registration adds one query that
+    // verifies it, once per engine). No candidates ⇒ no ref-lookup query.
+    expect(log.filter((m) => m === 'executeRaw').length).toBe(4);
   });
 });
 
@@ -503,7 +732,9 @@ describe('runMaintenanceSweep — budget + never-throw', () => {
       corpusIngested: 0,
       factsReconciled: 3,
       linksExtracted: 1,
+      linksRemoved: 0,
       timelineExtracted: 0,
+      corpus_files: [],
       skipped: [{ reason: 'budget_exhausted:corpus', count: 2 }],
       durationMs: 10,
     };
@@ -809,5 +1040,119 @@ describe('runSweep CLI arg parsing [CX2-5]', () => {
     expect(out).toContain('Sweep complete');
     expect(out).toContain('source=my-src');
     expect(out).toContain('budget_exhausted:facts_fence');
+  });
+});
+
+/**
+ * #4611 residual — the sweep is the third caller of the shared
+ * resolveCandidateSources helper and must thread the same two knobs the
+ * extract paths do (`link_resolution.cross_source`, `sources.default`).
+ * Pre-fix it passed none, so on the sweep path the fallback compared against
+ * the LITERAL 'default' and the flag was ignored — and reconciliation then
+ * REMOVED the cross-source edge a flag-on `extract links` had just written.
+ */
+describe('#4611 sweep honors link_resolution.cross_source + sources.default', () => {
+  const sweep = () => runMaintenanceSweep(engine, {
+    sourceId: 'default', capabilities: KEYLESS, budgetMs: 30_000,
+  });
+  const edgesInto = async (toSource: string) => {
+    const rows = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*) AS n FROM links l
+         JOIN pages pf ON pf.id = l.from_page_id
+         JOIN pages pt ON pt.id = l.to_page_id
+        WHERE pf.slug = 'notes/writer-example' AND pf.source_id = 'default'
+          AND pt.slug = 'people/alice-example' AND pt.source_id = $1`,
+      [toSource],
+    );
+    return parseInt(rows[0].n, 10);
+  };
+  async function seedForeignTarget(source: string) {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, [source],
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('people/alice-example', $1, 'person', 'Alice', 'A person page.', '')`, [source],
+    );
+    await seedPage('notes/writer-example', 'note', 'See [Alice](people/alice-example).');
+  }
+
+  afterEach(async () => {
+    await engine.executeRaw(`DELETE FROM config WHERE key IN ('link_resolution.cross_source', 'sources.default')`);
+    await engine.executeRaw(`UPDATE sources SET config = config - 'federated' WHERE id = 'default'`);
+    await engine.executeRaw('DELETE FROM links');
+    await engine.executeRaw('DELETE FROM pages');
+    await engine.executeRaw(`DELETE FROM sources WHERE id <> 'default'`);
+  });
+
+  test('flag on: a link whose target lives only in another source produces the edge', async () => {
+    await engine.setConfig('link_resolution.cross_source', 'true');
+    await seedForeignTarget('vault-a');
+    await sweep();
+    expect(await edgesInto('vault-a')).toBe(1);
+  });
+
+  test('flag on: the sweep keeps the cross-source edge a flag-on extract just wrote', async () => {
+    await engine.setConfig('link_resolution.cross_source', 'true');
+    await seedForeignTarget('vault-a');
+    await runExtract(engine, ['links', '--source', 'db']);
+    expect(await edgesInto('vault-a')).toBe(1);
+    // extract stamped links_extracted_at; a later edit makes the page stale
+    // again so the sweep's batch actually re-selects (and reconciles) it.
+    await engine.executeRaw(`UPDATE pages SET updated_at = now() WHERE slug = 'notes/writer-example'`);
+    const r = await sweep();
+    expect(r.linksRemoved).toBe(0);
+    expect(await edgesInto('vault-a')).toBe(1);
+  });
+
+  test('flag off, federated origin: the fallback lane follows the configured sources.default', async () => {
+    await engine.setConfig('sources.default', 'main-vault');
+    await engine.executeRaw(
+      `UPDATE sources SET config = jsonb_set(config, '{federated}', 'true'::jsonb) WHERE id = 'default'`,
+    );
+    await seedForeignTarget('main-vault');
+    await sweep();
+    expect(await edgesInto('main-vault')).toBe(1);
+  });
+});
+
+// ─── wave review: the facts pass surfaces the reconcile's refusals ──
+describe('runMaintenanceSweep — facts reconcile warnings reach the sweep log', () => {
+  test('a stale pages cache (canonical file newer than the DB body) logs FACTS_PAGE_CACHE_STALE instead of vanishing', async () => {
+    // runExtractFacts REFUSES destructive reconcile when the canonical file
+    // disagrees with pages.compiled_truth and says so in r.warnings. The sweep
+    // dropped r.warnings on the floor, so an operator saw factsReconciled: 0
+    // and nothing else — indistinguishable from "nothing to do".
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-sweep-stale-cache-'));
+    tmpDirs.push(root);
+    _resetWriteThroughCacheForTest();
+    await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [root]);
+    try {
+      await seedPage('people/alice-example', 'person', FENCE_BODY);
+      // A fence-owned DB row the fence no longer carries: the reconcile must
+      // take its destructive branch, which is where the stale-cache refusal lives.
+      await engine.insertFacts(
+        [{ fact: 'Stale indexed row', kind: 'fact', source: 'stale', row_num: 7, source_markdown_slug: 'people/alice-example' }],
+        { source_id: 'default' },
+      );
+      mkdirSync(join(root, 'people'), { recursive: true });
+      // The file carries a row the DB body does not: the cache is stale.
+      writeFileSync(join(root, 'people', 'alice-example.md'), FENCE_BODY.replace(
+        '<!--- gbrain:facts:end -->',
+        '| 3 | Joined the board of widget-co | fact | 1.0 | world | high | 2026-09-01 |  | test |  |\n<!--- gbrain:facts:end -->',
+      ), 'utf-8');
+
+      const lines: string[] = [];
+      const r = await runMaintenanceSweep(engine, {
+        sourceId: 'default',
+        capabilities: KEYLESS,
+        log: (msg: string) => { lines.push(msg); },
+      });
+      expect(r.factsReconciled).toBe(0);
+      expect(lines.some((l) => l.includes('FACTS_PAGE_CACHE_STALE'))).toBe(true);
+    } finally {
+      await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      _resetWriteThroughCacheForTest();
+    }
   });
 });

@@ -1,4 +1,8 @@
 import type { Recipe } from '../types.ts';
+import { openrouterModelSupportsSubagentLoop } from '../openrouter-families.ts';
+import { deepseekReasoningContentCompatFetch } from './deepseek.ts';
+import { openaiModelSupportsPromptCache } from './openai.ts';
+import { GLM_THINKING_BY_DEFAULT_RE } from './zhipu.ts';
 
 /**
  * Private in-process marker header. `gateway.chat()` sets it when the caller
@@ -16,7 +20,12 @@ export const OPENROUTER_CACHE_HEADER = 'x-gbrain-anthropic-prompt-cache';
 
 /**
  * Family-scoped prompt-cache capability (per OpenRouter docs):
- * - OpenAI chat routes cache automatically (no request mutation needed).
+ * - OpenAI chat routes cache automatically, from the generation that shipped
+ *   automatic caching onward. The family test is the SAME predicate the native
+ *   `openai` recipe uses, so a model cannot report different capabilities
+ *   depending on which route reaches it.
+ * - DeepSeek routes cache automatically too (context caching is on by default
+ *   for every account), matching the native `deepseek` recipe.
  * - Anthropic Claude routes cache when the request carries `cache_control`
  *   on a content block (applied by the fetch shim below).
  * Everything else is not marked cacheable — deliberately narrow rather than
@@ -24,7 +33,14 @@ export const OPENROUTER_CACHE_HEADER = 'x-gbrain-anthropic-prompt-cache';
  */
 export function openrouterSupportsPromptCache(modelId: string): boolean {
   const normalized = modelId.trim().toLowerCase();
-  if (normalized.startsWith('openai/gpt-') || /^openai\/o\d/.test(normalized)) return true;
+  if (normalized.startsWith('openai/')) {
+    // OpenRouter appends routing variants (`:online`, `:nitro`, `:floor`, …)
+    // that are not part of the upstream model id. Strip before delegating, or
+    // every variant of a cache-capable model would read as cache-less.
+    const upstreamId = normalized.slice('openai/'.length).split(':', 1)[0] ?? '';
+    return openaiModelSupportsPromptCache(upstreamId);
+  }
+  if (normalized.startsWith('deepseek/')) return true;
   if (normalized.startsWith('anthropic/claude-')) return true;
   return false;
 }
@@ -32,6 +48,32 @@ export function openrouterSupportsPromptCache(modelId: string): boolean {
 /** Only Anthropic Claude routes need an explicit cache_control block. */
 export function openrouterRequiresExplicitPromptCache(modelId: string): boolean {
   return modelId.trim().toLowerCase().startsWith('anthropic/claude-');
+}
+
+/**
+ * Native DeepSeek v4 thinks by default (recipe `thinking_by_default: true`,
+ * #4172) and OpenRouter's DeepSeek hosts serve the same models — reasoning
+ * bills as OUTPUT tokens against max_tokens, so output-cap sizing must grant
+ * the same headroom on the OR route (#4758). Z.ai's GLM-4.5+/5.x think by
+ * default too (zhipu recipe, gbrain#4727) and OR bills their reasoning as
+ * completion tokens — same cutoff, same headroom under the `z-ai/` prefix.
+ */
+export function openrouterThinkingByDefault(modelId: string): boolean {
+  const normalized = modelId.trim().toLowerCase();
+  if (normalized.startsWith('deepseek/')) return true;
+  return normalized.startsWith('z-ai/') && GLM_THINKING_BY_DEFAULT_RE.test(normalized);
+}
+
+/**
+ * Which proxied families may drive the subagent loop. The gateway loop keys
+ * replay on gbrain_tool_use_id, not the raw provider id, so a family only
+ * needs a live abort/retry pin proving its tool-call envelope survives a
+ * resume. Anthropic and DeepSeek have one (test/e2e/openrouter-*-subagent-
+ * replay.live.test.ts); other families stay refused until they do
+ * (TODOS.md OpenRouter follow-up). List lives in ../openrouter-families.ts.
+ */
+export function openrouterSupportsSubagentLoop(modelId: string): boolean {
+  return openrouterModelSupportsSubagentLoop(modelId);
 }
 
 /**
@@ -65,9 +107,54 @@ function withSystemCacheControl(body: unknown): unknown {
 }
 
 /**
- * Compat fetch: honors the OPENROUTER_CACHE_HEADER marker by splicing an
+ * OpenRouter reports upstream rate limits and some provider outages inside
+ * an HTTP 200 body: `{ error: { message, code, metadata? } }` (#5473). The
+ * AI SDK validates that body against the chat-completion schema and throws
+ * an `APICallError` with `statusCode: 200`, so neither the SDK's
+ * status-keyed retry nor gbrain's status-keyed classification sees the real
+ * condition.
+ *
+ * Only a 200 `application/json` body whose integer `error.code` is 429 or
+ * 5xx gets that code as its HTTP status. A success payload, an unparseable
+ * body, a 4xx code, a non-integer code and any non-JSON (SSE) response pass
+ * through untouched. An existing `Retry-After` header is kept as it is; a
+ * finite non-negative `error.metadata.retry_after`/`retryAfter` is promoted
+ * to one when absent. Fail-open: any parse problem returns the original
+ * response.
+ */
+async function rewriteOpenRouterErrorEnvelopeStatus(res: Response): Promise<Response> {
+  if (res.status !== 200) return res;
+  if (!(res.headers.get('content-type') ?? '').includes('application/json')) return res;
+  try {
+    const text = await res.clone().text();
+    const error = JSON.parse(text)?.error;
+    const code = error?.code;
+    if (!Number.isInteger(code)) return res;
+    if (code !== 429 && (code < 500 || code >= 600)) return res;
+    const headers = new Headers(res.headers);
+    if (!headers.has('retry-after')) {
+      const meta = error.metadata;
+      const retryAfter = meta?.retry_after ?? meta?.retryAfter;
+      if (typeof retryAfter === 'number' && Number.isFinite(retryAfter) && retryAfter >= 0) {
+        headers.set('retry-after', String(retryAfter));
+      }
+    }
+    return new Response(text, { status: code, statusText: res.statusText, headers });
+  } catch {
+    return res;
+  }
+}
+
+/**
+ * Compat fetch: (1) honors the OPENROUTER_CACHE_HEADER marker by splicing an
  * Anthropic cache_control breakpoint onto the system block, then strips the
- * marker. Fail-open: any parse problem sends the original body unchanged.
+ * marker; (2) composes the native DeepSeek `reasoning_content` promote so
+ * OpenRouter-hosted thinking models (DeepSeek V4, etc.) do not arrive at the
+ * AI SDK adapter as empty `content` (#4753); (3) gives an HTTP-200
+ * rate-limit or outage envelope its real status (#5473, see
+ * `rewriteOpenRouterErrorEnvelopeStatus`). Fail-open: any parse problem
+ * sends the original body or response unchanged. Tool-call turns are never
+ * promoted (that logic lives in `deepseekReasoningContentCompatFetch`).
  *
  * @internal exported for tests. Cast through `unknown` because TS's
  * `typeof fetch` includes a `preconnect` member (matches azure-openai.ts).
@@ -76,9 +163,13 @@ export const openrouterCompatFetch = (async (
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> => {
-  if (!init?.headers) return fetch(input as any, init as any);
+  const promote = async (nextInit?: RequestInit): Promise<Response> =>
+    rewriteOpenRouterErrorEnvelopeStatus(
+      await deepseekReasoningContentCompatFetch(input as any, nextInit as any),
+    );
+  if (!init?.headers) return promote(init);
   const headers = new Headers(init.headers as any);
-  if (!headers.has(OPENROUTER_CACHE_HEADER)) return fetch(input as any, init as any);
+  if (!headers.has(OPENROUTER_CACHE_HEADER)) return promote(init);
   headers.delete(OPENROUTER_CACHE_HEADER);
   let body = init.body;
   if (typeof body === 'string') {
@@ -93,7 +184,7 @@ export const openrouterCompatFetch = (async (
       // Non-JSON body: let the provider surface the original problem.
     }
   }
-  return fetch(input as any, { ...init, headers, body } as any);
+  return promote({ ...init, headers, body } as any);
 }) as unknown as typeof fetch;
 
 /**
@@ -134,18 +225,34 @@ export const openrouterCompatFetch = (async (
  * downstream agent stacks (OpenClaw deployments, etc.) get their own
  * attribution on OR's leaderboard instead of polluting gbrain's.
  *
- * Subagent loops: `supports_subagent_loop: false` is INFORMATIONAL. The real
- * gate is `isAnthropicProvider()` in `src/core/model-config.ts` which
- * hard-pins gbrain's subagent infra to Anthropic-direct (stable tool_use_id
- * across crashes/replays). OR-proxied Anthropic is rejected at submit time
- * regardless of this flag — relaxing the gate is a deeper architectural
- * change tracked in TODOS.md.
+ * Subagent loops: Anthropic (`anthropic/…`) and DeepSeek (`deepseek/…`)
+ * routes declare `supports_subagent_loop` so classifyCapabilities() allows
+ * them, and the handler auto-routes those jobs through `gateway.toolLoop()`
+ * (OR is not a native Anthropic provider, so the Messages SDK path is never
+ * used for `openrouter:*`). Other OR families stay refused until they get a
+ * live abort/retry pin (TODOS.md).
  */
 export const openrouter: Recipe = {
   id: 'openrouter',
   name: 'OpenRouter',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'anthropic/claude-haiku-4.5',
+    'google/gemini-3-flash-preview',
+    'deepseek/deepseek-chat',
+    'openai/gpt-5.2',
+    'openai/gpt-5.2-chat',
+    'openai/gpt-5.5',
+    'anthropic/claude-sonnet-4.6',
+    'anthropic/claude-opus-4.7',
+    'cohere/rerank-v3.5',
+    'cohere/rerank-4-fast',
+    'cohere/rerank-4-pro',
+    'nvidia/llama-nemotron-rerank-vl-1b-v2:free',
+  ],
   base_url_default: 'https://openrouter.ai/api/v1',
   auth_env: {
     required: ['OPENROUTER_API_KEY'],
@@ -168,7 +275,26 @@ export const openrouter: Recipe = {
   touchpoints: {
     embedding: {
       models: ['openai/text-embedding-3-small'],
-      default_dims: 1536,
+      // #4114: per-model native dims for the catalog the docs invite users to
+      // pick. The old recipe-wide `default_dims: 1536` was only right for
+      // text-embedding-3-small — `migrate embeddings --to openrouter:bge-m3`
+      // planned a 1536-wide column for a model that returns 1024. Slash-form
+      // ids are the lookup key (embeddingDimsForModel strips only a leading
+      // `provider:`, never the org slash). gemini-embedding-2-preview is
+      // deliberately NOT listed: its width is unverified, and a plausible
+      // guess is this exact bug class — unlisted ids resolve to 0, which
+      // forces an explicit --dim / embedding_dimensions with a clear error.
+      model_dims: {
+        'openai/text-embedding-3-small': 1536,
+        'openai/text-embedding-3-large': 3072,
+        'qwen/qwen3-embedding-8b': 4096,
+        'bge-m3': 1024,
+        'baai/bge-m3': 1024,
+      },
+      // OpenRouter proxies arbitrary embedding models with widths we cannot
+      // know ahead of time; 0 = no silent default for unlisted ids.
+      default_dims: 0,
+      trust_custom_dims: true,
       // text-embedding-3-small was trained at MRL breakpoints 512/1024/1536
       // (Weaviate analysis); 768 is a practical intermediate. Users opt into
       // a smaller dim via `gbrain config set embedding_dimensions <N>`.
@@ -206,11 +332,13 @@ export const openrouter: Recipe = {
         'deepseek/deepseek-chat',
       ],
       supports_tools: true,
-      // Informational only — real gate is isAnthropicProvider() upstream.
-      supports_subagent_loop: false,
+      supports_subagent_loop: openrouterSupportsSubagentLoop,
       // Family-scoped: OpenAI routes cache automatically; Anthropic routes
       // cache via the compat fetch shim's cache_control rewrite.
       supports_prompt_cache: openrouterSupportsPromptCache,
+      // DeepSeek v4 via OpenRouter thinks by default (same as native
+      // deepseek:). Other OR families stay default-off.
+      thinking_by_default: openrouterThinkingByDefault,
       // No max_context_tokens: catalog spans 128K to 1M+; a single recipe-wide
       // value is either unsafe for smaller models or wasteful for larger ones.
       // Let upstream errors surface per-model.
@@ -231,8 +359,6 @@ export const openrouter: Recipe = {
       // `cost_per_search_usd` field for exact accounting.
       cost_per_1m_tokens_usd: 0.001,
       price_last_verified: '2026-06-13',
-      // OpenRouter doesn't publish an explicit payload cap; 5MB matches
-      // ZeroEntropy's upstream limit and the gateway's pre-flight ceiling.
       max_payload_bytes: 5_000_000,
       // OR serves /rerank under /api/v1. base_url_default already ends in /v1,
       // so gateway concatenates to …/api/v1/rerank.

@@ -1,145 +1,88 @@
-# FORK.md — perennia-regen/gbrain
+# Perennia gbrain fork
 
-This repo is a **fork of [garrytan/gbrain](https://github.com/garrytan/gbrain)**.
-This file is the map a human (or an agent) reads before merging upstream: what the
-fork changes, why, and where the merge landmines are.
+The fork tracks [garrytan/gbrain](https://github.com/garrytan/gbrain). Fork PRs target
+`master` in `perennia-regen/gbrain`. The production wrapper pins an immutable fork
+commit; merging this repository does not deploy the server.
 
-## Remotes
+## Upgrade baseline
 
-```bash
-git remote -v
-# fork      https://github.com/perennia-regen/gbrain.git   (the fork; default)
-# origin    https://github.com/garrytan/gbrain.git         (upstream / Garry Tan)
-```
+The current port merges upstream tag `v0.60.237.0`
+(`a05fa516dcaadff57da975652c8f4b3c16cbd25e`) into the deployed fork baseline
+`e3e50ef1dec2436caef2020d9ac4be43640f30c2` (schema 9007). It requires Bun 1.4.0
+or later. Validate the wrapper against the exact candidate before changing its pin.
 
-Base branch for fork work: **`perennia`** (not `master`).
+## Fork contracts
 
-## How far behind upstream are we?
+| Contract | Implementation |
+|---|---|
+| Federated writes and source aliases | `ops/context.ts`, `persistence/authority.ts`, OAuth client `federated_write` |
+| Stable page references and ambiguous slug refusal | `ops/fork-page-ref.ts`, `page-state/fork-page-refs.ts`, page snapshots and link readers |
+| Server-derived page ACLs | `ops/context.ts`, SQL read policies, snapshots, graph, history, context and projection readers |
+| Document identity, version sequence and hash | `page-state/fork-metadata.ts`, canonical publication; remote `versioned_document_write` capability |
+| Optional atomic content CAS | `page-state/content-precondition.ts`, engine page locks, canonical revision publication |
+| Durable actor-bound proposals | `ops/governed-writes.ts`; exact payload hash, base revision, expiry and canonical request replay |
+| OAuth writer attribution | Canonical persistence authority and engine page/ingest metadata |
+| Per-source schema packs | `schema-pack/engine-resolution.ts`; configured pack failures stop imports, sync and canonical publication |
+| Configured extraction models and Cohere | Model resolver, `ai/recipes/cohere.ts`, guarded Cohere endpoint overrides |
+| Domain entities and atom provenance | Mention policy includes Spanish domain types; extraction writes source-qualified `has_atom` edges |
+| Timeline maintenance and optional contradiction probe | Canonical timeline operations; default-disabled autopilot probe |
 
-Check any time:
+Paths in the table are relative to `src/core/` unless stated otherwise. Upstream
+refactor wave 1 split the old `operations.ts`, engines, migration registry and
+command files. Port behavior into the owning module instead of restoring the old
+monolith. Regenerate registry, schema, operation/flag catalogs and documentation.
 
-```bash
-git fetch origin fork
-echo "fork:     $(git show fork/perennia:VERSION)"
-echo "upstream: $(git show origin/master:VERSION)"
-git log --oneline origin/master..fork/perennia   # what the fork adds
-git log --oneline fork/perennia..origin/master   # what upstream has that we lack
-```
+## Independent migration progress
 
-The fork forked from an older upstream and upstream keeps releasing. Pulling
-upstream regularly (small, frequent merges) is far cheaper than a once-a-year
-big-bang merge. See "Sync process" below.
+Upstream owns migration numbers below 9000. Fork migrations start at 9000. The
+legacy `config.version` remains the high fork bookmark. The independent
+`config['schema.upstream_version']` checkpoints each successfully completed
+upstream migration. Pending upstream work is selected against that cursor, so a
+9007 bookmark cannot hide upstream 127 through 245.
 
-## What the fork adds on top of upstream
+For legacy databases without the cursor, only known history is inferred:
+9000–9002 imply upstream 117; 9003 implies 119; 9004–9006 imply 122; 9007 implies
+126. Unknown high bookmarks and malformed cursors fail closed. Existing historical
+fork catch-up migrations retain their numbers; they no longer replay low-band
+handlers out of order. New syncs do not need duplicate catch-up SQL. Engine graduation treats the upstream
+cursor as engine schema state, keeps the target's cursor, and carries actor-bound
+write proposals with the other security records.
 
-Keep this list current — it's the checklist for "did upstream touch any of these?"
-on every merge.
+Migration 9008 checks that the independent upstream cursor reached 245. Migration
+9009 adds proposal base revisions, the confirming client and a terminal failure state.
+Definite refusals finish as failed; uncertain outcomes retain the canonical request
+identity for safe replay. Existing pending
+proposals lack a base revision and must not overwrite an existing page without a
+fresh preview.
 
-| Area | Files | What |
-|---|---|---|
-| Per-call source on graph ops | `src/core/operations.ts`, `src/core/engine.ts` | `add_link` / `add_tag` / `remove_link` / `remove_tag` take a per-call `source` param (PR #1) |
-| `get_page` multi-source read | `src/core/operations.ts` (get_page handler), `src/core/{postgres,pglite}-engine.ts` (`getPageLayers`) | `source` param + union-of-layers read across sources (PR #2) |
-| Federated write | `src/core/oauth-provider.ts`, `src/commands/auth.ts`, schema + migration (fork band) | `oauth_clients.federated_write`: per-write source authorization (write-side mirror of `federated_read`) |
-| Pere runtime patches | `src/core/by-mention.ts`, `src/core/extract-takes-from-pages.ts`, `src/core/cycle/extract-atoms.ts` | takes chat-model, by-mention domain types, `'atom'` linkable + `has_atom` source→atom link |
-| Write attribution | `src/core/{operations,types,utils,import-file,postgres-engine,pglite-engine}.ts`, migration (fork band) | `pages` / `ingest_log` record the writer's OAuth identity (`last_write_client_id` / `last_write_client_name`) for the per-user ingestion digest |
+Upstream 142 and its 144 skew guard would clear existing take vectors while
+resizing their dimension. The fork adds a guard before that destructive path:
+a populated vector column with mismatched dimensions stops the upgrade. Align the
+configuration deliberately or plan a separately authorized migration. An upgrade
+must not silently select another embedding provider or re-embed the corpus.
 
-## Migration numbering — the one rule that prevents silent data loss
+`test/fork-migration-resume.test.ts` exercises a failed handler, resume, no-op
+rerun and populated-vector refusal. `scripts/upgrade/rehearse-fork.ts` seeds only
+an empty local `gbrain_port_rehearsal` database using the legacy checkout, then
+runs the candidate and writes inventories for exact comparison. It refuses remote
+hosts and other database names. Use disposable fixtures; no customer data or
+credentials belong in test evidence.
 
-**The problem.** Upstream and the fork both append migrations at "the next integer."
-Run in parallel, both repos mint the SAME version number with DIFFERENT SQL. The
-runner is a high-water-mark (`pending = m.version > current`), so when a brain has
-already passed that number, the loser's migration is **skipped silently** — no
-conflict marker, no error, no CI failure. This already bit us once: the fork's
-`federated_write` grabbed 118/119 and upstream's `page_generation_clock_sequence_swap`
-+ `op_checkpoints_completed_keys_array_check` were dropped from the fork entirely.
+## Sync and publication
 
-**The rule.**
+Fetch both remotes and inspect the fork baseline before integrating upstream.
+Use the repository `/ship` workflow for version allocation, complete unit/E2E
+validation, review, generated documentation, commit and PR preparation. Keep the
+wrapper OAuth integration and synthetic upgrade inventory as separate gates.
+A local pass does not prove CI, rollout approval or production behavior.
 
-- **Upstream owns the contiguous low range (1..N).** Never renumber, edit, or
-  reuse an upstream migration version. On merge, the shared low range stays
-  byte-identical to upstream, so `migrate.ts` merges cleanly there.
-- **Fork-local migrations live in a reserved high band**, starting at
-  `FORK_MIGRATION_BASE = 9000` (see `src/core/migrate.ts`). Upstream's counter
-  will never reach it. Add new fork migrations by appending within the band.
-- Band order is **not** chronological — every fork-band migration is idempotent
-  (`ADD COLUMN IF NOT EXISTS`, `CREATE ... IF NOT EXISTS`, guarded `ADD
-  CONSTRAINT`) and order-independent, so appending is safe.
+`.github/workflows/upstream-sync.yml` starts from fork `master`, uses Bun 1.4.0
+and frozen dependencies, and creates a draft PR for a clean merge. Conflicts
+always leave a job summary and downloadable report. When Issues are disabled,
+the workflow skips issue creation; it does not fail by repeatedly retrying it.
 
-**Every upstream sync needs a band catch-up — not just number collisions.** This is
-the trap. The bookmark is a **single scalar high-water-mark**: once a deployed brain
-is stamped inside the band (`schema_version ≥ 9000`), `pending = version > current`
-makes **every** upstream migration non-pending — because they all live in the low
-range (< 9000). So a NEW upstream migration added at, say, 121 is `121 > 9003 = false`
-→ **skipped silently** on every already-deployed brain, leaving new code on a stale
-schema. This is a *superset* of the collision case: it is not limited to versions the
-fork previously shadowed. Two examples, same fix:
-
-- *Collision (118/119):* the fork's `federated_write` had grabbed 118/119; upstream's
-  real 118/119 were restored at their numbers + a catch-up `reconcile_forked_118_119`
-  at `FORK_MIGRATION_BASE + 3`.
-- *Plain new upstream migrations (120/121/122, the v0.42.59.0 sync):* never shadowed,
-  just numerically below the band ceiling → still skipped on brains at 9003. Fixed the
-  same way: added at their upstream numbers + a catch-up `reconcile_forked_120_121_122`
-  at `FORK_MIGRATION_BASE + 4`.
-
-**The catch-up recipe.** For each new upstream migration in a sync, add ONE band
-catch-up (version above the current band ceiling) that re-applies the exact same DDL,
-idempotently. Extract the DDL into a shared constant referenced by BOTH the upstream
-migration and the catch-up so they can never drift. If the upstream migration is
-engine-specific (`sqlFor`), the catch-up is too. On a fresh install (where 120/121/122
-ran in order) the catch-up is a harmless no-op; on a stamped brain it is the ONLY thing
-that delivers them. **Before shipping a sync, check prod's real bookmark**
-(`fly ssh console -a pere-brain -C "gbrain config get version"`) — if it is ≥ 9000, you
-MUST have a catch-up covering every new upstream migration or they never land.
-
-**Guardrail.** `test/migration-fork-band.test.ts` pins: unique versions, fork
-migrations live only in the band (add new `reconcile_forked_*` names to its
-`FORK_LOCAL_NAMES`), upstream migrations restored by name, and the schema is healed
-after a full init. `test/migration-reconcile-120-122.test.ts` reproduces the stuck-brain
-case (bookmark forced to 9003, objects dropped → catch-up restores them). Run both after
-touching `migrate.ts`.
-
-## Merge-conflict hotspots
-
-When merging `origin/master`, expect to resolve these (the fork has large local
-deltas here):
-
-- `src/core/operations.ts` — biggest delta (per-call source, get_page union,
-  attribution threading). Conflicts likely.
-- `src/core/migrate.ts` — should conflict ONLY if upstream edits the shared low
-  range you also touched; the fork band (9000+) is additive and won't conflict.
-- `src/core/{postgres,pglite}-engine.ts` — `getPageLayers`, `putPage` /
-  `logIngest` attribution columns.
-- `src/core/oauth-provider.ts`, `src/commands/auth.ts` — federated_write.
-- `src/schema.sql`, `src/core/pglite-schema.ts`, `src/core/schema-embedded.ts` —
-  schema additions; `schema-embedded.ts` is generated (`bun run build:schema`).
-
-## Sync process (do this monthly, not yearly)
-
-```bash
-git fetch origin fork
-git switch -c sync/upstream-$(date +%Y%m%d) fork/perennia
-git merge origin/master            # resolve conflicts using the hotspot list above
-bun run typecheck
-bun run test                       # full unit suite
-# (E2E if DATABASE_URL is available — see CLAUDE.md)
-git push fork sync/upstream-$(date +%Y%m%d)
-gh pr create --repo perennia-regen/gbrain --base perennia
-```
-
-On merge, after resolving `migrate.ts`: restore EVERY new upstream migration at its
-upstream number AND add a band catch-up (`reconcile_forked_*`) that re-applies its DDL
-idempotently — see "Every upstream sync needs a band catch-up" above. This is required
-for every sync that brings new upstream migrations, not only for number collisions,
-because deployed brains are stamped inside the band and skip anything below it. Re-run
-`test/migration-fork-band.test.ts` + `test/migration-reconcile-*.test.ts`.
-
-The `.github/workflows/upstream-sync.yml` workflow automates the fetch + merge
-attempt + test run and opens a PR (or an issue on conflict) on a schedule.
-
-## Upstream-first for generic features
-
-If a feature is not perennia-specific, **send it to `garrytan/gbrain` instead of
-(or before) the fork.** Anything that merges upstream stops being fork delta and
-costs zero to maintain. The ideal permanent delta is the minimum that is genuinely
-Perennia-specific.
+The wrapper keeps DB-first operation, rejects writes to the retired `default`
+source and does not run generic repository sync. Before a later authorized
+rollout, coordinate every writing CLI with the server revision, stop writers,
+verify a restorable database backup and test rollback against that backup.
+Restoring an old image alone is not a database rollback after schema changes.

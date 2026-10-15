@@ -95,6 +95,20 @@ Run these BEFORE composing the briefing sections. All four pulls are read-only.
    may miss the right source. Thin-client installs (`gbrain init --mcp-only`)
    route through the remote brain transparently.
 
+0e. **Open loops (when google sources exist).** Pull who is waiting on the
+   user and what they promised:
+
+   ```bash
+   gbrain waiting --json
+   ```
+
+   Fold the top counterparties (what's owed, due dates, evidence quotes,
+   deep links) into the ACTION ITEMS section — these are real loop rows, not
+   inferred follow-ups, so they outrank prose heuristics. `waiting` refuses
+   on stale google sources (no successful sync in 24h) and names the exact
+   fix — that's by design: run the sync it names, then retry (see
+   `skills/google-loops/SKILL.md`).
+
 ## Phases
 
 1. **Today's meetings.** For each meeting on the calendar:
@@ -176,6 +190,14 @@ mentioned must have a back-link from their page. See `skills/_brain-filing-rules
 When presenting facts from brain pages, include inline citations:
 - "Jane is CTO of Acme [Source: people/jane-doe, updated 2026-04-01]"
 - This lets the user trace any claim back to the brain page and assess freshness
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain waiting` refuses on stale data: run the sync command it names (or tell the user to, when it needs the brain host), then retry. Do not build the "waiting on you" section from stale mail.
+- `recall` / `query` sections come back empty with a degraded notice: write "the brain is searching keywords only right now" in that section instead of "nothing happened".
+- One section's source fails (`rate_limited`, `timeout`): ship the rest of the briefing and name the missing section; never silently drop it.
 
 ## Anti-Patterns
 

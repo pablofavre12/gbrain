@@ -64,9 +64,9 @@ change)" decision is vibes. The probe produces evidence.
                            │
         ┌──────────────────┼──────────────────────┬───────────────┐
         ▼                  ▼                      ▼               ▼
-   doctor (M1)         MCP (M3)             synthesize (M2)   trend (M5)
+   doctor (M1)       local read (M3)        synthesize (M2)   trend (M5)
    surfaces           find_contradictions    informational     persistent
-   findings           op for agents          block in prompt   tracking
+   findings           unscoped callers       block in prompt   tracking
 ```
 
 ## Severity rubric
@@ -79,8 +79,8 @@ The judge assigns severity per finding:
 | `medium` | factual values that may be stale | revenue figure, headcount, valuation |
 | `high` | identity / structural claims | founder/CEO/CFO role, company status |
 
-Doctor sorts findings by severity DESC. The MCP op accepts a severity filter
-so agents can fetch just the high-priority items.
+Doctor sorts findings by severity DESC. Trusted local callers without a source
+filter can use the operation's severity filter to fetch high-priority items.
 
 ## How to interpret the headline number
 
@@ -102,27 +102,39 @@ Decision criteria for the bigger swing (chunk-level `revises` field):
 |---|---|---|
 | < 5% | Source-boost + recency-decay + curated pages handle the load | Stop here; this is the right scope |
 | 5–15% | Real but bounded | Operator decides whether the cost justifies the swing |
-| > 15% | Real and substantial | Plan the bigger swing in v0.34+ |
+| > 15% | Real and substantial | Plan the bigger swing |
 
 ## When to act on findings
 
-Each finding ships with a `resolution_command` field — paste-ready:
+Each finding ships with a `resolution_command` field — addressable and
+honest about what needs operator judgment:
 
-- `gbrain takes supersede <slug> --row N` — newer take should replace
-  the older chunk text on the same page (intra_page kind).
-- `gbrain dream --phase synthesize --slug <slug>` — compiled_truth for
-  the curated entity needs an update (cross_slug curated-vs-bulk).
-- `gbrain takes mark-debate <slug> --row N` — intentional disagreement
-  (e.g., two opinions you want to keep both of).
-- `# manual review: <a> vs <b>` — judge wasn't sure; operator decides.
+- `gbrain takes supersede <slug> --row N --claim '<replacement>'` — newer
+  take should replace the older one (intra_page kind). `--row` is the
+  per-page row number and `--claim` is required; when the winning side has
+  an unambiguous claim (temporal supersession where the newer side is
+  itself a take) the command is fully paste-ready, otherwise it carries an
+  explicit `<replacement claim>` placeholder for you to fill from the
+  report — the classifier picks an action, not a winner, and will not
+  fabricate a take from arbitrary chunk prose.
+- `gbrain dream --phase synthesize  # re-synthesize; contradiction on <slug>`
+  — compiled_truth for the curated entity needs an update (cross_slug
+  curated-vs-bulk). The synthesize phase has no per-slug flag, so the
+  comment names the page to check after the run.
+- `# manual review: ...` — intentional-disagreement (debate) findings and
+  judge-unsure findings render as a manual-review comment; a
+  mark-as-debate subcommand does not exist yet, so nothing is minted that
+  would fail when pasted.
 
 Run `gbrain eval suspected-contradictions review --severity high` to
 inspect findings without re-running the probe.
 
 ## Cost model
 
-Default judge is `claude-haiku-4-5` at ~$1/Mtok in, $5/Mtok out. With
-the v0.32.6 truncation at 1500 chars per pair, ~500 input + 80 output
+The judge resolves `--judge` > `models.eval.contradictions_judge` > the utility
+model tier > `GBRAIN_CONTRADICTIONS_JUDGE_MODEL`; the figures below assume a
+small model such as `claude-haiku-4-5` at ~$1/Mtok in, $5/Mtok out. With
+the default truncation at 1500 chars per pair (`--max-pair-chars`), ~500 input + 80 output
 tokens per judge call. Budget cap defaults to $5 in TTY / $1 non-TTY.
 
 - ~$0.0006 per judge call
@@ -136,8 +148,14 @@ pay near-zero on re-runs (until you bump PROMPT_VERSION).
 
 - Probe never mutates the brain. Runs only read pages/takes/chunks.
   Writes go only to `eval_contradictions_runs` and `eval_contradictions_cache`.
-- MCP `find_contradictions` is read-scope. NOT in the subagent allowlist —
-  user-initiated only, not autonomous-action surface.
+- `find_contradictions` is read-scope and is not in the subagent allowlist.
+  Stored reports are temporarily available only to trusted local callers
+  without a source filter. The bare local `gbrain find-contradictions` reads
+  the latest run: a source the CLI resolved by default (no `--source`,
+  `GBRAIN_SOURCE` or `.gbrain-source`) is not a filter. Remote or
+  source-scoped callers receive
+  `{ contradictions: [], note }` with an availability note; their requests
+  do not load the stored report.
 - Build-fixture script is local-only. The redactor + `isCleanForCommit`
   gate makes accidental private-data commits hard, but the operator MUST
   inspect every redaction before commit.
@@ -148,7 +166,19 @@ The judge distinguishes real contradictions from legitimate change-over-time.
 The verdict enum has six members (`no_contradiction | contradiction |
 temporal_supersession | temporal_regression | temporal_evolution |
 negation_artifact`), and `pages.effective_date` is threaded into the judge
-prompt so the probe doesn't cry wolf on facts that simply changed.
+prompt so the probe doesn't cry wolf on facts that simply changed. Only
+content dates (frontmatter or filename) count; a page whose date is the
+recorded-time `fallback` reaches the judge as `(date unknown)` and leaves
+the text-date pre-filter in charge. A temporal verdict needs two different
+times: same-date or undated value conflicts are contradictions. Claims about
+two entities whose names merely look alike are never contradictions.
+
+Prompt v4 asks two questions before any verdict: do both statements give a
+value for the same attribute of the same entity (if not, nothing conflicts),
+and is there evidence of two different times? It tells the judge never to
+order two values by their size, the kind of document, or which statement is
+listed first, and that a negative claim about one party ("Fund A is not
+leading") and a positive claim about another ("Fund B is leading") agree.
 
 The trajectory substrate builds on the same signal:
 `gbrain eval trajectory <entity>` shows the chronological typed-claim

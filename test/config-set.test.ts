@@ -22,6 +22,7 @@ describe('KNOWN_CONFIG_KEYS', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('embedding_model');
     expect(KNOWN_CONFIG_KEYS).toContain('embedding_dimensions');
     expect(KNOWN_CONFIG_KEYS).toContain('embedding_disabled');  // v0.37 D9
+    expect(KNOWN_CONFIG_KEYS).toContain('auto_timeline');  // #4987 off switch
     expect(KNOWN_CONFIG_KEYS).toContain('expansion_model');
     expect(KNOWN_CONFIG_KEYS).toContain('chat_model');
     expect(KNOWN_CONFIG_KEYS).toContain('openrouter_api_key');
@@ -64,6 +65,10 @@ describe('KNOWN_CONFIG_KEYS', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('dream.synthesize.subagent_wait_timeout_ms');
   });
 
+  test('registers cycle.timezone for local-day dream bucketing (#4348)', () => {
+    expect(KNOWN_CONFIG_KEYS).toContain('cycle.timezone');
+  });
+
   test('contains the spend-control keys (v0.42.42.0, #2139) — no --force archaeology', () => {
     expect(KNOWN_CONFIG_KEYS).toContain('spend.posture');
     expect(KNOWN_CONFIG_KEYS).toContain('sync.cost_gate_min_usd');
@@ -79,7 +84,19 @@ describe('KNOWN_CONFIG_KEYS', () => {
     // or `config set` rejects the wave's own enable command without --force.
     expect(KNOWN_CONFIG_KEYS).toContain('agent.use_gateway_loop');
     expect(KNOWN_CONFIG_KEYS).toContain('openrouter_api_key');
-    expect(KNOWN_CONFIG_KEYS).toContain('zeroentropy_api_key');
+    expect(KNOWN_CONFIG_KEYS).toContain('deepseek_api_key');
+  });
+
+  test('contains the working-tree sync toggle (untracked-gap fix)', () => {
+    // The drift NOTE + stderr warning both tell users to run
+    // `gbrain config set sync.include_working_tree true`; the key must be
+    // known or the remedy itself is rejected without --force.
+    expect(KNOWN_CONFIG_KEYS).toContain('sync.include_working_tree');
+  });
+
+  test('contains the local extract-atoms knobs', () => {
+    expect(KNOWN_CONFIG_KEYS).toContain('cycle.extract_atoms.page_discovery_budget');
+    expect(KNOWN_CONFIG_KEYS).toContain('cycle.extract_atoms.max_source_chars');
   });
 
   test('registers only the live conversation-parser fallback key', () => {
@@ -299,6 +316,49 @@ describe('#2753 — the doctor-proposed gateway-loop command is accepted by `con
     expect(setCalls).toEqual([['sources.default', 'wiki']]);
   });
 
+  test('cycle.timezone: rejects an invalid IANA timezone before writing (#4348)', async () => {
+    const { engine, setCalls } = setStubEngine();
+    const { errs, exit } = await runConfigCapture(
+      engine,
+      ['set', 'cycle.timezone', 'Mars/Olympus_Mons'],
+    );
+
+    expect(exit).toBe(1);
+    expect(errs.join('\n')).toContain('valid IANA timezone');
+    expect(setCalls).toEqual([]);
+  });
+
+  test('persistence.limits.*: accepted without --force and never called unread (#5470)', async () => {
+    for (const key of ['persistence.limits.principal_terminal_bytes', 'persistence.limits.principal_lifetime_ids', 'persistence.receipt_retention_days']) {
+      const { engine, setCalls } = setStubEngine();
+      const { errs, exit } = await runConfigCapture(engine, ['set', key, '268435456']);
+      expect(exit).toBeNull();
+      expect(errs.join('\n')).not.toContain('Unknown config key');
+      expect(errs.join('\n')).not.toContain('Nothing in gbrain reads this');
+      expect(setCalls).toEqual([[key, '268435456']]);
+    }
+  });
+
+  test('persistence.limits.*: rejects a value every admission would refuse (#5470)', async () => {
+    const { engine, setCalls } = setStubEngine();
+    const { errs, exit } = await runConfigCapture(engine, ['set', 'persistence.limits.principal_lifetime_ids', '1.5e6']);
+    expect(exit).toBe(1);
+    expect(errs.join('\n')).toContain('expected a nonnegative integer');
+    expect(setCalls).toEqual([]);
+  });
+
+  test('cycle.timezone: accepts a valid IANA timezone (#4348)', async () => {
+    const { engine, setCalls } = setStubEngine();
+    const { errs, exit } = await runConfigCapture(
+      engine,
+      ['set', 'cycle.timezone', 'Asia/Kolkata'],
+    );
+
+    expect(exit).toBeNull();
+    expect(errs.join('\n')).not.toContain('valid IANA timezone');
+    expect(setCalls).toEqual([['cycle.timezone', 'Asia/Kolkata']]);
+  });
+
   // A DB failure must not be laundered into "source is not registered" — that
   // would send an operator chasing a source-registration problem that doesn't
   // exist while the real fault (connection, permissions, SQL regression) is
@@ -351,6 +411,73 @@ describe('#2753 — the doctor-proposed gateway-loop command is accepted by `con
   });
 });
 
+describe('#3748 — budget.* rejection routes to the live spend controls', () => {
+  function setStubEngine(): { engine: BrainEngine; setCalls: Array<[string, string]> } {
+    const setCalls: Array<[string, string]> = [];
+    const engine = {
+      getConfig: async () => null,
+      setConfig: async (key: string, value: string) => { setCalls.push([key, value]); },
+    } as unknown as BrainEngine;
+    return { engine, setCalls };
+  }
+
+  async function runConfigCapture(
+    engine: BrainEngine,
+    args: string[],
+  ): Promise<{ logs: string[]; errs: string[]; exit: number | null }> {
+    const logs: string[] = [];
+    const errs: string[] = [];
+    let exit: number | null = null;
+    const logSpy = spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logs.push(a.join(' ')); });
+    const errSpy = spyOn(console, 'error').mockImplementation((...a: unknown[]) => { errs.push(a.join(' ')); });
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      exit = code ?? 0;
+      throw new Error(`EXIT:${code}`);
+    }) as never);
+    try {
+      await runConfig(engine, args);
+    } catch (e) {
+      if (!(e as Error).message.startsWith('EXIT:')) throw e;
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
+    return { logs, errs, exit };
+  }
+
+  // Old release notes documented `budget.daily_cap_usd` as a hard spend wall,
+  // but the key was never registered and has NO readers. The rejection must
+  // name the control that actually exists (spend.posture + the spend-controls
+  // guide) instead of leaving the operator to --force a cap that caps nothing.
+  test('budget.daily_cap_usd is rejected AND the error names spend.posture + the guide', async () => {
+    const { engine, setCalls } = setStubEngine();
+    const { errs, exit } = await runConfigCapture(engine, ['set', 'budget.daily_cap_usd', '10']);
+    expect(exit).toBe(1);
+    const err = errs.join('\n');
+    expect(err).toContain('Unknown config key "budget.daily_cap_usd"');
+    expect(err).toContain('spend.posture');
+    expect(err).toContain('docs/operations/spend-controls.md');
+    expect(setCalls).toEqual([]);
+  });
+
+  test('--force still writes but warns that budget.* is not a spend cap', async () => {
+    const { engine, setCalls } = setStubEngine();
+    const { errs, exit } = await runConfigCapture(engine, ['set', 'budget.daily_cap_usd', '10', '--force']);
+    expect(exit).toBeNull();
+    const err = errs.join('\n');
+    expect(err).toContain('Nothing in gbrain reads this');
+    expect(err).toContain('NOT a spend cap');
+    expect(err).toContain('spend.posture');
+    expect(setCalls).toEqual([['budget.daily_cap_usd', '10']]);
+  });
+
+  test('budget.* stays unregistered — no readerless key gets blessed', () => {
+    expect(KNOWN_CONFIG_KEYS.some(k => k === 'budget' || k.startsWith('budget.'))).toBe(false);
+    expect(KNOWN_CONFIG_KEY_PREFIXES).not.toContain('budget.');
+  });
+});
+
 describe('#2753 — doctor and the subagent worker share one truthiness set', () => {
   // The doctor accepted true/1/yes/on; the worker accepted only true/1. So
   // `gbrain config set agent.use_gateway_loop yes` produced a HEALTHY doctor
@@ -366,5 +493,39 @@ describe('#2753 — doctor and the subagent worker share one truthiness set', ()
     for (const v of [null, undefined, '', '   ', 'false', '0', 'no', 'off', 'maybe', 1, true, {}]) {
       expect(isConfigTruthy(v)).toBe(false);
     }
+  });
+});
+
+describe('#6231 facts.page_write_notability_filter', () => {
+  async function setCapture(value: string) {
+    const setCalls: Array<[string, string]> = [];
+    const engine = { getConfig: async () => null, setConfig: async (key: string, v: string) => { setCalls.push([key, v]); } } as unknown as BrainEngine;
+    const errs: string[] = [];
+    let exit: number | null = null;
+    const logSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const errSpy = spyOn(console, 'error').mockImplementation((...a: unknown[]) => { errs.push(a.join(' ')); });
+    const outSpy = spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderrSpy = spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => { errs.push(String(chunk)); return true; }) as never);
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => { exit = code ?? 0; throw new Error(`EXIT:${code}`); }) as never);
+    try { await runConfig(engine, ['set', 'facts.page_write_notability_filter', value]); }
+    catch (e) { if (!(e as Error).message.startsWith('EXIT:')) throw e; }
+    finally { logSpy.mockRestore(); errSpy.mockRestore(); outSpy.mockRestore(); stderrSpy.mockRestore(); exitSpy.mockRestore(); }
+    return { setCalls, errs: errs.join('\n'), exit };
+  }
+
+  test('the key is registered', () => { expect(KNOWN_CONFIG_KEYS).toContain('facts.page_write_notability_filter'); });
+
+  test.each(['all', 'medium-and-up', 'high-only'])('%p is written as given', async (value) => {
+    const { setCalls, exit } = await setCapture(value);
+    expect(exit).toBeNull();
+    expect(setCalls).toEqual([['facts.page_write_notability_filter', value]]);
+  });
+
+  test.each(['low', 'medium'])('%p is refused and nothing is written', async (value) => {
+    const { setCalls, errs, exit } = await setCapture(value);
+    expect(exit).not.toBeNull();
+    expect(exit).not.toBe(0);
+    expect(errs).toContain('facts.page_write_notability_filter must be one of all, high-only, medium-and-up');
+    expect(setCalls).toEqual([]);
   });
 });

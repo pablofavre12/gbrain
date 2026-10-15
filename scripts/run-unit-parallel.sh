@@ -43,49 +43,43 @@
 #   .context/test-shards/        per-shard logs + exit codes (cleared at start)
 
 set -uo pipefail
+unset SHARD # This wrapper assigns its own children; ambient routing must not reach nested runners.
+
+# Fixture tests that `git commit` in temp repos must not inherit the developer's
+# global commit.gpgsign — a signing gpg-agent can OOM under full-suite memory
+# pressure and fail the commit ("gpg: signing failed: Cannot allocate memory",
+# #1696). git applies these env keys as highest-precedence config on every
+# invocation in this process tree, so all child `git commit`s run unsigned.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="commit.gpgsign" GIT_CONFIG_VALUE_0="false"
+
+# #3485: unit tests need no database — strip ambient DB URLs at this wrapper
+# boundary so the bunfig preload guard passes and nothing can reach a real
+# brain. The e2e wrapper (run-e2e.sh) is the only lane that keeps them.
+unset DATABASE_URL GBRAIN_DATABASE_URL
+# An ambient GBRAIN_HOME (a dev shell configured for a real brain) must not
+# reach unit tests either: the gbrain-home-preload respects a pre-set value
+# (the e2e wrapper needs that), so strip it at this boundary and let the
+# preload allocate per-run scratch instead.
+unset GBRAIN_HOME
 
 cd "$(dirname "$0")/.."
 
 # ──────────────────────────────────────────────────────────────────────────
-# CPU detection: Apple Silicon perf cores → Mac total physical → nproc → 4.
-# Returns a single positive integer.
+# W0 fix-wave (Tier-1 #16): PGLite schema snapshot, DEFAULT-ON for the plain
+# `bun run test` loop. 500+ test files each cold-boot PGLite + replay 126
+# migrations without it; the fixture was previously enabled ONLY inside
+# scripts/ci-local.sh, so the everyday loop paid the full cost. The build
+# script is idempotent (hash short-circuit) and concurrency-safe (mkdir
+# lock, D5.8), and its hash folds handler-migration source (D5.13), so an
+# unconditional call here is cheap and always current. Runs BEFORE the shard
+# fan-out — shards inherit a finished fixture. Opt out: GBRAIN_NO_SNAPSHOT=1
+# (the migration-replay canary tests clear the env themselves regardless).
 # ──────────────────────────────────────────────────────────────────────────
-detect_cpus() {
-  local n=""
-  n=$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null) && [ -n "$n" ] && [ "$n" -gt 0 ] && echo "$n" && return
-  n=$(sysctl -n hw.physicalcpu 2>/dev/null) && [ -n "$n" ] && [ "$n" -gt 0 ] && echo "$n" && return
-  n=$(nproc 2>/dev/null) && [ -n "$n" ] && [ "$n" -gt 0 ] && echo "$n" && return
-  echo 4
-}
-
-# ──────────────────────────────────────────────────────────────────────────
-# Available-memory detection (MB). macOS: vm_stat free + inactive +
-# speculative + purgeable pages (inactive/purgeable are reclaimable on
-# pressure, which is exactly the scenario we size for). Linux: MemAvailable.
-# Unknown platform → 0, and the caller skips adaptation entirely.
-# ──────────────────────────────────────────────────────────────────────────
-detect_available_mem_mb() {
-  if command -v vm_stat >/dev/null 2>&1; then
-    vm_stat 2>/dev/null | awk '
-      /page size of/ { psize = $8 }
-      /Pages free/        { free = $NF }
-      /Pages inactive/    { inactive = $NF }
-      /Pages speculative/ { spec = $NF }
-      /Pages purgeable/   { purge = $NF }
-      END {
-        gsub(/\./, "", free); gsub(/\./, "", inactive)
-        gsub(/\./, "", spec); gsub(/\./, "", purge)
-        if (psize == 0) psize = 16384
-        printf "%d\n", (free + inactive + spec + purge) * psize / 1048576
-      }'
-    return
-  fi
-  if [ -r /proc/meminfo ]; then
-    awk '/MemAvailable/ { printf "%d\n", $2 / 1024; found = 1 } END { if (!found) print 0 }' /proc/meminfo
-    return
-  fi
-  echo 0
-}
+# detect_cpus / detect_available_mem_mb / ensure_pglite_snapshot live in the
+# shared lib (also sourced by test-shard.sh, run-serial-tests.sh,
+# run-slow-tests.sh) — one implementation, no copy drift.
+. scripts/lib/test-env.sh
+ensure_pglite_snapshot "run-unit-parallel"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Argument parsing. --shards N override wins over $SHARDS; both are clamped.
@@ -162,11 +156,16 @@ if [ "${GBRAIN_TEST_NO_MEM_ADAPT:-0}" != "1" ]; then
     MAX_TOTAL=$((BUDGET_MB / MEM_PER_FILE_MB))
     [ "$MAX_TOTAL" -lt 1 ] && MAX_TOTAL=1
     ORIG_N="$N"; ORIG_INTRA="$INTRA_CONC"
-    # Shed shards before intra-shard concurrency: fewer bun processes frees
-    # more than narrower ones (each process carries its own heap + WASM).
+    # Shed intra-shard concurrency before shards. `bun test --max-concurrency`
+    # only bounds test.concurrent tests (1 file in the corpus) — every other
+    # file runs serially inside its shard process, so INTRA_CONC is nearly
+    # free to shed: dropping it costs no throughput, while dropping a SHARD
+    # removes a whole bun process of real fan-out. The old order (shards
+    # first) collapsed a 16GB box to 1x4 — effectively a serial run behind a
+    # 12000s watchdog (measured 3.25x slower than 4 shards on the same box).
     while [ $((N * INTRA_CONC)) -gt "$MAX_TOTAL" ]; do
-      if [ "$N" -gt 1 ]; then N=$((N - 1))
-      elif [ "$INTRA_CONC" -gt 1 ]; then INTRA_CONC=$((INTRA_CONC - 1))
+      if [ "$INTRA_CONC" -gt 1 ]; then INTRA_CONC=$((INTRA_CONC - 1))
+      elif [ "$N" -gt 1 ]; then N=$((N - 1))
       else break
       fi
     done
@@ -199,9 +198,18 @@ else
   mkdir -p "$LOG_DIR" || { echo "ERROR: cannot create log dir" >&2; exit 2; }
 fi
 # Clear from prior run.
-rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged "$LOG_DIR"/shard-*.lastkb "$LOG_DIR"/shard-*.lastprogress "$LOG_DIR"/shard-*.start "$LOG_DIR"/shard-*.end 2>/dev/null
+rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged "$LOG_DIR"/shard-*.lastkb "$LOG_DIR"/shard-*.lastprogress "$LOG_DIR"/shard-*.start "$LOG_DIR"/shard-*.end "$LOG_DIR"/shard-*.watchdog "$LOG_DIR"/shard-*.assigned "$LOG_DIR"/shard-*.hbsum 2>/dev/null
 : > "$FAILURES_LOG"
 : > "$SUMMARY_FILE"
+# Executed-test receipts (X2): on by default for this loop, under
+# .context/test-receipts (cleared per run) unless GBRAIN_TEST_RECEIPT_DIR names
+# another directory. `bun scripts/ci-executed-counts.ts --head-dir <dir>`
+# reads them; the shard and serial runners each write their own.
+if [ "$DRY_RUN" = "0" ] && [ -z "${GBRAIN_TEST_RECEIPT_DIR:-}" ] && [ "$LOG_DIR" = ".context/test-shards" ]; then
+  rm -rf .context/test-receipts
+  GBRAIN_TEST_RECEIPT_DIR=.context/test-receipts
+fi
+receipts_init unit || exit 2
 
 # ──────────────────────────────────────────────────────────────────────────
 # Resolve `timeout` command. macOS without coreutils has neither; we degrade
@@ -229,22 +237,83 @@ fi
 # so $? is recoverable per-shard (we never trust `wait`'s aggregate value).
 # ──────────────────────────────────────────────────────────────────────────
 SHARD_PIDS=()
+HB_PID=""
+CLEANUP_STARTED=0
+
+# An operator interrupt must stop the work, not only this wrapper. The shard
+# subshells are async children of a non-interactive bash, so they (and their
+# gtimeout/bun descendants) inherit SIGINT ignored: without a trap, bash exits
+# while gtimeout/bun stay alive under launchd and can retain gigabytes until
+# the shard cap fires. Only armed while the shards are live (disarmed on the
+# normal path once they are reaped). TERM gives cooperative children a moment
+# to exit, then KILL guarantees a TERM-resistant test cannot outlive the
+# cancelled suite.
+cleanup_children() {
+  local exit_code="${1:-0}"
+  [ "$CLEANUP_STARTED" = "1" ] && return
+  CLEANUP_STARTED=1
+
+  if [ -n "$HB_PID" ]; then
+    pkill -P "$HB_PID" 2>/dev/null || true
+    kill "$HB_PID" 2>/dev/null || true
+  fi
+
+  local pid descendants=""
+  collect_descendants() {
+    local parent="$1" child
+    for child in $(pgrep -P "$parent" 2>/dev/null); do
+      collect_descendants "$child"
+      printf '%s\n' "$child"
+    done
+  }
+
+  # Snapshot descendants BEFORE the subshell is TERMed: once it dies its
+  # gtimeout/bun children reparent to launchd and pgrep -P can't find them.
+  # The subshells are not process-group leaders here, so signal by PID.
+  for pid in ${SHARD_PIDS[@]+"${SHARD_PIDS[@]}"}; do
+    descendants="$descendants $(collect_descendants "$pid")"
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $descendants; do kill -TERM "$pid" 2>/dev/null || true; done
+  [ "${#SHARD_PIDS[@]}" -gt 0 ] && sleep 1
+  for pid in $descendants; do kill -KILL "$pid" 2>/dev/null || true; done
+  for pid in ${SHARD_PIDS[@]+"${SHARD_PIDS[@]}"}; do
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  [ -n "$HB_PID" ] && wait "$HB_PID" 2>/dev/null || true
+
+  return "$exit_code"
+}
+
+handle_interrupt() {
+  local exit_code="$1"
+  trap - INT TERM EXIT
+  cleanup_children "$exit_code" || true
+  exit "$exit_code"
+}
+
+trap 'handle_interrupt 130' INT
+trap 'handle_interrupt 143' TERM
+trap 'cleanup_children $?' EXIT
+
 for i in $(seq 1 "$N"); do
   (
     SHARD_LOG="$LOG_DIR/shard-$i.log"
     date +%s > "$LOG_DIR/shard-$i.start"
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" --signal=TERM --kill-after="${SHARD_KILL_AFTER}s" "${SHARD_TIMEOUT}s" \
-        env SHARD="$i/$N" \
+        env SHARD="$i/$N" GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1
       rc=$?
     else
-      env SHARD="$i/$N" \
+      env SHARD="$i/$N" GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1 &
       pid=$!
-      ( sleep "$SHARD_TIMEOUT" && kill -TERM "$pid" 2>/dev/null && \
+      ( sleep "$SHARD_TIMEOUT" && touch "$LOG_DIR/shard-$i.watchdog" && \
+        kill -TERM "$pid" 2>/dev/null && \
         sleep "$SHARD_KILL_AFTER" && kill -KILL "$pid" 2>/dev/null ) &
       cap_pid=$!
       wait "$pid" 2>/dev/null
@@ -265,6 +334,12 @@ for i in $(seq 1 "$N"); do
     date +%s > "$LOG_DIR/shard-$i.end"
     echo "$rc" > "$LOG_DIR/shard-$i.exit"
     { [ "$rc" = "124" ] || [ "$rc" = "137" ]; } && echo "WEDGED" > "$LOG_DIR/shard-$i.wedged"
+    # No-timeout-binary fallback: its watchdog TERMs the shard (rc 143), which
+    # the 124/137 line above can't see — the sentinel dropped right before the
+    # TERM marks the wedge, so the EXIT-HANG/WEDGED classifier is reachable on
+    # machines without coreutils timeout instead of a bare rc=143 hard-fail.
+    [ -f "$LOG_DIR/shard-$i.watchdog" ] && { [ "$rc" = "143" ] || [ "$rc" = "137" ]; } \
+      && echo "WEDGED" > "$LOG_DIR/shard-$i.wedged"
   ) &
   SHARD_PIDS+=($!)
 done
@@ -284,18 +359,42 @@ grep_count() {
   echo "${n:-0}"
 }
 
+# strip_ansi: emit FILE with SGR color sequences removed.
+#
+# Every parser below reads a log that `bun test` wrote to a pipe with color
+# still enabled, so its lines carry SGR escapes:
+#     ESC[0mESC[32m 5385 passESC[0m
+#     ESC[0mESC[31m✗ESC[0m ESC[0msome test name
+# Parsing those raw makes awk's $1 the escape blob rather than the count or the
+# marker — which silently produced `pass=0 fail=0` on shards that had thousands
+# of passes, and stopped every `✗`/`(fail)` pattern below from ever matching.
+# The ESC is built with printf rather than written as `\x1b`, because BSD sed
+# (macOS) does not understand `\x` escapes.
+strip_ansi() {
+  local esc
+  esc=$(printf '\033')
+  sed "s/${esc}\[[0-9;]*[a-zA-Z]//g" "$1"
+}
+
 # bun_summary_count: parses Bun's summary lines (one per `bun test` invocation
-# inside a shard — there's only one when we pass an explicit file list).
+# inside a shard). Grouped unit shards emit an authoritative aggregate so child
+# Bun invocations inside tests cannot inflate the reported totals.
 # Looks for ` N pass` / ` N fail` / ` N skip` patterns and sums them across
 # all summary blocks the shard emitted. `bun test` prints these near the end
 # of its output. Format: leading whitespace + integer + space + label.
 bun_summary_count() {
   local label="$1"; local file="$2"
   if [ ! -f "$file" ]; then echo 0; return; fi
-  awk -v label="$label" '
+  strip_ansi "$file" | awk -v label="$label" '
+    /^__gbrain_unit_shard__ / {
+      for (i = 2; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == label) { aggregate = pair[2]; have_aggregate = 1 }
+      }
+    }
     $1 ~ /^[0-9]+$/ && $2 == label { total += $1 }
-    END { print total + 0 }
-  ' "$file"
+    END { print have_aggregate ? aggregate + 0 : total + 0 }
+  '
 }
 
 # shard_total_files: parse the "[unit-shard N/M] running X files" line that
@@ -353,13 +452,20 @@ heartbeat() {
     local hb_elapsed=$((now - hb_start))
     for i in $(seq 1 "$N"); do
       if [ -f "$LOG_DIR/shard-$i.exit" ]; then
-        local rc; rc=$(cat "$LOG_DIR/shard-$i.exit" 2>/dev/null || echo "?")
+        # Finished shards never change: compute the summary once at first
+        # sight of .exit and cache it — re-running strip_ansi+awk over a
+        # multi-MB log twice per shard on every 10s tick was hundreds of
+        # full-file passes per run.
+        local rc p f
+        if [ ! -f "$LOG_DIR/shard-$i.hbsum" ]; then
+          rc=$(cat "$LOG_DIR/shard-$i.exit" 2>/dev/null || echo "?")
+          p=$(bun_summary_count "pass" "$LOG_DIR/shard-$i.log")
+          f=$(bun_summary_count "fail" "$LOG_DIR/shard-$i.log")
+          echo "$rc $p $f" > "$LOG_DIR/shard-$i.hbsum"
+        fi
+        read -r rc p f < "$LOG_DIR/shard-$i.hbsum"
         local status="✓"
         [ "$rc" != "0" ] && status="✗"
-        local f
-        f=$(bun_summary_count "fail" "$LOG_DIR/shard-$i.log")
-        local p
-        p=$(bun_summary_count "pass" "$LOG_DIR/shard-$i.log")
         line="$line [s$i: done $status ${p}p ${f}f]"
       else
         local lf="$LOG_DIR/shard-$i.log"
@@ -407,20 +513,24 @@ HB_PID=$!
 # process cleanup" at end-of-job reports them as (unnamed) test failures.
 # Seen on the garrytan/port-pr-1406 PR, 2 CI runs in a row, 6 orphans
 # matching the 6 invocations in test/scripts/run-unit-parallel.test.ts.
-trap 'pkill -P "$HB_PID" 2>/dev/null; kill "$HB_PID" 2>/dev/null; wait "$HB_PID" 2>/dev/null' EXIT
-
 # Wait for every shard. Don't care about wait's exit code.
 for pid in "${SHARD_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
 
 pkill -P "$HB_PID" 2>/dev/null
 kill "$HB_PID" 2>/dev/null
 wait "$HB_PID" 2>/dev/null
-trap - EXIT
+# Every shard is reaped: disarm the interrupt handlers too, so a later
+# Ctrl-C during the foreground serial/rescue phases can't run
+# cleanup_children against SHARD_PIDS that may have been reused.
+trap - INT TERM EXIT
 
 # ──────────────────────────────────────────────────────────────────────────
 # Aggregate failures (single writer; serial; never concurrent).
-# Bun failure block format: from `(fail) ...` line through next `(pass)`,
-# `(skip)`, blank line, or `__bun_test_summary__` marker.
+# Bun failure block format: from the failure marker line through the next pass
+# marker, `(skip)`, blank line, or `__bun_test_summary__`. Bun 1.3 emits `✗ ` /
+# `✓ `; older releases emitted `(fail) ` / `(pass) `. Both are matched, and every
+# parse runs on ANSI-stripped text — the markers are color-wrapped on the wire,
+# so raw patterns silently matched nothing.
 # ──────────────────────────────────────────────────────────────────────────
 TOTAL_FAILURES=0
 TOTAL_PASS=0
@@ -432,6 +542,31 @@ TOTAL_RC=0
 # NON_OOM_FAIL records that at least one failure exists that the rescue lane
 # must NOT absolve (plain assertion failures, wedges without the signature).
 OOM_RE='Out of memory|WebAssembly\.Memory|RuntimeError: [Aa]borted|Aborted\(\)'
+
+# oom_signature_in_log: true when FILE carries a genuine WASM OOM signature.
+#
+# Not a bare `grep -qE "$OOM_RE"`. The signature is ordinary text, so any test
+# that merely PRINTS it trips the detector — and one does: the rescue lane's own
+# meta-test (test/scripts/run-unit-parallel.test.ts) writes fixtures containing
+# `Original error: Out of memory` and asserts on the nested runner's output. When
+# that assertion fails, Bun prints the captured payload as an `Expected:` /
+# `Received:` diff, the fixture text lands in the PARENT shard log, and the
+# parent concludes a real OOM occurred — re-running every file in the shard
+# serially. Observed 2026-08-11: a full 372-file serial rescue kicked off on a
+# machine with 19 GB free, triggered by the test that exists to verify rescue.
+#
+# Assertion payloads are therefore excluded. A real OOM aborts the file and the
+# signature appears as runtime output on its own line; it never shows up ONLY
+# inside a quoted expect() diff. Keeps the safety net armed for real OOMs while
+# refusing to be fooled by a string a test happened to print.
+oom_signature_in_log() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  strip_ansi "$file" \
+    | grep -vE '^[[:space:]]*(Expected|Received):' \
+    | grep -qE "$OOM_RE"
+}
+
 OOM_RESCUE_LIST="$LOG_DIR/oom-rescue-files.txt"
 : > "$OOM_RESCUE_LIST"
 NON_OOM_FAIL=0
@@ -449,15 +584,37 @@ EXTERNAL_KILL_ANY=0
 failing_files_in_log() {
   local file="$1"
   [ -f "$file" ] || return 0
-  awk '
+  strip_ansi "$file" | awk '
     /^(::group::)?[^ ].*\.test\.ts:$/ {
       current = $0
       sub(/^::group::/, "", current)
       current = substr(current, 1, length(current) - 1)
       next
     }
-    /^\(fail\) / && current != "" { print current }
-  ' "$file" | sort -u
+    /^(\(fail\) |✗ )/ && current != "" { print current }
+  ' | sort -u
+}
+
+# shard_assigned_list: the deterministic per-shard file list, computed once
+# per shard and cached — shard_unstarted_files and the rescue-queue appends
+# used to re-walk `find test` via --dry-run-list up to 3x per wedged shard.
+shard_assigned_list() {
+  local shard_idx="$1" cache="$LOG_DIR/shard-$shard_idx.assigned"
+  if [ ! -f "$cache" ]; then
+    # Cache ONLY on success (tmp + mv): a failed/truncated first attempt —
+    # most likely under the exact fork-pressure conditions this path runs in —
+    # must not be served to the rescue queue as a partial file list.
+    if SHARD="$shard_idx/$N" bash scripts/run-unit-shard.sh --dry-run-list 2>/dev/null > "$cache.tmp"; then
+      mv "$cache.tmp" "$cache"
+    else
+      rm -f "$cache.tmp"
+      # Loud, not silent: an underivable list means a rescue-queue append got
+      # NOTHING while the summary says the shard was queued.
+      echo "⚠️  shard $shard_idx/$N: assigned-file list underivable — rescue queue may be incomplete" >&2
+      return 0
+    fi
+  fi
+  cat "$cache"
 }
 
 # shard_unstarted_files: completion evidence for the EXIT-HANG classifier.
@@ -471,7 +628,7 @@ failing_files_in_log() {
 shard_unstarted_files() {
   local shard_idx="$1" log="$2"
   local assigned
-  assigned=$(SHARD="$shard_idx/$N" bash scripts/run-unit-shard.sh --dry-run-list 2>/dev/null)
+  assigned=$(shard_assigned_list "$shard_idx")
   if [ -z "$assigned" ]; then
     echo "(assigned-file-list-underivable)"
     return
@@ -505,7 +662,7 @@ for i in $(seq 1 "$N"); do
 
   shard_oom=0
   if [ "$rc" != "0" ] && [ "${GBRAIN_TEST_NO_OOM_FALLBACK:-0}" != "1" ] \
-     && [ -f "$SHARD_LOG" ] && grep -qE "$OOM_RE" "$SHARD_LOG"; then
+     && [ -f "$SHARD_LOG" ] && oom_signature_in_log "$SHARD_LOG"; then
     shard_oom=1
   fi
 
@@ -554,7 +711,11 @@ for i in $(seq 1 "$N"); do
     # Warn-pass gate: rescue-eligible kills (OOM signature / external kill)
     # are excluded so they reach the serial rescue queue below instead of
     # being absolved without a re-run.
-    if [ "$fail_count" = "0" ] && [ "$inline_fails" = "0" ] && [ "$idle_secs" -ge 300 ] \
+    grouped_incomplete=0
+    if grep -q '^__gbrain_unit_group_start__ ' "$SHARD_LOG" && ! grep -q '^__gbrain_unit_shard__ .* rc=0$' "$SHARD_LOG"; then
+      grouped_incomplete=1
+    fi
+    if [ "$grouped_incomplete" = "0" ] && [ "$fail_count" = "0" ] && [ "$inline_fails" = "0" ] && [ "$idle_secs" -ge 300 ] \
        && [ "$shard_oom" = "0" ] && [ "$shard_external_kill" = "0" ]; then
       # Completion evidence (fail-closed): warn-pass additionally requires
       # every assigned file to have STARTED (its file-header appears in the
@@ -580,12 +741,12 @@ for i in $(seq 1 "$N"); do
     fi
     TOTAL_RC=1
     if [ "$shard_external_kill" = "1" ]; then
-      SHARD="$i/$N" bash scripts/run-unit-shard.sh --dry-run-list 2>/dev/null >> "$OOM_RESCUE_LIST"
+      shard_assigned_list "$i" >> "$OOM_RESCUE_LIST"
       echo "shard $i/$N: KILLED externally after ${s_elapsed}s (rc=$rc, well before ${SHARD_TIMEOUT}s cap — queued for serial rescue)" >> "$SUMMARY_FILE"
     elif [ "$shard_oom" = "1" ]; then
       # Wedged UNDER memory pressure: we can't attribute failures, so queue
       # the shard's entire file list for the serial rescue pass.
-      SHARD="$i/$N" bash scripts/run-unit-shard.sh --dry-run-list 2>/dev/null >> "$OOM_RESCUE_LIST"
+      shard_assigned_list "$i" >> "$OOM_RESCUE_LIST"
       echo "shard $i/$N: WEDGED after ${SHARD_TIMEOUT}s (rc=$rc, OOM signature — queued for serial rescue)" >> "$SUMMARY_FILE"
     else
       NON_OOM_FAIL=1
@@ -608,10 +769,10 @@ for i in $(seq 1 "$N"); do
       else
         # OOM signature but no attributable files (e.g. bun died before any
         # file header) → rescue the whole shard.
-        SHARD="$i/$N" bash scripts/run-unit-shard.sh --dry-run-list 2>/dev/null >> "$OOM_RESCUE_LIST"
+        shard_assigned_list "$i" >> "$OOM_RESCUE_LIST"
       fi
     elif [ "$shard_external_kill" = "1" ]; then
-      SHARD="$i/$N" bash scripts/run-unit-shard.sh --dry-run-list 2>/dev/null >> "$OOM_RESCUE_LIST"
+      shard_assigned_list "$i" >> "$OOM_RESCUE_LIST"
       echo "shard $i/$N: KILLED externally after ${s_elapsed}s (rc=$rc — queued for serial rescue)" >> "$SUMMARY_FILE"
     else
       NON_OOM_FAIL=1
@@ -623,15 +784,16 @@ for i in $(seq 1 "$N"); do
   if [ "$rc" != "0" ]; then
     TOTAL_RC=1
     if [ "$fail_count" -gt 0 ] && [ -f "$SHARD_LOG" ]; then
-      # Extract each (fail) block: from `(fail)` line through next `(pass)`,
-      # `(skip)`, blank line, or `__bun_test_summary__`. Single awk pass.
-      awk -v shard="$i" '
-        /^\(fail\) / { in_block=1; print "--- shard " shard ": " $0; next }
+      # Extract each failure block: from the `✗ ` / `(fail) ` line through the
+      # next pass/skip marker, blank line, or `__bun_test_summary__`. Single awk
+      # pass over ANSI-stripped text.
+      strip_ansi "$SHARD_LOG" | awk -v shard="$i" '
+        /^(\(fail\) |✗ )/ { in_block=1; print "--- shard " shard ": " $0; next }
         in_block {
-          if (/^\(pass\)/ || /^\(skip\)/ || /^[[:space:]]*$/ || /__bun_test_summary__/) { in_block=0; print ""; next }
+          if (/^(\(pass\)|\(skip\)|✓ |✓$)/ || /^[[:space:]]*$/ || /__bun_test_summary__/) { in_block=0; print ""; next }
           print $0
         }
-      ' "$SHARD_LOG" >> "$FAILURES_LOG"
+      ' >> "$FAILURES_LOG"
     elif [ -f "$SHARD_LOG" ]; then
       # Non-zero rc but no (fail) line found — extraction couldn't pinpoint.
       # Dump the full shard log so we never silently lose the failure cause.
@@ -667,7 +829,7 @@ SERIAL_FILES_COUNT=0
 SERIAL_FILES_COUNT=$(find test -name '*.serial.test.ts' -not -path 'test/e2e/*' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$SERIAL_FILES_COUNT" -gt 0 ]; then
   echo "════════════ serial pass ($SERIAL_FILES_COUNT files) ════════════"
-  bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
+  GBRAIN_TEST_RECEIPT_DIR="$TEST_RECEIPT_DIR" bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
   SERIAL_RC=$?
   cat "$LOG_DIR/serial.log"
   if [ "$SERIAL_RC" != "0" ]; then
@@ -686,13 +848,13 @@ if [ "$SERIAL_FILES_COUNT" -gt 0 ]; then
     s_fail=$(bun_summary_count "fail" "$LOG_DIR/serial.log")
     TOTAL_FAILURES=$((TOTAL_FAILURES + s_fail))
     if [ "$s_fail" -gt 0 ]; then
-      awk '
-        /^\(fail\) / { in_block=1; print "--- shard serial: " $0; next }
+      strip_ansi "$LOG_DIR/serial.log" | awk '
+        /^(\(fail\) |✗ )/ { in_block=1; print "--- shard serial: " $0; next }
         in_block {
-          if (/^\(pass\)/ || /^\(skip\)/ || /^[[:space:]]*$/ || /__bun_test_summary__/) { in_block=0; print ""; next }
+          if (/^(\(pass\)|\(skip\)|✓ |✓$)/ || /^[[:space:]]*$/ || /__bun_test_summary__/) { in_block=0; print ""; next }
           print $0
         }
-      ' "$LOG_DIR/serial.log" >> "$FAILURES_LOG"
+      ' >> "$FAILURES_LOG"
     else
       {
         echo "--- shard serial: rc=$SERIAL_RC, no (fail) markers — full log follows ---"
@@ -742,23 +904,33 @@ if [ "$TOTAL_RC" != "0" ] && [ "${RESCUE_COUNT:-0}" -gt 0 ]; then
   grep '\.serial\.test\.ts$' "$OOM_RESCUE_LIST" > "$LOG_DIR/oom-rescue-serial.txt" || true
   RESCUE_RC=0
   : > "$RESCUE_LOG"
-  run_rescue() { # $1 = per-invocation timeout seconds; rest = test-file args
-    local t="$1"; shift
+  # Each rescue invocation writes its own receipt (kind=rescue), which
+  # supersedes the killed or failed attempt for the files it re-ran.
+  run_rescue() { # $1 = per-invocation timeout seconds; $2 = receipt lane; $3 = receipt tag; rest = test-file args
+    local t="$1" lane="$2" tag="$3" rc=0 primary_lane="$TEST_RECEIPT_LANE"
+    shift 3
+    TEST_RECEIPT_LANE="$lane"
+    receipt_begin rescue "$tag" "" "" "" "$@"
+    TEST_RECEIPT_LANE="$primary_lane"
     if [ -n "$TIMEOUT_BIN" ]; then
       "$TIMEOUT_BIN" --signal=TERM --kill-after="${SHARD_KILL_AFTER}s" "${t}s" \
-        bun test --max-concurrency 1 --timeout=60000 "$@" >> "$RESCUE_LOG" 2>&1
+        bun test --max-concurrency 1 --timeout=60000 ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$@" >> "$RESCUE_LOG" 2>&1 || rc=$?
     else
-      bun test --max-concurrency 1 --timeout=60000 "$@" >> "$RESCUE_LOG" 2>&1
+      bun test --max-concurrency 1 --timeout=60000 ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "$@" >> "$RESCUE_LOG" 2>&1 || rc=$?
     fi
+    receipt_end "$rc"
+    return "$rc"
   }
   if [ -s "$LOG_DIR/oom-rescue-batch.txt" ]; then
     # shellcheck disable=SC2046
-    run_rescue "$RESCUE_TIMEOUT" $(cat "$LOG_DIR/oom-rescue-batch.txt") || RESCUE_RC=1
+    run_rescue "$RESCUE_TIMEOUT" unit batch $(cat "$LOG_DIR/oom-rescue-batch.txt") || RESCUE_RC=1
   fi
   if [ -s "$LOG_DIR/oom-rescue-serial.txt" ]; then
+    rescue_idx=0
     while IFS= read -r serial_file; do
       [ -n "$serial_file" ] || continue
-      run_rescue 300 "$serial_file" || RESCUE_RC=1
+      rescue_idx=$((rescue_idx + 1))
+      run_rescue 300 serial "file$rescue_idx" "$serial_file" || RESCUE_RC=1
     done < "$LOG_DIR/oom-rescue-serial.txt"
   fi
   cat "$RESCUE_LOG"
@@ -783,13 +955,13 @@ if [ "$TOTAL_RC" != "0" ] && [ "${RESCUE_COUNT:-0}" -gt 0 ]; then
   else
     # Real failures confirmed serially (or a non-OOM failure exists anyway).
     OOM_RESCUE_NOTE=" | oom_rescue_failed=${r_fail}real"
-    awk '
-      /^\(fail\) / { in_block=1; print "--- oom-rescue (serial, confirmed real): " $0; next }
+    strip_ansi "$RESCUE_LOG" | awk '
+      /^(\(fail\) |✗ )/ { in_block=1; print "--- oom-rescue (serial, confirmed real): " $0; next }
       in_block {
-        if (/^\(pass\)/ || /^\(skip\)/ || /^[[:space:]]*$/ || /__bun_test_summary__/) { in_block=0; print ""; next }
+        if (/^(\(pass\)|\(skip\)|✓ |✓$)/ || /^[[:space:]]*$/ || /__bun_test_summary__/) { in_block=0; print ""; next }
         print $0
       }
-    ' "$RESCUE_LOG" >> "$FAILURES_LOG"
+    ' >> "$FAILURES_LOG"
     echo "oom-rescue: $RESCUE_COUNT files pass=$r_pass fail=$r_fail rc=$RESCUE_RC (real failures confirmed)" >> "$SUMMARY_FILE"
   fi
 fi

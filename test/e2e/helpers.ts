@@ -1,8 +1,8 @@
 /**
- * E2E test helpers: DB lifecycle, fixture import, timing, and diagnostics.
+ * E2E test helpers: DB lifecycle, fixture import, and diagnostics.
  *
  * Usage in test files:
- *   import { setupDB, teardownDB, importFixtures, time } from './helpers.ts';
+ *   import { setupDB, teardownDB, importFixtures } from './helpers.ts';
  *   beforeAll(async () => { await setupDB(); await importFixtures(); });
  *   afterAll(async () => { await teardownDB(); });
  */
@@ -13,10 +13,17 @@ import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import * as db from '../../src/core/db.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
 import { parseMarkdown } from '../../src/core/markdown.ts';
+import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
+import { TRUST_BACKFILL_COMPLETED_KEY } from '../../src/core/trust/schema.ts';
+import { WRITE_GATE_SCAN_BASELINE_KEY } from '../../src/core/write-gate-schema.ts';
+import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { runSchemaTransition } from '../../src/core/embedding-migration.ts';
+import { buildDeferredAnnIndexes } from '../../src/core/embedding-ann-build.ts';
+import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
 
-// Load .env.testing if present
+// Local opt-in configuration; container CI must not import developer credentials.
 const envPath = resolve(import.meta.dir, '../../.env.testing');
-if (existsSync(envPath)) {
+if (process.env.GBRAIN_CI_DISABLE_TEST_ENV_FILE !== '1' && existsSync(envPath)) {
   const lines = readFileSync(envPath, 'utf-8').split('\n');
   for (const line of lines) {
     const trimmed = line.trim();
@@ -35,6 +42,13 @@ const FIXTURES_DIR = resolve(import.meta.dir, 'fixtures');
 let engine: PostgresEngine | null = null;
 
 const ALL_TABLES = [
+  // Fork authority and proposal fixtures must not retain sources across runs.
+  'page_write_proposals',
+  'oauth_clients',
+  // C4 pinned questions: no FKs (pointers only); cleared so pins never leak across files.
+  'question_evidence',
+  'pinned_questions',
+  'fact_withdrawals',
   // v0.31: facts must come BEFORE pages too (FK to sources, but tests
   // seed via direct SQL so the row stays referenced until truncated).
   'facts',
@@ -53,10 +67,13 @@ const ALL_TABLES = [
   // join), but stale rows poison stats/count assertions across runs.
   'context_volunteer_events',
   'pages',       // last because of foreign keys
-  'config',
   'minion_attachments',
   'minion_inbox',
   'minion_jobs',
+  // A fresh-database `gbrain init` commits a protocol-2 shared-skill request;
+  // the request guard refuses to delete it (cascading from a source delete)
+  // in any later protocol-1 session. TRUNCATE fires no row guard.
+  'persistence_requests',
 ];
 
 /**
@@ -67,44 +84,18 @@ export function hasDatabase(): boolean {
 }
 
 /**
- * Production guard: setupDB() TRUNCATEs every data table on whatever
- * DATABASE_URL points at, and run-e2e.sh deliberately preserves an exported
- * DATABASE_URL — so a developer with a production URL in their environment
- * would wipe their real brain by running the suite. Refuse unless the
- * database name identifies itself as a test database ("test" as a word
- * segment, e.g. gbrain_test — the CI/.env.testing.example convention), or
- * the operator explicitly opts the exact name in via GBRAIN_E2E_ALLOW_DB.
- *
- * Exported for unit testing; pure — no connection is made.
+ * Production guard, moved to test/helpers/db-guard.ts so test files outside
+ * test/e2e/ can import it without loading this module. Re-exported here for
+ * existing call sites (setupDB below, test/e2e/db-guard.test.ts).
  */
-export function assertSafeE2eDatabaseUrl(
-  url: string,
-  env: Record<string, string | undefined> = process.env,
-): void {
-  let dbName: string;
-  try {
-    dbName = decodeURIComponent(new URL(url).pathname.replace(/^\//, ''));
-  } catch {
-    throw new Error(`E2E guard: DATABASE_URL is not a parseable URL; refusing to run destructive setup.`);
-  }
-  if (!dbName) {
-    throw new Error(`E2E guard: DATABASE_URL has no database name; refusing to run destructive setup.`);
-  }
-  if (/(^|[_-])test([_-]|$)/i.test(dbName)) return;
-  if (env.GBRAIN_E2E_ALLOW_DB && env.GBRAIN_E2E_ALLOW_DB === dbName) return;
-  throw new Error(
-    `E2E guard: database "${dbName}" does not look like a test database ` +
-    `(expected "test" as a name segment, e.g. gbrain_test). setupDB() would ` +
-    `TRUNCATE every data table in it. If this is intentional, set ` +
-    `GBRAIN_E2E_ALLOW_DB=${dbName} to opt in explicitly.`,
-  );
-}
+export { assertSafeE2eDatabaseUrl };
 
 /**
- * Connect to DB, run schema init, truncate all tables.
+ * Connect to DB and clear fixture data while retaining the migration ledger.
+ * Explicit migration fixtures can opt into replaying the cold migration chain.
  * Call in beforeAll() of each test file.
  */
-export async function setupDB(): Promise<PostgresEngine> {
+export async function setupDB(options: { replayMigrations?: boolean } = {}): Promise<PostgresEngine> {
   if (!DATABASE_URL) {
     throw new Error('DATABASE_URL not set. Copy .env.testing.example to .env.testing and configure it.');
   }
@@ -121,6 +112,9 @@ export async function setupDB(): Promise<PostgresEngine> {
   // Some tables (e.g. v0.28 takes/synthesis_evidence) only exist after
   // migrations run via engine.connect() below, so skip non-existent tables.
   const conn = db.getConnection();
+  const embeddingIdentity = await conn.unsafe<Array<{ key: string; value: string }>>(
+    `SELECT key, value FROM config WHERE key IN ('embedding_model', 'embedding_dimensions')`,
+  );
   for (const table of ALL_TABLES) {
     try {
       await conn.unsafe(`TRUNCATE ${table} CASCADE`);
@@ -130,11 +124,50 @@ export async function setupDB(): Promise<PostgresEngine> {
     }
   }
 
+  // A warm reset keeps what the migrations seeded on the empty brain: the version and the trust bookkeeping
+  // (v226 backfill completion, v227 scan baseline), both still true of the emptied tables.
+  if (options.replayMigrations) await conn.unsafe('TRUNCATE config');
+  else await conn.unsafe('DELETE FROM config WHERE key <> ALL($1::text[])', [['version', 'schema.upstream_version', TRUST_BACKFILL_COMPLETED_KEY, WRITE_GATE_SCAN_BASELINE_KEY]]);
+
   // Re-seed config (initSchema inserts default config rows)
   await conn.unsafe(`
     INSERT INTO config (key, value) VALUES ('schema_version', '1')
     ON CONFLICT (key) DO NOTHING
   `);
+  for (const row of embeddingIdentity) {
+    await conn.unsafe('INSERT INTO config (key, value) VALUES ($1, $2)', [row.key, row.value]);
+  }
+
+  // Reset leaked brain identity: `sources` is not in ALL_TABLES (the default
+  // row must survive), but rows/columns written by earlier files or runs
+  // persist. writeSyncAnchor's ownership guard (#3735) keys on
+  // sources.default.local_path — a stale value from another test makes every
+  // legacy-path performSync classify as first_sync forever. 42P01-tolerant
+  // like the TRUNCATE loop above.
+  try {
+    // A file that activated managed persistence and exited without
+    // deactivating leaves the writer guard armed, and its sources trigger
+    // rejects the reset below (writer_coordinator_required). A fresh-database
+    // `gbrain init` also raises the writer protocol floor to 2 with shared
+    // skill bundles on, after which every protocol-1 request is refused
+    // (writer_upgrade_required). Restore the schema defaults (disabled, floor
+    // 1, bundles off) first. The floor trigger forbids lowering it by UPDATE,
+    // so the singleton row is replaced with its other columns kept.
+    await conn.unsafe(`WITH old AS (DELETE FROM persistence_brain WHERE singleton = 1 RETURNING *)
+      INSERT INTO persistence_brain SELECT (jsonb_populate_record(NULL::persistence_brain, to_jsonb(old)
+        || '{"enabled": false, "activated_at": null, "writer_protocol_floor": 1, "skill_bundles_enabled": false}'::jsonb)).* FROM old`);
+    await conn.unsafe(`DELETE FROM sources WHERE id <> 'default'`);
+    // Only the sync-identity columns: local_path feeds writeSyncAnchor's
+    // ownership guard (#3735) and last_commit/last_sync_at feed first_sync
+    // classification. chunker_version is deliberately left alone — NULLing
+    // it flips extraction-staleness semantics for unrelated suites.
+    await conn.unsafe(
+      `UPDATE sources SET local_path = NULL, last_commit = NULL, last_sync_at = NULL WHERE id = 'default'`,
+    );
+  } catch (e: unknown) {
+    const code = (e as { code?: string })?.code;
+    if (code !== '42P01' && code !== '42703') throw e; // missing table/column on older schemas
+  }
 
   engine = new PostgresEngine();
   await engine.connect({ database_url: DATABASE_URL });
@@ -144,6 +177,46 @@ export async function setupDB(): Promise<PostgresEngine> {
   // Idempotent: re-running migrations on an already-migrated DB is a no-op.
   await engine.initSchema();
   return engine;
+}
+
+/**
+ * Opt-in setup for fixtures that seed legacy-width text vectors. Bare CLI
+ * init tests can create the shared database at the new-install width; row
+ * truncation alone cannot make those columns fit a later 1536-d fixture.
+ * Ordinary setupDB preserves custom shapes for schema/migration tests.
+ */
+export async function setupLegacyEmbeddingDB(): Promise<PostgresEngine> {
+  configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} });
+  const target = await setupDB();
+  const dims = LEGACY_EMBEDDING_CONFIG.embedding_dimensions;
+  const columns = await target.executeRaw<{ table_name: string; type_name: string; dims: number }>(`
+    SELECT c.relname AS table_name, t.typname AS type_name, a.atttypmod AS dims
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_type t ON t.oid = a.atttypid
+     WHERE n.nspname = 'public'
+       AND c.relname IN ('content_chunks', 'query_cache', 'facts', 'takes')
+       AND a.attname = 'embedding' AND a.attnum > 0 AND NOT a.attisdropped`);
+  if (columns.length !== 4 || columns.some(column => !['vector', 'halfvec'].includes(column.type_name))) {
+    throw new Error('Legacy embedding fixture requires all four text embedding columns');
+  }
+  if (columns.some(column => column.table_name !== 'takes' && Number(column.dims) !== dims)) {
+    // #5088: the transition defers HNSW builds to the migration's build phase; the fixture builds them now.
+    let pending = await runSchemaTransition(target, dims);
+    await buildDeferredAnnIndexes(target, { targetDims: dims, readPending: async () => pending, writePending: async next => { pending = next; }, log: () => {} });
+  }
+  const takes = columns.find(column => column.table_name === 'takes')!;
+  if (Number(takes.dims) !== dims) {
+    // Production transition deliberately leaves takes alone (search is
+    // trigram-based). This empty test table also receives fixed-width seeds.
+    await target.executeRaw(`ALTER TABLE takes ALTER COLUMN embedding TYPE ${takes.type_name}(${dims}) USING NULL`);
+  }
+  await target.transaction(async tx => {
+    await tx.setConfig('embedding_model', LEGACY_EMBEDDING_CONFIG.embedding_model);
+    await tx.setConfig('embedding_dimensions', String(dims));
+  });
+  return target;
 }
 
 /**
@@ -174,10 +247,10 @@ export function getConn() {
 
 /**
  * Import all fixture files from test/e2e/fixtures/ into the brain.
+ * An explicit engine lets a fixture own its database without shared resets.
  * Returns the list of import results.
  */
-export async function importFixtures() {
-  const e = getEngine();
+export async function importFixtures(e: PostgresEngine = getEngine()) {
   const results: Array<{ slug: string; status: string; chunks: number }> = [];
 
   const files = findMarkdownFiles(FIXTURES_DIR);
@@ -218,16 +291,6 @@ function findMarkdownFiles(dir: string): string[] {
     }
   }
   return results.sort();
-}
-
-/**
- * Time a function and return [result, durationMs].
- */
-export async function time<T>(fn: () => Promise<T>): Promise<[T, number]> {
-  const start = performance.now();
-  const result = await fn();
-  const dur = performance.now() - start;
-  return [result, dur];
 }
 
 /**

@@ -49,9 +49,11 @@ upstream: conversation-history+transcript-save@fc834ee
 
 Two halves of one loop:
 
-1. **IMPORT** — raw export or session log → one dated markdown page per
-   conversation under `conversations/` → `gbrain import`/`gbrain sync` →
-   parser validation → fact extraction → gap check.
+1. **IMPORT** — raw export or session log → dated markdown pages under
+   `conversations/` (the native importer writes them directly and splits
+   long sessions into parts; the manual path converts one page per
+   conversation, then `gbrain import`/`gbrain sync`) → parser validation →
+   fact extraction → gap check.
 2. **RETRIEVE** — search the archive, pull threads, build timelines, and
    answer "when did I first discuss X".
 
@@ -59,11 +61,43 @@ Years of AI-assistant history is one of the largest personal corpora most
 users own. This skill makes it first-class brain content instead of a JSON
 blob in a downloads folder.
 
-**No native raw-export importer exists.** `gbrain import <dir>` ingests
-markdown directories; nothing in the CLI parses a provider's raw
-`conversations.json` directly. The conversion step below is agent work.
-(A native `gbrain import --format chatgpt|claude` is a filed follow-up; until
-it lands, this procedure is the supported path.)
+**A native importer now exists: `gbrain transcripts ingest`.** It parses
+agent session logs (Claude Code, Codex, OpenClaw, Hermes, Grok Build) AND
+extracted consumer exports (ChatGPT `conversations.json`, Claude.ai export)
+directly: detection, secret redaction, imessage-slack rendering,
+long-session splitting, and idempotent re-runs are all native. Prefer it
+over the manual procedure whenever the source is one of those seven
+formats:
+
+```
+gbrain transcripts ingest ~/Downloads/conversations.json   # unzip first
+gbrain transcripts ingest                                  # discover harness logs
+gbrain transcripts ingest --max-bytes 4gb <store>          # oversized store (omit = per-format caps)
+gbrain transcripts status                                  # found vs imported gaps
+```
+
+`--max-bytes` note: the cap is part of the `--since last` checkpoint
+fingerprint — running with a different cap (or dropping it) starts a fresh
+watermark scope, so a capped run's skipped tail is never mistaken for
+already-scanned.
+
+Native-vs-manual delta to know: the native lane redacts SECRETS by FORMAT
+(vendor key prefixes, JWTs, cloud/API key shapes, `Bearer` headers,
+connection strings carrying inline passwords, PEM private keys, and
+high-entropy `KEY=`/`TOKEN=`/`PASSWORD=` assignments) plus your
+`~/.gbrain/harvest-private-patterns.txt` regexes and counts agent-directed
+imperatives into frontmatter, but broad PII detection (names, phones,
+addresses) remains YOUR review pass — the manual procedure's human scrub step
+still applies to sensitive corpora. Preview what will be scrubbed with
+`--dry-run` before a bulk `--all`. If a secret still reached a page, rotate
+it first, then remove the page immediately with
+`gbrain delete <slug> --purge` (local CLI only — no 72h tombstone); the
+brain-repo git history or a synced file may still hold it. Two more deltas: the
+native lane caps each message at ~4K characters in the page body (readable
+archive, not verbatim — the session file named in `source_uri` stays the
+verbatim record), and tool/thinking traffic appears only as one-line
+placeholders. Providers without a native adapter (e.g. Perplexity) keep
+using the manual conversion below.
 
 ## Where Conversations Live
 
@@ -114,9 +148,11 @@ Before writing each page, scan the transcript for secret-shaped strings and
 PII, and redact each match to a labeled placeholder (`[REDACTED_API_KEY]`,
 `[REDACTED_TOKEN]`, `[REDACTED_EMAIL]`):
 
-- OpenAI-style keys (`sk-…`), GitHub tokens (`ghp_…`), AWS access-key ids
-  (`AKIA…`), bearer/authorization tokens, and long high-entropy hex or base64
-  blobs.
+- Vendor-prefixed keys (`sk-…`, `ghp_…`, `AKIA…`/`ASIA…`, `AIza…`,
+  `sk_live_…`, `glpat-…`, `npm_…`, `hf_…`), format-only credentials with NO
+  prefix (JWTs `eyJ….eyJ….…`, account SIDs, connection strings with an inline
+  password), bearer/authorization tokens, PEM private-key blocks, and
+  `KEY=`/`TOKEN=`/`PASSWORD=` assignments whose value is high-entropy.
 - Personal data the transcript wasn't meant to publish: phone numbers, home
   addresses, government ids, private emails.
 
@@ -195,7 +231,8 @@ read — fix the converter and regenerate, don't hand-patch individual pages.
 # Preview: segmentation + counts, no DB writes
 gbrain extract-conversation-facts --types conversation --dry-run --limit 5
 
-# Real run, cost-capped; use --background for large archives
+# Real run (paid, cost-capped): only after the user agrees to the cap;
+# use --background for large archives
 gbrain extract-conversation-facts --types conversation --max-cost-usd 5
 ```
 
@@ -310,6 +347,15 @@ Evolution:
 - YYYY-MM-DD — <one-line development> (conversations/...)
 ```
 
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- `gbrain extract-conversation-facts` stops at its cost cap (exit 11): run the printed `resume_command`; it skips pages already done. Raise `--max-cost-usd` only after the user agrees.
+- Under an explicit cap it refuses with `no_pricing`: the user must agree to register the model price; the brain host's operator runs `gbrain pricing set <model> --input <usd-per-1M> --output <usd-per-1M>`.
+- `gbrain transcripts ingest` writes nothing: check the path the converter actually writes to before re-running; an empty import is silent, so verify page counts.
+- A "did we discuss X?" search is empty with a degraded notice: that is not proof it was never discussed; say the search was keyword-only.
+
 ## Anti-Patterns
 
 - ❌ Summarizing or paraphrasing transcripts on import — the page IS the
@@ -337,6 +383,13 @@ Evolution:
 
 ## Dedup (sharp boundaries)
 
+- **[chat-connectors](../chat-connectors/SKILL.md)** — the LIVE, account-connected
+  lane: connect a ChatGPT/Claude account and sync new conversations
+  automatically (cookie/OAuth, incremental watermark, scheduled). This skill owns
+  the EXPORT-FILE lane (a downloaded `conversations.json`) and ALL retrieval/
+  tracing. Route "connect my chatgpt / keep my conversations synced" there;
+  route "I downloaded my export" / "when did I first discuss X" here. Perplexity
+  (no live connector) uses this skill's manual conversion.
 - **[voice-note-ingest](../voice-note-ingest/SKILL.md)** — audio. Voice
   memos and audio messages route there (transcription + exact-phrasing
   filing). This skill handles text chat exports and session logs.
@@ -366,9 +419,12 @@ This skill guarantees:
   `conversations/<provider>/YYYY-MM-DD-<slug>.md` with `type: conversation`,
   a `date:` frontmatter field, and a verbatim transcript in a
   parser-recognized message format.
-- Every conversation is scanned for secret-shaped strings and PII before its
-  page is written; matches are redacted to labeled placeholders and counted in
-  the import receipt (untrusted-content convention).
+- Every conversation is scanned for secret-shaped strings (by wire format,
+  not just vendor prefix — JWTs, cloud/API key shapes, connection-string
+  credentials, high-entropy assignments) and PII before its page is written;
+  matches are redacted to labeled placeholders and counted in the import
+  receipt (untrusted-content convention). A page that still captured a
+  secret is removed immediately with `gbrain delete <slug> --purge`.
 - Colliding slugs (untitled/same-day threads) are disambiguated with a short
   stable thread hash and check-before-write, never overwritten.
 - Every import run validates a sample via `gbrain conversation-parser scan`

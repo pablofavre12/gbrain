@@ -12,9 +12,8 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { rehydrateJobDates } from '../src/commands/jobs.ts';
+import { surfaceSource } from './helpers/source-surface.ts';
 
 describe('rehydrateJobDates', () => {
   test('coerces wire-format ISO strings to Dates on all timestamp fields', () => {
@@ -27,6 +26,7 @@ describe('rehydrateJobDates', () => {
       started_at: '2026-07-21T04:02:12.001Z',
       finished_at: '2026-07-21T04:02:14.900Z',
       lock_until: '2026-07-21T04:03:12.001Z',
+      timeout_at: '2026-07-21T04:32:12.001Z',
       delay_until: null,
     };
     const job = rehydrateJobDates(wire);
@@ -35,6 +35,7 @@ describe('rehydrateJobDates', () => {
     expect(job.started_at).toBeInstanceOf(Date);
     expect(job.finished_at).toBeInstanceOf(Date);
     expect(job.lock_until).toBeInstanceOf(Date);
+    expect(job.timeout_at).toBeInstanceOf(Date);
     expect((job.started_at as unknown as Date).toISOString()).toBe('2026-07-21T04:02:12.001Z');
     // Date math used by formatJob's duration column works post-rehydration.
     expect((job.finished_at as unknown as Date).getTime() - (job.started_at as unknown as Date).getTime())
@@ -66,7 +67,7 @@ describe('rehydrateJobDates', () => {
 });
 
 describe('thin-client unpack sites route through rehydrateJobDates (source audit)', () => {
-  const src = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'jobs.ts'), 'utf8');
+  const src = surfaceSource('jobs');
 
   test('list branch rehydrates', () => {
     expect(src).toContain('unpackToolResult<MinionJob[]>(raw).map((j) => rehydrateJobDates(j))');

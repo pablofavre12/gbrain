@@ -37,6 +37,7 @@ PLACEHOLDERS=(
 # Skip if directory doesn't exist yet (early-clone state).
 if [ ! -d "$CORPUS_DIR" ]; then
   echo "OK: $CORPUS_DIR does not exist yet (skipping privacy scan)"
+  echo "GBRAIN_CHECK_SKIPPED: $CORPUS_DIR absent"
   exit 0
 fi
 
@@ -97,7 +98,7 @@ done < <(find "$CORPUS_DIR" -name '*.md' -type f 2>/dev/null)
 # scenario-privacy rule (no real deal shapes / timelines, even anonymized)
 # lives in evals/brainbench/README.md and is review-enforced.
 # ---------------------------------------------------------------------------
-# Env override exists for the negative-path test (test/eval-brainbench-e2e.test.ts)
+# Env override exists for the negative-path test (test/eval-brainbench-e2e.slow.test.ts)
 # — production callers never set it.
 BB_DIR="${BRAINBENCH_PRIVACY_DIR:-evals/brainbench}"
 if [ -d "$BB_DIR/fixtures" ]; then

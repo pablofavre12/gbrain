@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   buildClaudeHookCommand,
+  buildPortableClaudeHookCommand,
   claudeCommittedSettingsPath,
   claudeSettingsPath,
   registerClaudeMcp,
@@ -66,10 +67,13 @@ describe('host-specs [ENG-7]', () => {
     }
     expect(TARGETS[CLAUDE_CODE_SPEC_ID].status).toBe('verified');
     expect(TARGETS[CLAUDE_CODE_SPEC_ID].references.join(' ')).toContain('code.claude.com');
-    // Codex mcp-add shape is docs-derived, not live-host-verified.
-    expect(TARGETS[CODEX_SPEC_ID].status).toBe('provisional');
-    // The v1 "no TOML writer" decision is recorded where the format lives.
+    // Verified against codex-cli 0.147.0 (#4043: serde field scan) and
+    // 0.149.1 (#4574: inline bearer_token rejected at config load — the
+    // writer emits http_headers); the fired CX2-17 revisit is recorded
+    // where the format lives, and 'TOML' stays the load-bearing word.
+    expect(TARGETS[CODEX_SPEC_ID].status).toBe('verified');
     expect(TARGETS[CODEX_SPEC_ID].note).toContain('TOML');
+    expect(TARGETS[CODEX_SPEC_ID].note).toContain('http_headers');
   });
 });
 
@@ -170,18 +174,18 @@ describe('writeClaudeHooks [G5, CX2-17]', () => {
     expect(bak).toEqual({ permissions: { allow: ['X'] } });
   });
 
-  test('broken JSON: original backed up aside, loud note, clean file written', () => {
+  test('broken JSON: write ABORTS fail-closed, file untouched, fix named', () => {
+    // A parse-broken settings.local.json may carry permissions/allowlist
+    // entries gbrain cannot see — rewriting it (the old backup-and-start-clean
+    // behavior) silently dropped them from the live file. The write path now
+    // matches removeClaudeHooks: refuse, name the fix, change nothing.
     const dir = ws();
     mkdirSync(join(dir, '.claude'), { recursive: true });
-    writeFileSync(claudeSettingsPath(dir), '{ definitely broken json !!!');
-    const res = writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV });
-    expect(res.brokenBackupPath).not.toBeNull();
-    expect(existsSync(res.brokenBackupPath!)).toBe(true);
-    expect(readFileSync(res.brokenBackupPath!, 'utf8')).toContain('definitely broken');
-    expect(res.notes.join(' ')).toContain('not valid JSON');
-    // Fresh file is valid and carries our hooks.
-    const settings = readSettings(dir);
-    expect(markerEntries(settings, 'SessionStart')).toHaveLength(1);
+    const original = '{ definitely broken json !!!';
+    writeFileSync(claudeSettingsPath(dir), original);
+    expect(() => writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV })).toThrow(/not valid JSON.*re-run/s);
+    // Byte-identical after the refused write — nothing moved, nothing rewritten.
+    expect(readFileSync(claudeSettingsPath(dir), 'utf8')).toBe(original);
   });
 
   test('relative gbrainBin refused (GUI hosts inherit no PATH)', () => {
@@ -252,7 +256,7 @@ describe('removeClaudeHooks [G5]', () => {
 });
 
 describe('MCP registration argv builders [G1, CX-P1.4]', () => {
-  test('registerClaudeMcp: stdio shape with scope + source env; serve pinned to --surface full', () => {
+  test('registerClaudeMcp: stdio shape with scope + source env; serve pinned to --surface full (REGISTRATION_SURFACE)', () => {
     const cmds = registerClaudeMcp({ gbrainBin: BIN, scope: 'project', sourceId: 'workspace' });
     expect(cmds).toEqual([
       ['claude', 'mcp', 'add', 'gbrain', '--scope', 'project', '-e', 'GBRAIN_SOURCE=workspace', '--', BIN, 'serve', '--surface', 'full'],
@@ -269,7 +273,7 @@ describe('MCP registration argv builders [G1, CX-P1.4]', () => {
     ]);
   });
 
-  test('registerCodexMcp: --env shape, no scope flag; serve pinned to --surface full', () => {
+  test('registerCodexMcp: --env shape, no scope flag; serve pinned to --surface full (REGISTRATION_SURFACE)', () => {
     const cmds = registerCodexMcp({ gbrainBin: BIN, sourceId: 'workspace', gbrainHome: '/ws' });
     expect(cmds).toEqual([
       ['codex', 'mcp', 'add', 'gbrain', '--env', 'GBRAIN_SOURCE=workspace', '--env', 'GBRAIN_HOME=/ws', '--', BIN, 'serve', '--surface', 'full'],
@@ -291,6 +295,16 @@ describe('buildClaudeHookCommand', () => {
     expect(cmd).toBe(
       `env GBRAIN_SOURCE=plain-slug 'GBRAIN_HOME=/has space/dir' ${BIN} hook user-prompt`,
     );
+  });
+
+  test('local carrier: an omitted GBRAIN_SOURCE renders NO source pin (harness lane under a live PGLite serve)', () => {
+    const cmd = buildClaudeHookCommand(BIN, 'SessionStart', { GBRAIN_HOOK_LANE: 'harness' });
+    expect(cmd).toBe(`env GBRAIN_HOOK_LANE=harness ${BIN} hook session-start`);
+    expect(cmd).not.toContain('GBRAIN_SOURCE');
+  });
+
+  test('committed carrier: an omitted GBRAIN_SOURCE is refused — the portable command must stay source-scoped', () => {
+    expect(() => buildPortableClaudeHookCommand('SessionStart', {})).toThrow(/source-scoped/);
   });
 });
 

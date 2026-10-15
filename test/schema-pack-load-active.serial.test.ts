@@ -1,3 +1,4 @@
+import { loadActivePackForEngine } from '../src/core/schema-pack/load-active.ts';
 // v0.38 active-pack loader smoke tests (T-AP boundary helper).
 //
 // Covers: 7-tier resolution chain with config-driven inputs, tier-1
@@ -7,7 +8,6 @@
 import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
 import {
   loadActivePack,
-  loadActivePackForEngine,
   resolveActivePackNameOnly,
   __setPackLocatorForTests,
   _resetPackLocatorForTests,

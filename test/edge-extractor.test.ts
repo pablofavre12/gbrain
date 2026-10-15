@@ -36,6 +36,18 @@ class Foo {
     expect(syms.some((s) => s === 'go' || s === 'Foo::go')).toBe(true);
   });
 
+  test('N13-8: an untyped member call is flagged memberCall; bare and typed calls are not', async () => {
+    const src = `
+import { util } from './util';
+function join(a: string) { return a; }
+function f(xs: string[]) { join('a'); util.go(); return xs.join('/'); }
+`.trim();
+    const result = await chunkCodeTextFull(src, 'src/foo.ts');
+    const flagged = (sym: string) => result.edges.filter(e => e.toSymbol === sym).map(e => e.memberCall === true);
+    expect(flagged('join').sort()).toEqual([false, true]);
+    expect(flagged('./util::go')).toEqual([false]);
+  });
+
   test('all edges typed as calls', async () => {
     const src = 'function f() { return g(); }';
     const result = await chunkCodeTextFull(src, 'src/foo.ts');
@@ -173,6 +185,42 @@ fun caller(input: String): String {
     const src = 'fun f(): Int { return g() }\nfun g(): Int = 1';
     const result = await chunkCodeTextFull(src, 'src/Typed.kt');
     expect(result.edges.length).toBeGreaterThan(0);
+    for (const e of result.edges) expect(e.edgeType).toBe('calls');
+  });
+});
+
+describe('#3602 — C# invocation extraction', () => {
+  test('captures bare method invocations', async () => {
+    const src = `namespace Demo
+{
+    public class Svc
+    {
+        public int Helper() { return 1; }
+        public int Caller() { return Helper(); }
+    }
+}
+`;
+    const result = await chunkCodeTextFull(src, 'src/Svc.cs');
+    expect(result.edges.map(e => e.toSymbol)).toContain('Helper');
+  });
+
+  test('captures member-access invocations (obj.Method())', async () => {
+    const src = `namespace Demo
+{
+    public class Svc
+    {
+        public int Run(Other other) { return other.Compute(); }
+    }
+}
+`;
+    const result = await chunkCodeTextFull(src, 'src/Svc.cs');
+    expect(result.edges.map(e => e.toSymbol)).toContain('Compute');
+  });
+
+  test('all C# edges typed as calls', async () => {
+    const src = 'public class C { int F() { return G(); } int G() { return 1; } }';
+    const result = await chunkCodeTextFull(src, 'src/C.cs');
+    expect(result.edges.length).toBeGreaterThanOrEqual(1);
     for (const e of result.edges) expect(e.edgeType).toBe('calls');
   });
 });

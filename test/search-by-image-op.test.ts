@@ -1,3 +1,4 @@
+import { installFixtureChunks } from './helpers/page-projection.ts';
 // Commit 2 (Phase 2): search_by_image MCP op trust-boundary + spend cap.
 //
 // Covers:
@@ -198,4 +199,17 @@ describe('search_by_image op — D23-#6 spend cap', () => {
     );
     expect(Array.isArray(results)).toBe(true);
   });
+});
+
+
+test('image and text-refinement vector arms retain the authenticated page ACL', async()=>{
+  const page=await engine.putPage('notes/private-image',{type:'note',title:'Private image',compiled_truth:'PRIVATEIMAGEEVIDENCE',acl_subject_ids:['user:alice']});
+  await installFixtureChunks(engine,page.slug,[{chunk_index:0,chunk_text:page.compiled_truth,chunk_source:'compiled_truth',modality:'image'}]);
+  await engine.executeRaw('UPDATE content_chunks SET embedding_image=$2::vector WHERE page_id=$1',[page.id,JSON.stringify(Array.from({length:1024},()=>0.1))]);
+  const context=(subject:string)=>({engine,remote:true,sourceId:'default',auth:{token:'fixture',clientId:'image-acl',scopes:['read'],sourceId:'default',allowedSources:['default'],subjectIds:[subject]}} as any);
+  for(const query of [undefined,'refine image']) {
+    const input={image_data:PNG_BYTES.toString('base64'),...(query?{query}:{})};
+    expect(JSON.stringify(await op().handler(context('user:alice'),input))).toContain('PRIVATEIMAGEEVIDENCE');
+    expect(JSON.stringify(await op().handler(context('user:bob'),input))).not.toContain('PRIVATEIMAGEEVIDENCE');
+  }
 });

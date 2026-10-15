@@ -1,5 +1,6 @@
 /** Real-Postgres parity for page ACL and monotonic Platform document writes. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { sealPageTextProjection } from '../../src/core/page-state/projections.ts';
 import { DocumentVersionConflictError } from '../../src/core/engine.ts';
 import { hasDatabase, setupDB, teardownDB } from './helpers.ts';
 
@@ -39,6 +40,7 @@ describeE2E('page ACL + document fence — Postgres parity', () => {
     });
     await engine.addLink('documents/public-root', 'documents/postgres-report', '', 'references');
 
+    await sealPageTextProjection(engine, 'documents/postgres-report', 'default');
     expect(await engine.getPageById(saved.id, { aclSubjectIds: ['user:bob'] })).toBeNull();
     expect(await engine.getPageById(saved.id, { aclSubjectIds: ['user:alice'] })).not.toBeNull();
     expect(await engine.searchKeyword('postgres marker', { aclSubjectIds: ['user:bob'] })).toEqual([]);

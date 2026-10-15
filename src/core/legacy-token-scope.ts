@@ -1,11 +1,17 @@
+import { ALLOWED_SCOPES } from './scope.ts';
+import { NO_SOURCES } from './source-id.ts';
+
 /**
  * Derive a legacy bearer token's source scope from its stored
  * `access_tokens.permissions.source_id` grant.
  *
  * ARRAY = federated read grant, exposed through `allowedSources` with the
  * first granted source as the scalar write floor. STRING = scalar source.
- * Missing, empty, or garbage values fail closed to the historical `default`
- * floor and NEVER widen to all sources.
+ * An array with no usable source id is the explicit no-source grant
+ * (`auth rescope-token --sources none`): the `NO_SOURCES` sentinel with an
+ * empty `allowedSources`, which reads, writes and publication all refuse.
+ * Missing or non-array garbage values keep the historical `default` floor.
+ * Nothing here ever widens to all sources.
  */
 export function parseLegacyTokenScope(rawSource: unknown): { sourceId: string; allowedSources?: string[] } {
   if (Array.isArray(rawSource)) {
@@ -13,7 +19,7 @@ export function parseLegacyTokenScope(rawSource: unknown): { sourceId: string; a
     if (allowedSources.length > 0) {
       return { sourceId: allowedSources[0], allowedSources };
     }
-    return { sourceId: 'default' };
+    return { sourceId: NO_SOURCES, allowedSources: [] };
   }
   if (typeof rawSource === 'string' && rawSource.length > 0) {
     return { sourceId: rawSource };
@@ -38,6 +44,50 @@ export function parseLegacyTokenScope(rawSource: unknown): { sourceId: string; a
 export function parseTakesHoldersAllowList(raw: unknown): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   return (raw as unknown[]).filter((h): h is string => typeof h === 'string');
+}
+
+export function parseLegacyOperationGrant(raw: unknown): string[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw) || raw.some(value => typeof value !== 'string' || !/^[a-z][a-z0-9_]*$/.test(value))) return [];
+  return [...new Set(raw)];
+}
+
+/**
+ * Normalize a legacy token's `access_tokens.scopes TEXT[]` column value
+ * (#4043 least-privilege: the dormant original-schema column is THE scope
+ * store — a dedicated column is structurally immune to the whole
+ * permissions-object-replacement bug class).
+ *
+ * NULL / undefined → undefined: the caller grandfathers to the historical
+ * full-access grant, so every existing token (scopes was never written
+ * before this feature) behaves byte-identically. An ARRAY input is filtered
+ * to known scope names and returned AS IS — including `[]`: an explicit
+ * array that yields nothing is a deny (a typo'd scope fails closed at verify
+ * time; mint-time validation refuses unknown scopes loudly, so `[]` here
+ * means the row was set deliberately or is damaged — either way, deny).
+ *
+ * A STRING in the Postgres array-literal shape (`{read,write}` — some
+ * driver/pooler paths hand TEXT[] back undecoded) is parsed and filtered
+ * like an array. Any OTHER non-null value is representation drift on a row
+ * that WAS written — that must fail CLOSED (deny), never silently widen to
+ * the grandfather grant: only the never-written NULL earns full access.
+ *
+ * Named away from the one-char-apart `parseLegacyTokenScope` (SINGULAR —
+ * the source-isolation grant above) on purpose.
+ */
+export function normalizeTokenScopes(raw: unknown): string[] | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  const filterKnown = (items: unknown[]): string[] =>
+    items.filter(
+      (s): s is string => typeof s === 'string' && (ALLOWED_SCOPES as ReadonlySet<string>).has(s as never),
+    );
+  if (Array.isArray(raw)) return filterKnown(raw as unknown[]);
+  if (typeof raw === 'string' && /^\{.*\}$/.test(raw.trim())) {
+    const inner = raw.trim().slice(1, -1);
+    if (inner === '') return [];
+    return filterKnown(inner.split(',').map((s) => s.trim().replace(/^"|"$/g, '')));
+  }
+  return []; // damaged/drifted representation on a written row → deny
 }
 
 /**

@@ -5,16 +5,16 @@
 // orients before acting (the exact thing missing when chronology gets fumbled).
 // Pure composition of engine.getSince + engine.getOntology — no new SQL.
 import type { BrainEngine } from '../engine.ts';
-import type { ChronicleTimelineRow, OntologyValue } from '../types.ts';
+import type { ChronicleTimelineRow, OntologyValue, PageReadScope } from '../types.ts';
 
-export interface ChronicleContextOpts {
+export interface ChronicleContextOpts extends PageReadScope {
   /** Lookback window in days for the recent timeline (default 7). */
   days?: number;
   /** Entity slugs to resolve current ontology for (e.g. the people in the session). */
   entities?: string[];
   /** Cap on timeline rows (default 50). */
   limit?: number;
-  /** Untrusted caller → diary-sourced ontology is redacted. */
+  /** Untrusted caller → only world-visibility ontology, diary-sourced rows redacted. */
   remote?: boolean;
   sourceId?: string;
   sourceIds?: string[];
@@ -36,13 +36,15 @@ export async function loadChronicleContext(
 ): Promise<ChronicleContext> {
   const days = typeof opts.days === 'number' && opts.days > 0 ? opts.days : 7;
   const since = daysAgoIso(days);
-  const scope = { sourceId: opts.sourceId, sourceIds: opts.sourceIds };
+  const scope = { ...opts };
 
-  const recent_timeline = await engine.getSince(since, { ...scope, limit: opts.limit ?? 50 });
+  const recent_timeline = await engine.getSince(since, {
+    ...scope, excludePrivate: opts.excludePrivate, limit: opts.limit ?? 50,
+  });
 
   const ontologies: Record<string, OntologyValue[]> = {};
   for (const slug of opts.entities ?? []) {
-    let vals = await engine.getOntology(slug, scope);
+    let vals = await engine.getOntology(slug, { ...scope, excludePrivate: opts.excludePrivate, visibility: opts.remote ? ['world'] : undefined });
     if (opts.remote) vals = vals.filter((v) => !(v.source ?? '').startsWith('life/diary/'));
     if (vals.length) ontologies[slug] = vals;
   }
