@@ -334,6 +334,25 @@ async function assertStillSyncExcluded(tx: BrainEngine, row: WriteRequest, exclu
     `${excludedPath} was excluded from sync when the purge of ${row.slug} was prepared and is not any more, so nothing was purged. Run the purge again; it re-reads the exclusion.`, pageFix(row.source_id, row.slug));
 }
 
+/** Compare a round-tripped body using the same subtype and tag normalization as publication. */
+function isCanonicalPageNoop(content: string, row: WriteRequest, snapshot: PageSnapshot,
+  versionTags: string[] | undefined, activePack: ParseOpts['activePack']): boolean {
+  const incoming = parseMarkdown(content, row.slug, { activePack });
+  resolveParsedSubtype(incoming, snapshot.page);
+  const tags = versionTags ?? [...new Set([...snapshot.tags, ...incoming.tags])].sort();
+  return digest(canonical(snapshot.page, snapshot.tags)) === digest(canonical(incoming, tags));
+}
+
+/** Derive successful put receipts from the canonical page inside publication. */
+async function putPageReceipt(tx: BrainEngine, row: WriteRequest, page?: Page | null) {
+  if (row.operation !== 'put_page') return {};
+  const committed = page ?? await tx.getPage(row.slug, { sourceId: row.source_id });
+  if (!committed) throw new Error('Published page is missing from its transaction');
+  return { page_id: committed.id,
+    ...(committed.document_id ? { receipt: { document_id: committed.document_id,
+      version_sequence: committed.document_version_sequence, version_hash: committed.document_version_hash } } : {}) };
+}
+
 /** The `delete_page` preparation: soft delete, or purge with its journal sweep (#6511) run under the preparation budget. */
 async function prepareDeletePageMutation(engine: BrainEngine, row: WriteRequest, snapshot: PageSnapshot | null,
   options: { activePack?: ParseOpts['activePack']; clock?: ClaimPhaseClock; allowMissingFile?: boolean }): Promise<PreparedMutation> {
@@ -504,13 +523,10 @@ export async function preparePageMutation(unbounded: BrainEngine, row: WriteRequ
   // Detect an exact canonical no-op before ingestion can invoke any provider.
   // Revision/identity checks above still apply to stale identical replacements.
   if (!metadataChanged && snapshot && (snapshot.page.deleted_at != null) === targetDeleted && typeof content === 'string') {
-    const incoming = parseMarkdown(content,row.slug,{ activePack });
-    resolveParsedSubtype(incoming, snapshot.page);
-    const tags = versionTags ?? [...new Set([...snapshot.tags,...incoming.tags])].sort();
-    if (digest(canonical(snapshot.page,snapshot.tags)) === digest(canonical(incoming,tags))) {
+    if (isCanonicalPageNoop(content, row, snapshot, versionTags, activePack)) {
       const file=await prepareFileTarget(engine,row,snapshot,targetDeleted ? null : serializePageToMarkdown(snapshot.page,snapshot.tags),undefined,{ activePack, remote: row.authority.remote });
       return {observedRevision,noop:true,file,...await pageDatabaseOnlyPublication(engine,row,file),
-        apply:async()=>({...pageNoopAdvisories(row),status:'skipped',slug:row.slug,source_id:row.source_id,noop:true,chunks:0,chunk_skip_reason:'write_skipped',
+        apply:async tx=>({...pageNoopAdvisories(row),...await putPageReceipt(tx,row),status:'skipped',slug:row.slug,source_id:row.source_id,noop:true,chunks:0,chunk_skip_reason:'write_skipped',
           ...(row.operation==='capture'?{channel:'capture',content_hash:p.capture_hash}:{}),...fenceRepairOutcome})};
     }
   }
@@ -668,6 +684,7 @@ export async function preparePageMutation(unbounded: BrainEngine, row: WriteRequ
     const coreUsage = core?.usage();
     const gate = noop ? undefined : gateField(ready.result.gate, `p:${row.source_id}/${row.slug}`, null);
     return { ...advisories, ...(autoLinks ? {auto_links:autoLinks} : {}), ...(coreUsage ? { core: coreUsage } : {}),
+      ...await putPageReceipt(tx, row, publication.postimage?.page),
       ...(removedTimeline ? { timeline_rows_removed: timelineRowsRemovedAdvisory(row, removedTimeline) } : {}),
       status: noop ? 'skipped' : row.operation === 'restore_page' ? 'restored' : row.operation === 'revert_version' ? 'reverted' : 'created_or_updated',
       slug: row.slug, source_id: row.source_id, chunks: ready.result.chunks, noop,

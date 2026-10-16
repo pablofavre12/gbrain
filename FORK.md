@@ -29,6 +29,13 @@ or later. Validate the wrapper against the exact candidate before changing its p
 | Reader-specific temporal graph | Authorized assertions and transitions are filtered before deriving state, dates, counts and relationship notes |
 | Durable authored references | Revision- and source-incarnation-bound inventories preserve references independently of target visibility and resolution |
 
+Successful `put_page` publication returns `page_id`. A stored versioned document
+also returns `receipt: { document_id, version_sequence, version_hash }`, taken
+from the canonical page inside the publication transaction. An exact canonical
+no-op returns these fields too; ordinary pages omit `receipt`.
+
+**Say to your agent:** *"Save this document and show me the document version acknowledged by the brain."*
+
 Legacy bearer grants use live source membership on both HTTP transports. An archived
 federated source is excluded; an archived or missing primary source suspends the
 bound grant without rewriting its stored permissions. Unarchiving restores access

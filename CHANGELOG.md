@@ -10,6 +10,25 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.239.0] - 2026-10-15
+
+**Document ingestion receives a complete acknowledgment, including when a retry changes nothing.**
+
+A successful page write now returns its page identity. Versioned documents also return the stored document identity, sequence and hash, so an ingestion client can verify the version it saved. Repeating the same canonical content returns the same acknowledgment without creating another content change.
+
+### How to use it
+
+Continue sending the existing document version fence. Ordinary page replacements still require the current revision; stale revisions and conflicting document versions are refused.
+
+### To take advantage of v0.60.239.0
+
+Upgrade clients and servers to the same reviewed fork commit. No new database migration or model configuration is required for this receipt fix.
+
+### Itemized changes
+
+- Return `page_id` for successful `put_page` publications, including canonical no-ops.
+- Return the canonical document receipt when the stored page is versioned.
+
 ## [0.60.238.0] - 2026-10-15
 
 **The fork moves to the pinned upstream release while keeping each reader's private knowledge separate.**
