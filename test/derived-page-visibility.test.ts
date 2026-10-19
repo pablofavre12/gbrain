@@ -41,11 +41,18 @@ beforeAll(async () => {
     engines.push(pg.engine); closePostgres = pg.close;
   }
   for (const engine of engines) {
+    // A public derived fixture has a live origin; missing origins fail closed.
+    await engine.putPage('notes/world-origin', { type: 'note', title: 'World origin', compiled_truth: 'Public origin' });
     for (const [slug, type, body, frontmatter] of pages) {
       const result = await importFromContent(engine, slug, serializeMarkdown(frontmatter, body, '', { type, title: slug, tags: [] }),
         { noEmbed: true, forceRechunk: true });
       expect(result.status).toBe('imported');
     }
+    // Fixtures claiming public derivation need the stable input identity written by extractors.
+    await engine.executeRaw(`INSERT INTO derivation_inputs(derived_table,derived_id,input_table,input_id,source_id)
+      SELECT 'pages',a.id::text,'pages',p.id::text,'default' FROM pages a,pages p
+      WHERE a.source_id='default' AND p.source_id='default' AND p.slug='notes/world-origin'
+        AND a.slug IN ('atoms/world-origin','concepts/stamped-world')`);
   }
 }, 120_000);
 

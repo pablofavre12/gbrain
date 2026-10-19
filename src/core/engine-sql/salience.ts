@@ -1,3 +1,4 @@
+import { pageAclFragment } from './page-acl.ts';
 /**
  * Salience, anomaly detection and enrich candidates: one SQL implementation
  * for both engines (refactor wave 1, W1-core C10). The statement text is
@@ -148,7 +149,7 @@ export async function getRecentSalience(exec: LegacyUnscopedRead, opts: Salience
     const holderCondition = restricted ? sqlFragment`AND t.holder = ANY(${opts.takesHoldersAllowList!}::text[])` : sqlFragment``;
     // Scope is already bound above; use the shared live/privacy predicate
     // before ranking and LIMIT, including for holder-unrestricted callers.
-    const aclCondition = opts.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds}::text[])`;
+    const aclCondition = opts.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND ${pageAclFragment('p', opts.aclSubjectIds)}`;
     const readCondition = sqlFragment`${aclCondition} ${trustedSql(`AND ${pageReadFilter('p', { excludePrivate: opts.excludePrivate, minTrust: opts.minTrust, suppressFlagged: opts.suppressFlagged }, [], true)}`)}`;
     const rows = (await exec.run(sqlFragment`
       SELECT p.slug, p.source_id, p.title, p.type, p.updated_at, ${trustedSql(emotionalSql)} AS emotional_weight,
@@ -267,7 +268,7 @@ export async function findAnomalies(exec: LegacyUnscopedRead, opts: AnomaliesOpt
         : sqlFragment``;
 
     // Baseline keys, baseline counts and current counts must share visibility.
-    const aclCondition = opts.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds}::text[])`;
+    const aclCondition = opts.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND ${pageAclFragment('p', opts.aclSubjectIds)}`;
     const readCondition = sqlFragment`${aclCondition} ${trustedSql(`AND ${pageReadFilter('p', { excludePrivate: opts.excludePrivate, minTrust: opts.minTrust, suppressFlagged: opts.suppressFlagged }, [], true)}`)}`;
 
     // Tag cohort baseline with day densification + zero-fill (codex C4#6).

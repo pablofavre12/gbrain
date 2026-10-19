@@ -1,3 +1,4 @@
+import { pageAclFragment } from './page-acl.ts';
 /**
  * Timeline and Life Chronicle reads: one SQL implementation for both engines
  * (refactor wave 1, W1-extended). Statement text is PostgresEngine's master
@@ -91,8 +92,8 @@ export async function addTimelineEntriesBatch(exec: SqlExecutor, entries: Timeli
 
 
 function timelineAcl(opts?: PageReadScope) {
-  return opts?.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds}::text[])
-    AND (te.event_page_id IS NULL OR EXISTS (SELECT 1 FROM pages acl_event WHERE acl_event.id=te.event_page_id AND (acl_event.acl_subject_ids IS NULL OR acl_event.acl_subject_ids && ${opts.aclSubjectIds}::text[])))`;
+  return opts?.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND ${pageAclFragment('p', opts.aclSubjectIds)}
+    AND (te.event_page_id IS NULL OR EXISTS (SELECT 1 FROM pages acl_event WHERE acl_event.id=te.event_page_id AND ${pageAclFragment('acl_event', opts.aclSubjectIds)}))`;
 }
 
 export async function getTimeline(exec: LegacyUnscopedRead, slug: string, opts?: TimelineOpts): Promise<TimelineEntry[]> {

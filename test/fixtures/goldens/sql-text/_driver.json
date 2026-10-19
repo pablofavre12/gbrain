@@ -4678,7 +4678,7 @@
       "getCalibrationCurve": {
         "allFilters": [
           {
-            "paramCount": 9,
+            "paramCount": 7,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4689,7 +4689,7 @@
         ],
         "default": [
           {
-            "paramCount": 6,
+            "paramCount": 4,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4700,7 +4700,7 @@
         ],
         "sourceId": [
           {
-            "paramCount": 7,
+            "paramCount": 5,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4726,7 +4726,7 @@
       "getScorecard": {
         "allFilters": [
           {
-            "paramCount": 8,
+            "paramCount": 6,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4737,7 +4737,7 @@
         ],
         "default": [
           {
-            "paramCount": 2,
+            "paramCount": 0,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4748,7 +4748,7 @@
         ],
         "sourceId": [
           {
-            "paramCount": 3,
+            "paramCount": 1,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4811,7 +4811,7 @@
       "listTakes": {
         "default": [
           {
-            "paramCount": 22,
+            "paramCount": 20,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4822,7 +4822,7 @@
         ],
         "sourceId": [
           {
-            "paramCount": 23,
+            "paramCount": 21,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4833,7 +4833,7 @@
         ],
         "sourceIds+excludePrivate": [
           {
-            "paramCount": 23,
+            "paramCount": 21,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4894,7 +4894,7 @@
       "searchTakes": {
         "default": [
           {
-            "paramCount": 7,
+            "paramCount": 5,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4905,7 +4905,7 @@
         ],
         "sourceId": [
           {
-            "paramCount": 8,
+            "paramCount": 6,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4916,7 +4916,7 @@
         ],
         "sourceIds+excludePrivate": [
           {
-            "paramCount": 8,
+            "paramCount": 6,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4929,7 +4929,7 @@
       "searchTakesVector": {
         "default": [
           {
-            "paramCount": 7,
+            "paramCount": 5,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4940,7 +4940,7 @@
         ],
         "sourceId": [
           {
-            "paramCount": 8,
+            "paramCount": 6,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,
@@ -4951,7 +4951,7 @@
         ],
         "sourceIds+excludePrivate": [
           {
-            "paramCount": 8,
+            "paramCount": 6,
             "unsafeOptions": {
               "cancelFence": false,
               "prepare": true,

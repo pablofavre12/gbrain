@@ -1,3 +1,4 @@
+import { pageAclFilter } from './page-acl.ts';
 /**
  * Alias fan-out for `search` and `query`: when the query names an entity,
  * also search under every other name it goes by, so records filed under a
@@ -107,7 +108,7 @@ export async function resolveQueryEntities(engine: BrainEngine, query: string, s
     `SELECT slug, source_id, lower(title) AS t FROM pages
       WHERE lower(title) = ANY($1::text[]) AND source_id = ANY($2::text[]) AND type = ANY($3::text[]) AND deleted_at IS NULL
       ${scope.excludePrivate ? `AND ${privatePagesFilterFragment('pages')}` : ''}
-      AND ($4::text[] IS NULL OR acl_subject_ids IS NULL OR acl_subject_ids && $4::text[])`, [norms, sources, types, scope.aclSubjectIds ?? null]).catch(() => []);
+      AND ($4::text[] IS NULL OR ${pageAclFilter('pages', '$4')})`, [norms, sources, types, scope.aclSubjectIds ?? null]).catch(() => []);
   const caseRows = await engine.executeRaw<{ slug: string; alias_norm: string; alias_text: string | null }>(
     `SELECT slug, alias_norm, alias_text FROM page_aliases WHERE alias_norm = ANY($1::text[]) AND case_sensitive AND source_id = ANY($2::text[])`,
     [norms, sources]).catch(() => []);

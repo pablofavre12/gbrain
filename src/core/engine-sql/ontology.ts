@@ -1,3 +1,4 @@
+import { pageAclFragment } from './page-acl.ts';
 import type { OntologyReadOpts, OntologyValue, OntologyDimensionStat, OntologyConflict, PageReadScope } from '../types.ts';
 import { privateProvenanceFilterFragment } from '../search/private-visibility.ts';
 import type { LegacyUnscopedRead } from './brands.ts';
@@ -14,7 +15,7 @@ function policy(opts?: OntologyPolicy) {
   const acl = opts?.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND NOT EXISTS (
     SELECT 1 FROM pages acl_page WHERE acl_page.source_id=facts.source_id
       AND acl_page.slug IN (facts.entity_slug,facts.source_markdown_slug)
-      AND acl_page.acl_subject_ids IS NOT NULL AND NOT (acl_page.acl_subject_ids && ${opts.aclSubjectIds}::text[]))`;
+      AND NOT ${pageAclFragment('acl_page', opts.aclSubjectIds)})`;
   return sqlFragment`${scope} ${privacy} ${visibility} ${acl}`;
 }
 

@@ -1,3 +1,4 @@
+import { pageAclFilter } from './page-acl.ts';
 /**
  * The vector-search statement, built once for both engines, the doctor
  * `vector_plan` check and the plan-proof E2E so the SQL they run or EXPLAIN
@@ -289,7 +290,7 @@ export function buildVectorSearchStatement(input: VectorSearchStatementInput): V
   // candidate set before re-rank. Array form wins over scalar.
   if (opts?.sourceIds && opts.sourceIds.length > 0) filters.push(`AND p.source_id = ANY(${bind(opts.sourceIds)}::text[])`);
   else if (opts?.sourceId) filters.push(`AND p.source_id = ${bind(opts.sourceId)}`);
-  if (opts?.aclSubjectIds !== undefined) filters.push(`AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${bind(opts.aclSubjectIds)}::text[])`);
+  if (opts?.aclSubjectIds !== undefined) filters.push(`AND ${pageAclFilter('p', bind(opts.aclSubjectIds))}`);
   // The index walk applies chunk-level filters while it orders the index and page-level ones after the key joins.
   const chunkFilters = filters.filter(sql => sql.startsWith('AND cc.'));
   const pageFilters = filters.filter(sql => !sql.startsWith('AND cc.'));

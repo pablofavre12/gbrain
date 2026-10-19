@@ -1,3 +1,4 @@
+import { pageAclFilter } from './search/page-acl.ts';
 /**
  * Batched exact-key page snapshots for bulk walks (`gbrain extract --source db`).
  *
@@ -52,7 +53,7 @@ export async function readPageSnapshotsBatch(
         OVER (ORDER BY v.n ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS batch_prior_bytes
     FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS v(slug, source_id, n)
     LEFT JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id AND ($4::boolean OR p.deleted_at IS NULL)
-      AND ($5::text[] IS NULL OR p.acl_subject_ids IS NULL OR p.acl_subject_ids && $5::text[])
+      AND ($5::text[] IS NULL OR ${pageAclFilter('p', `$5`)})
       ${opts.excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : ''}
   ), chosen AS (
     SELECT w.batch_n, w.batch_slug, w.batch_source_id, p.* FROM wanted w LEFT JOIN pages p ON p.id = w.batch_page_id

@@ -1,3 +1,4 @@
+import { pageAclFragment } from './page-acl.ts';
 import { DocumentVersionConflictError } from '../engine.ts';
 /**
  * Pages: one SQL implementation for both engines (refactor wave 1,
@@ -459,7 +460,7 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       : sqlFragment`AND p.deleted_at IS NULL`;
     // #4352: untrusted-caller private-page filter (see PageFilters.excludePrivate).
     const aclCondition = filters?.aclSubjectIds !== undefined
-      ? sqlFragment`AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${filters.aclSubjectIds}::text[])`
+      ? sqlFragment`AND ${pageAclFragment('p', filters.aclSubjectIds)}`
       : sqlFragment``;
     const privateCondition = filters?.excludePrivate === true
       ? trustedSql(`AND ${privatePagesFilterFragment('p')}`)
@@ -938,7 +939,7 @@ export async function getVersions<B extends boolean = true>(
       ? sqlFragment`AND p.source_id = ANY(${opts.sourceIds}::text[])`
       : opts?.sourceId ? sqlFragment`AND p.source_id = ${opts.sourceId}` : sqlFragment``;
     const acl = opts?.aclSubjectIds === undefined ? sqlFragment``
-      : sqlFragment`AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds}::text[])`;
+      : sqlFragment`AND ${pageAclFragment('p', opts.aclSubjectIds)}`;
     const columns = opts?.includeBody === false ? PAGE_VERSION_METADATA_COLUMNS : PAGE_VERSION_COLUMNS;
     const limit = opts?.limit !== undefined ? sqlFragment`LIMIT ${opts.limit}` : sqlFragment``;
     const { rows } = await exec.run(sqlFragment`

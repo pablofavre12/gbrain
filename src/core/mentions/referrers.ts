@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 /**
  * Pages that link to an entity, one row per referring page: the entity card's
  * `referenced_by` groups and `get_backlinks {group: "page"}` both read this
@@ -110,7 +111,7 @@ function referrersCte(scope: ReferrerScope, params: unknown[]): string {
       SELECT t.id FROM pages t JOIN unnest($1::text[], $2::text[]) AS k(s, g) ON t.source_id = k.s AND t.slug = k.g
        WHERE t.deleted_at IS NULL${targetPriv}
          AND EXISTS (SELECT 1 FROM sources source WHERE source.id=t.source_id AND NOT source.archived)
-         AND ($6::text[] IS NULL OR t.acl_subject_ids IS NULL OR t.acl_subject_ids && $6::text[])
+         AND ($6::text[] IS NULL OR ${pageAclFilter('t', `$6`)})
     ),
     refs AS MATERIALIZED (
       SELECT DISTINCT l.from_page_id AS id FROM links l WHERE l.to_page_id IN (SELECT id FROM tgt)${linkPriv}
@@ -125,7 +126,7 @@ function referrersCte(scope: ReferrerScope, params: unknown[]): string {
          AND f.deleted_at IS NULL AND f.source_id = ANY($3::text[])
          AND EXISTS (SELECT 1 FROM sources source WHERE source.id=f.source_id AND NOT source.archived)
          AND f.id NOT IN (SELECT id FROM tgt)${pagePriv}${pageTrust}
-         AND ($6::text[] IS NULL OR f.acl_subject_ids IS NULL OR f.acl_subject_ids && $6::text[])
+         AND ($6::text[] IS NULL OR ${pageAclFilter('f', `$6`)})
     )`;
 }
 

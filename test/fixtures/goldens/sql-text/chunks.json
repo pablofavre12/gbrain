@@ -99,7 +99,7 @@
               "string"
             ],
             "sql": "SELECT count(*) AS total, max(cc.chunk_index) AS max_index FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = $2 AND (p.text_projection_revision = p.knowledge_revision) IS TRUE",
-            "textSha256": "0abf9cfaa682610078e55dc3a67bf5533ec9e20da56d67637036fb58d08af0b5"
+            "textSha256": "2076da59b39534690e34f2393bd01ea50c9294766031ded872880e3a69027179"
           },
           {
             "lane": "pool",
@@ -110,7 +110,7 @@
               "number"
             ],
             "sql": "SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.model, cc.token_count, cc.embedded_at, cc.language, cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line, cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality, cc.projected_byte_start, cc.projected_byte_end, (cc.\"embedding\" IS NULL) AS embedding_is_null FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = $2 AND (p.text_projection_revision = p.knowledge_revision) IS TRUE AND cc.chunk_index >= $3 AND cc.chunk_index < $4 ORDER BY cc.chunk_index",
-            "textSha256": "dcffdc693c90921c50f25acf3f875e4b9878429f7aa74318cdd369fb45719d55"
+            "textSha256": "34f1b41a99f8a9df579aae2557a5a175b022eb56016cf4ee50305872072b10f0"
           }
         ],
         "sourceIds+excludePrivate": [
@@ -127,7 +127,7 @@
               "array<string>"
             ],
             "sql": "SELECT count(*) AS total, max(cc.chunk_index) AS max_index FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = ANY($2::text[]) AND ((COALESCE(p.frontmatter->>'visibility', CASE WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(p.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN p.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = p.source_id AND derived_origin.slug = p.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = p.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN p.type = 'event' AND p.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = p.source_id AND chronicle_origin.slug = p.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = p.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') = 'array' THEN p.frontmatter->'derived_from' ELSE jsonb_build_array(p.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) AND (p.text_projection_revision = p.knowledge_revision) IS TRUE AND COALESCE(p.chunker_version, 0) >= 4",
-            "textSha256": "b5f4ce280ee064463e69c2f3b23f5b741de56a527aa89e167fb5b04cceefdd88"
+            "textSha256": "5bec9f39348d98beb073fb031a570f689b21e485f8d8c0168bb77c125cb58b16"
           },
           {
             "lane": "pool",
@@ -138,7 +138,7 @@
               "number"
             ],
             "sql": "SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.model, cc.token_count, cc.embedded_at, cc.language, cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line, cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality, cc.projected_byte_start, cc.projected_byte_end, (cc.\"embedding\" IS NULL) AS embedding_is_null FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = ANY($2::text[]) AND ((COALESCE(p.frontmatter->>'visibility', CASE WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(p.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN p.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = p.source_id AND derived_origin.slug = p.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = p.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN p.type = 'event' AND p.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = p.source_id AND chronicle_origin.slug = p.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = p.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') = 'array' THEN p.frontmatter->'derived_from' ELSE jsonb_build_array(p.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) AND (p.text_projection_revision = p.knowledge_revision) IS TRUE AND COALESCE(p.chunker_version, 0) >= 4 AND cc.chunk_index >= $3 AND cc.chunk_index < $4 ORDER BY cc.chunk_index",
-            "textSha256": "14cdb468082cbb9831a37defa61e7f7a81c6d49543ebdfb5e1c7381b80533fae"
+            "textSha256": "10dc0e1797b9975626a78fe18c03810795e91177fb60c2ab37f737fbe8576307"
           }
         ]
       },
@@ -194,7 +194,7 @@
               "string"
             ],
             "sql": "SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.model, cc.token_count, cc.embedded_at, cc.language, cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line, cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality, cc.projected_byte_start, cc.projected_byte_end, (cc.\"embedding\" IS NULL) AS embedding_is_null FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = $2 AND (p.text_projection_revision = p.knowledge_revision) IS TRUE ORDER BY cc.chunk_index",
-            "textSha256": "94709f3a02195549c0106c82675ae0af6be2833d93e9712a7add3fe56b74bff5"
+            "textSha256": "1e4ee67a77945a2b3afc9b7c80361c668512832441cc8c0fe7e2c808489373ac"
           }
         ],
         "excludePrivate": [
@@ -211,7 +211,7 @@
               "string"
             ],
             "sql": "SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.model, cc.token_count, cc.embedded_at, cc.language, cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line, cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality, cc.projected_byte_start, cc.projected_byte_end, (cc.\"embedding\" IS NULL) AS embedding_is_null FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = $2 AND ((COALESCE(p.frontmatter->>'visibility', CASE WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(p.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN p.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = p.source_id AND derived_origin.slug = p.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = p.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN p.type = 'event' AND p.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = p.source_id AND chronicle_origin.slug = p.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = p.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') = 'array' THEN p.frontmatter->'derived_from' ELSE jsonb_build_array(p.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) AND (p.text_projection_revision = p.knowledge_revision) IS TRUE AND COALESCE(p.chunker_version, 0) >= 4 ORDER BY cc.chunk_index",
-            "textSha256": "7098154f67dffe3614bf435c07d49e78e100acc3151affa5ac0c3a51a9d8f1c0"
+            "textSha256": "d25ac3e5720ce8ce9a291834aa226b70ccae122f7746d785e71005f4160059f5"
           }
         ],
         "includeEmbedding": [
@@ -228,7 +228,7 @@
               "string"
             ],
             "sql": "SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.model, cc.token_count, cc.embedded_at, cc.language, cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line, cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality, cc.projected_byte_start, cc.projected_byte_end, (cc.\"embedding\" IS NULL) AS embedding_is_null , cc.\"embedding\" AS embedding FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = $2 AND (p.text_projection_revision = p.knowledge_revision) IS TRUE ORDER BY cc.chunk_index",
-            "textSha256": "c8ea75144bb3990310c694412db9a9b97ce79f3e7c4240d1c64b983aa0f72558"
+            "textSha256": "784f6e5150d1fc1895803bb41b956d31c3b017000976895a6e7a6f3d7884147f"
           }
         ],
         "includeUnsealed": [
@@ -245,7 +245,7 @@
               "string"
             ],
             "sql": "SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.model, cc.token_count, cc.embedded_at, cc.language, cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line, cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality, cc.projected_byte_start, cc.projected_byte_end, (cc.\"embedding\" IS NULL) AS embedding_is_null FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = $2 ORDER BY cc.chunk_index",
-            "textSha256": "3b244b8bbfe87547ec4cfb5ddf6ac88555a7ce110bdf2c097fccf88db3636f99"
+            "textSha256": "cb0bad87a9dbb5181dba43b23061bf87e5df81834b7de84c3ae84f9ddd7fdeb0"
           }
         ],
         "requireSafeChunks": [
@@ -262,7 +262,7 @@
               "string"
             ],
             "sql": "SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.model, cc.token_count, cc.embedded_at, cc.language, cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line, cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality, cc.projected_byte_start, cc.projected_byte_end, (cc.\"embedding\" IS NULL) AS embedding_is_null FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = $2 AND (p.text_projection_revision = p.knowledge_revision) IS TRUE AND COALESCE(p.chunker_version, 0) >= 4 ORDER BY cc.chunk_index",
-            "textSha256": "58cfabcc2bc8d59f7729c9637a807ea6bbefee0c0f5f1eca3f971dfeceb10032"
+            "textSha256": "e5bef36e96d8dccdd605a9c71d521c45104e2b808aa6a6c4ba2c8a91cbc142b0"
           }
         ],
         "sourceIds": [
@@ -279,7 +279,7 @@
               "array<string>"
             ],
             "sql": "SELECT cc.id, cc.page_id, cc.chunk_index, cc.chunk_text, cc.chunk_source, cc.model, cc.token_count, cc.embedded_at, cc.language, cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line, cc.parent_symbol_path, cc.doc_comment, cc.symbol_name_qualified, cc.modality, cc.projected_byte_start, cc.projected_byte_end, (cc.\"embedding\" IS NULL) AS embedding_is_null FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 AND p.source_id = ANY($2::text[]) AND (p.text_projection_revision = p.knowledge_revision) IS TRUE ORDER BY cc.chunk_index",
-            "textSha256": "4e947132a232db58b8ca30892b573a982bb677e0cfa26552d6e286df8bdf3639"
+            "textSha256": "dbd31fbefd89d35f324673fdde6fe4c1244e1825276d186721104c449a3fbfaf"
           }
         ]
       },

@@ -1,3 +1,4 @@
+import { pageAclFilter } from './search/page-acl.ts';
 import * as ontologyImpl from './engine-sql/ontology.ts';
 import { applyTimelineBaseline } from './timeline-baseline.ts';
 import { assertPageContent } from './page-state/content-precondition.ts';
@@ -1488,9 +1489,9 @@ export class PGLiteEngine implements BrainEngine {
     if (opts?.aclSubjectIds !== undefined) {
       if (opts.aclSubjectIds.length > 0) {
         params.push(opts.aclSubjectIds);
-        extraFilter += ` AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+        extraFilter += ` AND ${pageAclFilter('p', `$${params.length}`)}`;
       } else {
-        extraFilter += ' AND p.acl_subject_ids IS NULL';
+        extraFilter += ` AND ${pageAclFilter('p', "ARRAY[]::text[]")}`;
       }
     }
 
@@ -1690,9 +1691,9 @@ export class PGLiteEngine implements BrainEngine {
     if (opts?.aclSubjectIds !== undefined) {
       if (opts.aclSubjectIds.length > 0) {
         params.push(opts.aclSubjectIds);
-        extraFilter += ` AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+        extraFilter += ` AND ${pageAclFilter('p', `$${params.length}`)}`;
       } else {
-        extraFilter += ' AND p.acl_subject_ids IS NULL';
+        extraFilter += ` AND ${pageAclFilter('p', "ARRAY[]::text[]")}`;
       }
     }
 
@@ -1828,14 +1829,14 @@ export class PGLiteEngine implements BrainEngine {
 
   getChunkWindows(requests: ChunkWindowRequest[], opts: ChunkWindowOpts): Promise<ChunkWindowPage[]> { return chunksImpl.getChunkWindows(scopedRead(this.engineSql), requests, opts); }
 
-  async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean }): Promise<Chunk[]> {
+  async getChunks(slug: string, opts?: { aclSubjectIds?: string[]; sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean }): Promise<Chunk[]> {
     const sourceIds = opts?.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
     const sourceId = opts?.sourceId ?? 'default';
     const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
     return chunksImpl.getChunks(scopedRead(this.engineSql), column, slug, { sourceIds, sourceId }, opts);
   }
 
-  async getChunkPage(slug: string, opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; fromIndex: number; limit: number }) {
+  async getChunkPage(slug: string, opts: { aclSubjectIds?: string[]; sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; fromIndex: number; limit: number }) {
     const sourceIds = opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
     const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
     return chunksImpl.getChunkPage(scopedRead(this.engineSql), column, slug, { sourceIds, sourceId: opts.sourceId ?? 'default' }, opts);
@@ -2271,7 +2272,7 @@ export class PGLiteEngine implements BrainEngine {
     const params: unknown[] = [slug];
     if (opts?.aclSubjectIds !== undefined) {
       params.push(opts.aclSubjectIds);
-      where.push(`(p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`);
+      where.push(`${pageAclFilter('p', `$${params.length}`)}`);
     }
     if (source) {
       params.push(source);

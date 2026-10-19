@@ -1,3 +1,4 @@
+import { pageAclFragment } from './page-acl.ts';
 import { pageEligibleSql } from '../eligibility/sql.ts';
 /**
  * Content chunks: one SQL implementation for both engines (refactor wave 1,
@@ -336,12 +337,13 @@ export async function upsertChunksOnce(
 function chunkReadWhere(
   slug: string,
   scope: { sourceIds?: string[]; sourceId: string },
-  opts?: { excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean },
+  opts?: { aclSubjectIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean },
 ): SqlFragment {
   const scopeSql = scope.sourceIds
     ? sqlFragment`p.source_id = ANY(${scope.sourceIds}::text[])`
     : sqlFragment`p.source_id = ${scope.sourceId}`;
   return sqlFragment`p.slug = ${slug} AND ${scopeSql}
+          ${opts?.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND ${pageAclFragment('p', opts.aclSubjectIds)}`}
           ${opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
           ${opts?.includeUnsealed ? sqlFragment`` : trustedSql(`AND ${currentTextProjectionFilter('p')}`)}
           ${requiresSafeChunks(opts) ? trustedSql(`AND ${safeChunksFilter('p')}`) : sqlFragment``}`;
@@ -352,7 +354,7 @@ export async function getChunks(
   column: string,
   slug: string,
   scope: { sourceIds?: string[]; sourceId: string },
-  opts?: { includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean; indexRange?: { from: number; to: number } },
+  opts?: { aclSubjectIds?: string[]; includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean; indexRange?: { from: number; to: number } },
 ): Promise<Chunk[]> {
       const colId = trustedSql(quoteIdentifier(column));
       const includeEmbedding = opts?.includeEmbedding === true;
@@ -398,7 +400,7 @@ export async function getChunkPage(
   column: string,
   slug: string,
   scope: { sourceIds?: string[]; sourceId: string },
-  opts: { fromIndex: number; limit: number; excludePrivate?: boolean; requireSafeChunks?: boolean },
+  opts: { aclSubjectIds?: string[]; fromIndex: number; limit: number; excludePrivate?: boolean; requireSafeChunks?: boolean },
 ): Promise<{ chunks: Chunk[]; total_chunks: number; max_chunk_index: number | null }> {
       const { rows } = await exec.run<{ total: number | string; max_index: number | null }>(sqlFragment`
         SELECT count(*) AS total, max(cc.chunk_index) AS max_index
@@ -954,7 +956,7 @@ export async function getChunkWindows(exec: ScopedRead, requests: ChunkWindowReq
     : opts.sourceId ? sqlFragment`AND p.source_id = ${opts.sourceId}` : sqlFragment``;
   const privateSql = opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``;
   const safeSql = requiresSafeChunks(opts) ? trustedSql(`AND ${safeChunksFilter('p')}`) : sqlFragment``;
-  const aclSql = opts.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds}::text[])`;
+  const aclSql = opts.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND ${pageAclFragment('p', opts.aclSubjectIds)}`;
   const eligibleSql = trustedSql(`AND ${pageEligibleSql('p', { floor: opts.minTrust, suppressFlagged: opts.suppressFlagged })}`);
   const { rows } = await exec.run(sqlFragment`
     WITH req AS (

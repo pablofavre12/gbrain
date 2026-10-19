@@ -1,3 +1,4 @@
+import { pageAclFragment } from './page-acl.ts';
 /**
  * Takes (typed/weighted/attributed claims), contradiction-probe runs + judge
  * cache, and synthesis evidence: one SQL implementation for both engines
@@ -304,7 +305,7 @@ export async function listTakes(exec: LegacyUnscopedRead, opts: TakesListOpts = 
       JOIN pages p ON p.id = t.page_id
       WHERE 1=1
         ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
-        AND (${opts.aclSubjectIds ?? null}::text[] IS NULL OR p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds ?? null}::text[])
+        AND ${opts.aclSubjectIds === undefined ? sqlFragment`TRUE` : pageAclFragment('p', opts.aclSubjectIds)}
         AND (${opts.page_id ?? null}::int   IS NULL OR t.page_id = ${opts.page_id ?? null}::int)
         AND (${opts.page_slug ?? null}::text IS NULL OR p.slug   = ${opts.page_slug ?? null}::text)
         AND (${opts.holder ?? null}::text   IS NULL OR t.holder  = ${opts.holder ?? null}::text)
@@ -345,7 +346,7 @@ export async function searchTakes(exec: LegacyUnscopedRead, query: string, opts:
       WHERE t.active
         AND ${query} <% t.claim
         ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
-        AND (${opts.aclSubjectIds ?? null}::text[] IS NULL OR p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds ?? null}::text[])
+        AND ${opts.aclSubjectIds === undefined ? sqlFragment`TRUE` : pageAclFragment('p', opts.aclSubjectIds)}
         AND (
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
@@ -381,7 +382,7 @@ export async function searchTakesVector(
       WHERE t.active
         AND t.embedding IS NOT NULL
         ${opts.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('p')}`) : sqlFragment``}
-        AND (${opts.aclSubjectIds ?? null}::text[] IS NULL OR p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds ?? null}::text[])
+        AND ${opts.aclSubjectIds === undefined ? sqlFragment`TRUE` : pageAclFragment('p', opts.aclSubjectIds)}
         AND (
           ${opts.takesHoldersAllowList ?? null}::text[] IS NULL
           OR t.holder = ANY(${opts.takesHoldersAllowList ?? null}::text[])
@@ -623,7 +624,7 @@ export async function getScorecard(exec: LegacyUnscopedRead, opts: TakesScorecar
       FROM takes
       WHERE 1=1 ${holderClause} ${domainClause} ${sinceClause} ${untilClause} ${allowed} ${sourceFilter}
         ${opts.excludePrivate ? trustedSql(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterFragment('p')})`) : sqlFragment``}
-        AND (${opts.aclSubjectIds ?? null}::text[] IS NULL OR EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds ?? null}::text[])))
+        AND ${opts.aclSubjectIds === undefined ? sqlFragment`TRUE` : sqlFragment`EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${pageAclFragment('p', opts.aclSubjectIds)})`}
     `)).rows;
     const r = rows[0] as { total_bets: number; resolved: number; correct: number; incorrect: number; partial: number; unresolvable_count: number; brier: number | null };
     return finalizeScorecard(r);
@@ -665,7 +666,7 @@ export async function getCalibrationCurve(exec: LegacyUnscopedRead, opts: Calibr
         WHERE resolved_quality IN ('correct','incorrect')
           ${holderClause} ${allowed} ${sourceFilter}
           ${opts.excludePrivate ? trustedSql(`AND EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${privatePagesFilterFragment('p')})`) : sqlFragment``}
-        AND (${opts.aclSubjectIds ?? null}::text[] IS NULL OR EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds ?? null}::text[])))
+        AND ${opts.aclSubjectIds === undefined ? sqlFragment`TRUE` : sqlFragment`EXISTS (SELECT 1 FROM pages p WHERE p.id = takes.page_id AND ${pageAclFragment('p', opts.aclSubjectIds)})`}
       )
       SELECT
         (bucket_idx::numeric * ${bucketSize}::numeric)::float       AS bucket_lo,

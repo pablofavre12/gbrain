@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 /**
  * Identity siblings: pages in one source whose titles name the same subject
  * under different prefixes ("Account sheet: Widget Co" and "CRM record:
@@ -81,7 +82,7 @@ export async function readIdentitySiblings(engine: BrainEngine, sourceId: string
       `SELECT slug, title, type, frontmatter->>'identity' AS identity FROM pages
         WHERE source_id = $1 AND deleted_at IS NULL AND type = ANY($2::text[])
           AND (lower(title) = $3 OR lower(title) LIKE $4)${privacy}
-          AND ($5::text[] IS NULL OR acl_subject_ids IS NULL OR acl_subject_ids && $5::text[])
+          AND ($5::text[] IS NULL OR ${pageAclFilter('pages', '$5')})
         ORDER BY slug LIMIT ${SIBLING_GROUP_CAP + 2}`,
       [sourceId, types, subject, like, opts.aclSubjectIds ?? null]);
     const members = rows.filter(r => normalizeAlias(titleName(r.title ?? '')) === subject);
@@ -111,7 +112,7 @@ export async function siblingCanonical(engine: BrainEngine, sourceId: string, sl
     const rows = await engine.executeRaw<{ slug: string; title: string | null; type: string | null; identity: unknown }>(
       `SELECT slug, title, type, frontmatter->>'identity' AS identity FROM pages
         WHERE source_id = $1 AND deleted_at IS NULL AND slug = ANY($2::text[])${opts.excludePrivate ? ` AND ${privatePagesFilterFragment('pages')}` : ''}
-          AND ($3::text[] IS NULL OR acl_subject_ids IS NULL OR acl_subject_ids && $3::text[])`,
+          AND ($3::text[] IS NULL OR ${pageAclFilter('pages', '$3')})`,
       [sourceId, unique,opts.aclSubjectIds ?? null]);
     if (rows.length !== unique.length) return null;
     const pack = await loadSourcePack(engine, sourceId);
@@ -131,7 +132,7 @@ export async function siblingCanonical(engine: BrainEngine, sourceId: string, sl
  */
 export async function factEntitySlugs(engine: BrainEngine, sourceId: string, slug: string, opts: { aclSubjectIds?: string[]; excludePrivate?: boolean } = {}): Promise<string[]> {
   const [page] = await engine.executeRaw<{ title: string | null }>(
-    'SELECT title FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL AND ($3::text[] IS NULL OR acl_subject_ids IS NULL OR acl_subject_ids && $3::text[])', [sourceId, slug,opts.aclSubjectIds ?? null]).catch(() => []);
+    `SELECT title FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL AND ($3::text[] IS NULL OR ${pageAclFilter('pages', '$3')})`, [sourceId, slug,opts.aclSubjectIds ?? null]).catch(() => []);
   if (!page) return [slug];
   const siblings = await readIdentitySiblings(engine, sourceId, { slug, title: page.title }, { excludePrivate: opts.excludePrivate ?? true, aclSubjectIds: opts.aclSubjectIds });
   const { slugify } = await import('../entities/resolve.ts');

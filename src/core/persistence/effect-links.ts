@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import type { PageReadScope } from '../types.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
@@ -109,7 +110,7 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
     // An ACL-denied destination is indistinguishable from an absent one, including skip reasons.
     const existing = targets.size ? await tx.executeRaw<{ slug: string; visible: boolean }>(`SELECT p.slug,(${privatePagesFilterFragment('p')}) AS visible
       FROM pages p WHERE p.source_id=$1 AND p.slug=ANY($2::text[]) AND p.deleted_at IS NULL
-        AND ($3::text[] IS NULL OR p.acl_subject_ids IS NULL OR p.acl_subject_ids && $3::text[])`, [sourceId, [...targets.keys()], aclSubjects]) : [];
+        AND ($3::text[] IS NULL OR ${pageAclFilter('p', `$3`)})`, [sourceId, [...targets.keys()], aclSubjects]) : [];
     const visible = new Map(existing.map(page => [page.slug, page.visible]));
     const granted = await targetGrant(tx, row.authority);
     const wanted = new Map<string, string>();
@@ -119,7 +120,7 @@ export async function runLinksEffect(engine: BrainEngine, effect: PersistenceEff
       else wanted.set(slug, context);
     }
     const owned = await tx.executeRaw<{ id: number; slug: string; acl_visible: boolean }>(`SELECT l.id,t.slug,
-      ($3::text[] IS NULL OR t.acl_subject_ids IS NULL OR t.acl_subject_ids && $3::text[]) AS acl_visible
+      ($3::text[] IS NULL OR ${pageAclFilter('t', `$3`)}) AS acl_visible
       FROM links l JOIN pages t ON t.id=l.to_page_id
       WHERE l.link_source=$1 AND l.origin_page_id=$2`, [REMOTE_MENTION_LINK_SOURCE, live.page.id, aclSubjects]);
     const obsolete = owned.filter(link => !wanted.has(link.slug));

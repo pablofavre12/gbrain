@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 import { submitPageMutation } from '../persistence/page-mutations.ts';
 import { MERGE_PRECONDITION_PARAMS, WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 /**
@@ -212,7 +213,7 @@ async function countMcpResolved(ctx: OperationContext): Promise<number> {
   const params: unknown[] = [];
   if (scope.aclSubjectIds !== undefined) {
     params.push(scope.aclSubjectIds);
-    where.push(`(p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`);
+    where.push(`${pageAclFilter('p', `$${params.length}`)}`);
   }
   if (scope.sourceIds && scope.sourceIds.length > 0) {
     params.push(scope.sourceIds);

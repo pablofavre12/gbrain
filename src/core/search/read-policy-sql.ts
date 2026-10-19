@@ -1,3 +1,4 @@
+import { pageAclFilter } from './page-acl.ts';
 import type { PageReadScope, PageReadPolicy } from '../types.ts';
 import { privatePagesFilterFragment } from './private-visibility.ts';
 import { quarantineFilterFragment } from '../quarantine.ts';
@@ -19,7 +20,7 @@ export function pageReadFilter(
   const clauses: string[] = [];
   if (scope?.aclSubjectIds !== undefined) {
     params.push(scope.aclSubjectIds);
-    clauses.push(`(${alias}.acl_subject_ids IS NULL OR ${alias}.acl_subject_ids && $${params.length}::text[])`);
+    clauses.push(pageAclFilter(alias, `$${params.length}`));
   }
   if (scope?.sourceIds?.length) {
     params.push(scope.sourceIds);

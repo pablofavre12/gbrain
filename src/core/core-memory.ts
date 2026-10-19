@@ -1,3 +1,4 @@
+import { pageAclFilter } from './search/page-acl.ts';
 /**
  * Always-loaded core memory tier.
  *
@@ -253,7 +254,7 @@ export async function listCorePages(exec: RawExec, opts: ListCorePagesOpts = {})
   }
   if (opts.aclSubjectIds !== undefined) {
     params.push(opts.aclSubjectIds);
-    where.push(`(p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`);
+    where.push(`${pageAclFilter('p', `$${params.length}`)}`);
   }
   if (opts.excludePrivate) where.push(privatePagesFilterFragment('p'));
   const policy = opts.eligibility;

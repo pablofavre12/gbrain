@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 import { fenceClaimHashes, overlayWithdrawalBody } from '../facts/withdrawal-overlay.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { ReadQuery } from '../search/read-enrichment.ts';
@@ -86,7 +87,7 @@ async function readSnapshotStatement(query: ReadQuery, slug: string, opts?: Page
   }
   if (opts?.aclSubjectIds !== undefined) {
     params.push(opts.aclSubjectIds);
-    filters.push(`(p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`);
+    filters.push(`${pageAclFilter('p', `$${params.length}`)}`);
   }
   if (!opts?.includeDeleted) filters.push('p.deleted_at IS NULL');
   if (opts?.excludePrivate) filters.push(privatePagesFilterFragment('p'));

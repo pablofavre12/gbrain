@@ -1,3 +1,4 @@
+import { pageAclFragment } from './page-acl.ts';
 /**
  * Hot-memory facts: one SQL implementation for both engines (refactor wave 1,
  * W1-core C11). Statement text is PostgresEngine's master text (SQL-text
@@ -58,7 +59,7 @@ function eligibilityClause(opts: FactListOpts | undefined) {
 
 function privacyClause(opts: { excludePrivate?: boolean; aclSubjectIds?: string[] } | undefined) {
   const privacy = opts?.excludePrivate ? sqlFragment` AND ${trustedSql(privateProvenanceFilterFragment('facts'))}` : sqlFragment``;
-  const acl = opts?.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment` AND NOT EXISTS (SELECT 1 FROM pages acl_page WHERE acl_page.source_id=facts.source_id AND acl_page.slug IN (facts.source_markdown_slug,facts.entity_slug) AND acl_page.acl_subject_ids IS NOT NULL AND NOT (acl_page.acl_subject_ids && ${opts.aclSubjectIds}::text[]))`;
+  const acl = opts?.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment` AND NOT EXISTS (SELECT 1 FROM pages acl_page WHERE acl_page.source_id=facts.source_id AND acl_page.slug IN (facts.source_markdown_slug,facts.entity_slug) AND NOT ${pageAclFragment('acl_page', opts.aclSubjectIds)})`;
   return sqlFragment`${privacy}${acl}`;
 }
 

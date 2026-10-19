@@ -1,3 +1,4 @@
+import { pageAclFragment } from './page-acl.ts';
 /**
  * Tags: one SQL implementation for both engines (refactor wave 1,
  * W1-extended). Statement text is PostgresEngine's master text (SQL-text
@@ -24,7 +25,7 @@ export async function getTags(
         ? sqlFragment`source_id = ANY(${opts.sourceIds}::text[])`
         : sqlFragment`source_id = ${opts?.sourceId ?? 'default'}`;
     const privacy = opts?.excludePrivate ? trustedSql(`AND ${privatePagesFilterFragment('pages')}`) : sqlFragment``;
-    const acl = opts?.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND (acl_subject_ids IS NULL OR acl_subject_ids && ${opts.aclSubjectIds}::text[])`;
+    const acl = opts?.aclSubjectIds === undefined ? sqlFragment`` : sqlFragment`AND ${pageAclFragment('pages', opts.aclSubjectIds)}`;
     const live = opts?.liveOnly ? sqlFragment`AND deleted_at IS NULL` : sqlFragment``;
     const { rows } = await exec.run<{ tag: string }>(sqlFragment`
       SELECT DISTINCT tag FROM tags

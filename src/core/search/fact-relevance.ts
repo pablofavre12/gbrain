@@ -1,3 +1,4 @@
+import { pageAclFilter } from './page-acl.ts';
 /**
  * Question relevance for saved facts, shared by recall's `question` ranking
  * (src/core/facts/question-recall.ts) and the temporal fact reserve
@@ -132,7 +133,7 @@ function poolPredicate(scope: FactPoolScope, filters: FactPoolFilters | undefine
   if (scope.aclSubjectIds !== undefined) clauses.push(`NOT EXISTS (
     SELECT 1 FROM pages acl_page WHERE acl_page.source_id=f.source_id
       AND acl_page.slug IN (f.entity_slug,f.source_markdown_slug)
-      AND acl_page.acl_subject_ids IS NOT NULL AND NOT (acl_page.acl_subject_ids && ${bind(scope.aclSubjectIds)}::text[]))`);
+      AND NOT ${pageAclFilter('acl_page', bind(scope.aclSubjectIds))})`);
   if (filters?.entities) {
     clauses.push(`(f.source_id, f.entity_slug) IN (SELECT * FROM unnest(${bind(filters.entities.map(e => e.sourceId))}::text[], ${bind(filters.entities.map(e => e.slug))}::text[]))`);
   }

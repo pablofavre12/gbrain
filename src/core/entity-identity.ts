@@ -1,3 +1,4 @@
+import { pageAclFilter } from './search/page-acl.ts';
 /**
  * #4224 — cross-source entity identity (federation v1).
  *
@@ -177,7 +178,7 @@ export async function listEntityIdentities(
   const allowedSources = opts.allowedSources?.length ? opts.allowedSources
     : opts.sourceId ? [opts.sourceId] : undefined;
   if (opts.excludePrivate) where.push(privatePagesFilterFragment('p'));
-  if (opts.aclSubjectIds !== undefined) { params.push(opts.aclSubjectIds); where.push(`(p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`); }
+  if (opts.aclSubjectIds !== undefined) { params.push(opts.aclSubjectIds); where.push(`${pageAclFilter('p', `$${params.length}`)}`); }
   if (opts.entityId) {
     params.push(validateEntityId(opts.entityId));
     where.push(`ei.entity_id = $${params.length}`);
@@ -202,7 +203,7 @@ export async function listEntityIdentities(
       seedScope += ` AND ei2.source_id IN (${ph.join(', ')})`;
     }
     if (opts.excludePrivate) seedScope += ` AND ${privatePagesFilterFragment('p2')}`;
-    if (opts.aclSubjectIds !== undefined) { params.push(opts.aclSubjectIds); seedScope += ` AND (p2.acl_subject_ids IS NULL OR p2.acl_subject_ids && $${params.length}::text[])`; }
+    if (opts.aclSubjectIds !== undefined) { params.push(opts.aclSubjectIds); seedScope += ` AND ${pageAclFilter('p2', `$${params.length}`)}`; }
     where.push(`ei.entity_id IN (
       SELECT ei2.entity_id FROM entity_identities ei2
       JOIN pages p2 ON p2.id = ei2.page_id AND p2.source_id = ei2.source_id

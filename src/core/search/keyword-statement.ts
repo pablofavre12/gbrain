@@ -1,3 +1,4 @@
+import { pageAclFilter } from './page-acl.ts';
 /**
  * Page-grain keyword statements for `search` (Cat 40 Hard F2): the strict
  * keyword match count (`keyword_total` on hybrid calls, `total` with
@@ -75,7 +76,7 @@ export function buildKeywordMatch(query: string, opts: SearchOpts | undefined): 
   if (opts?.beforeDate) filters += add(opts.beforeDate, n => `${dated} ${opts.beforeDateInclusive ? '<=' : '<'} ${n}::text::timestamptz`);
   if (opts?.sourceIds?.length) filters += add(opts.sourceIds, n => `p.source_id = ANY(${n}::text[])`);
   else if (opts?.sourceId) filters += add(opts.sourceId, n => `p.source_id = ${n}`);
-  if (opts?.aclSubjectIds !== undefined) filters += add(opts.aclSubjectIds, n => `(p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${n}::text[])`);
+  if (opts?.aclSubjectIds !== undefined) filters += add(opts.aclSubjectIds, n => `${pageAclFilter('p', n)}`);
   const hardExclude = buildHardExcludeClause('p.slug', resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes));
   const factor = buildSourceFactorCase('p.slug', opts?.source_boosts ?? resolveBoostMap(), opts?.detail);
   return {

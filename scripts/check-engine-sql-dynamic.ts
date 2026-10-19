@@ -51,6 +51,7 @@ const CONSTANT_ALLOWLIST: Record<string, string> = {
 };
 
 const VETTED_BUILDERS: Record<string, string> = {
+  pageAclFilter: 'src/core/search/page-acl.ts: constant ACL predicate over code-owned aliases and bound parameter expressions',
   pageReadFilter: 'src/core/search/read-policy-sql.ts: binds scope values as params, splices only the caller alias',
   buildRecencyComponentSql: 'src/core/search/sql-ranking.ts: inlines LIKE literals + numeric coefficients from the decay map, as master (planner behavior)',
   privatePagesFilterFragment: 'src/core/search/private-visibility.ts: constant visibility predicate over a caller alias',

@@ -60,6 +60,12 @@ async function seed(engine: BrainEngine, slug: string, type: string, frontmatter
   const result = await importFromContent(engine, slug, serializeMarkdown(frontmatter, body, '', { type: type as never, title: slug, tags: [] }),
     { noEmbed: true, forceRechunk: true });
   expect(['imported', 'skipped']).toContain(result.status);
+  // Model the stable input edge that canonical atom extraction records.
+  if (type === 'atom' && typeof frontmatter.source_slug === 'string') {
+    await engine.executeRaw(`INSERT INTO derivation_inputs(derived_table,derived_id,input_table,input_id,source_id)
+      SELECT 'pages',a.id::text,'pages',p.id::text,'default' FROM pages a,pages p
+      WHERE a.source_id='default' AND p.source_id='default' AND a.slug=$1 AND p.slug=$2 ON CONFLICT DO NOTHING`, [slug, frontmatter.source_slug]);
+  }
 }
 
 const visibilityOf = async (engine: BrainEngine, slug: string) =>
@@ -136,10 +142,11 @@ describe('#5525 concepts take the strictest visibility of their inputs', () => {
   test('one private and one world input make a private concept; two world inputs a world concept; tighten-only on re-synthesis', async () => {
     for (const engine of engines) {
       await reset(engine);
-      await seed(engine, 'atoms/a1', 'atom', { visibility: 'world', concepts: ['concepts/mixed', 'concepts/open'] });
+      await seed(engine, 'notes/public-input', 'note', {});
+      await seed(engine, 'atoms/a1', 'atom', { visibility: 'world', source_slug: 'notes/public-input', concepts: ['concepts/mixed', 'concepts/open'] });
       await seed(engine, 'atoms/a2', 'atom', { visibility: 'private', concepts: ['concepts/mixed'] });
-      await seed(engine, 'atoms/a3', 'atom', { visibility: 'world', concepts: ['concepts/open', 'concepts/later'] });
-      await seed(engine, 'atoms/a4', 'atom', { visibility: 'world', concepts: ['concepts/later'] });
+      await seed(engine, 'atoms/a3', 'atom', { visibility: 'world', source_slug: 'notes/public-input', concepts: ['concepts/open', 'concepts/later'] });
+      await seed(engine, 'atoms/a4', 'atom', { visibility: 'world', source_slug: 'notes/public-input', concepts: ['concepts/later'] });
       await runPhaseSynthesizeConcepts(engine, { _chat: stubChat as never, sourceId: 'default' });
       expect(await visibilityOf(engine, 'concepts/mixed')).toBe('private');
       expect(await visibilityOf(engine, 'concepts/open')).toBe('world');
@@ -231,8 +238,8 @@ describe('#5525 a later private flip of an origin page reaches derived atoms and
       await reset(engine);
       await seed(engine, 'notes/origin', 'note', {});
       await seed(engine, 'atoms/from-origin', 'atom', { visibility: 'world', source_slug: 'notes/origin', concepts: ['concepts/flip'] });
-      await seed(engine, 'atoms/other', 'atom', { visibility: 'world', source_slug: 'notes/other', concepts: ['concepts/flip'] });
       await seed(engine, 'notes/other', 'note', {});
+      await seed(engine, 'atoms/other', 'atom', { visibility: 'world', source_slug: 'notes/other', concepts: ['concepts/flip'] });
       await runPhaseSynthesizeConcepts(engine, { _chat: stubChat as never, sourceId: 'default' });
       expect(await visibilityOf(engine, 'concepts/flip')).toBe('world');
       expect(await remoteSees(engine, 'atoms/from-origin')).toBe(true);
@@ -268,8 +275,11 @@ describe('#5525 tighten-only visibility backfill', () => {
       await seed(engine, 'atoms/over-private', 'atom', { visibility: 'private', source_slug: 'notes/world', managed_extraction: true });
       await seed(engine, 'atoms/unstamped-private', 'atom', { source_slug: 'notes/private' });
       await seed(engine, 'concepts/orphan', 'concept', { synthesized_by: 'synthesize_concepts-v0.41', visibility: 'world' });
-      expect(await remoteSees(engine, 'atoms/leaked-transcript')).toBe(true);
-      expect(await remoteSees(engine, 'atoms/leaked-gone-origin')).toBe(true);
+      // Read-time provenance containment applies before the visibility repair.
+      expect(await visibilityOf(engine, 'atoms/leaked-transcript')).toBe('world');
+      expect(await visibilityOf(engine, 'atoms/leaked-gone-origin')).toBe('world');
+      expect(await remoteSees(engine, 'atoms/leaked-transcript')).toBe(false);
+      expect(await remoteSees(engine, 'atoms/leaked-gone-origin')).toBe(false);
       expect(await remoteSees(engine, 'atoms/unstamped-world')).toBe(false);
       expect((await derivedVisibilityCheck(engine)).details).toMatchObject({ unstamped_atoms: 2, looser_atoms: 2, count: 'exact' });
       await withEnv({ GBRAIN_HOME: home }, async () => {

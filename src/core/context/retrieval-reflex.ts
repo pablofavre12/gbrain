@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 /**
  * Retrieval Reflex — resolver core (issue #1981, Layer 1).
  *
@@ -77,7 +78,7 @@ async function weakTitleHits(engine: BrainEngine, sourceIds: string[], privacySq
     const rows = await engine.executeRaw<PageRow>(
       `SELECT p.slug, p.source_id, p.title, p.type, p.frontmatter, ${PREFIX_SQL} AS compiled_truth
          FROM pages p
-        WHERE p.deleted_at IS NULL ${privacySql} AND ($3::text[] IS NULL OR p.acl_subject_ids IS NULL OR p.acl_subject_ids && $3::text[])
+        WHERE p.deleted_at IS NULL ${privacySql} AND ($3::text[] IS NULL OR ${pageAclFilter('p', `$3`)})
           AND p.source_id = ANY($1::text[])
           AND lower(p.title) = ANY($2::text[])`,
       [sourceIds, norms, aclSubjectIds ?? null],
@@ -219,7 +220,7 @@ export interface PageRow {
   compiled_truth: string | null;
 }
 
-const aclSql = (slot: number) => `AND ($${slot}::text[] IS NULL OR p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${slot}::text[])`;
+const aclSql = (slot: number) => `AND ($${slot}::text[] IS NULL OR ${pageAclFilter('p', `$${slot}`)})`;
 
 /**
  * Resolve candidates to a pointer block. Returns null when nothing resolves

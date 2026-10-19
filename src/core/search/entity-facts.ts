@@ -1,3 +1,4 @@
+import { pageAclFilter } from './page-acl.ts';
 /**
  * Saved facts about the entity a search names. Facts saved with `remember`
  * live in the facts table, not in page chunks, so a search whose words differ
@@ -37,7 +38,7 @@ async function newestFacts(engine: BrainEngine, sourceId: string, slugs: string[
         AND ($4::text[] IS NULL OR NOT EXISTS (
           SELECT 1 FROM pages p WHERE p.source_id = f.source_id
           AND p.slug IN (f.entity_slug, f.source_markdown_slug)
-          AND p.acl_subject_ids IS NOT NULL AND NOT (p.acl_subject_ids && $4::text[])))
+          AND NOT ${pageAclFilter('p', '$4')}))
       ORDER BY f.valid_from DESC, f.id DESC
       LIMIT ${limit}`,
     [sourceId, slugs, [...AUDIT_ROW_SOURCES], aclSubjectIds ?? null]);

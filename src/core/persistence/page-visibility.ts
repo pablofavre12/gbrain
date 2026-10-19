@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 import { opError } from '../ops/contract.ts';
 import { REMOTE_PRIVATE_PAGES_KEY, privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { SqlEngine, WriteAuthority } from './model.ts';
@@ -14,7 +15,7 @@ export async function authorizePageVisibility(engine: SqlEngine, authority: Writ
   if (!authority.remote) return;
   const excludePrivate = (authority.excludePrivate ?? true) || await excludesPrivateWrites(engine, true);
   const rows = await engine.executeRaw(`SELECT 1 FROM pages WHERE source_id=$1 AND slug=$2
-    AND ((acl_subject_ids IS NOT NULL AND NOT (acl_subject_ids && $3::text[]))
+    AND (NOT ${pageAclFilter('pages', '$3')}
       OR ($4::boolean AND NOT (${privatePagesFilterFragment('pages')}))) LIMIT 1`,
     [authority.sourceId, slug, authority.aclSubjectIds ?? [], excludePrivate]);
   if (rows.length) throw pageNotVisibleError();

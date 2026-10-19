@@ -1,3 +1,4 @@
+import { pageAclFilter } from './search/page-acl.ts';
 import * as ontologyImpl from './engine-sql/ontology.ts';
 import { applyTimelineBaseline } from './timeline-baseline.ts';
 import { assertPageContent } from './page-state/content-precondition.ts';
@@ -1085,9 +1086,9 @@ export class PostgresEngine implements BrainEngine {
     if (opts?.aclSubjectIds !== undefined) {
       if (opts.aclSubjectIds.length > 0) {
         params.push(opts.aclSubjectIds);
-        aclClause = `AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+        aclClause = `AND ${pageAclFilter('p', `$${params.length}`)}`;
       } else {
-        aclClause = 'AND p.acl_subject_ids IS NULL';
+        aclClause = `AND ${pageAclFilter('p', "ARRAY[]::text[]")}`;
       }
     }
     params.push(innerLimit);
@@ -1313,9 +1314,9 @@ export class PostgresEngine implements BrainEngine {
     if (opts?.aclSubjectIds !== undefined) {
       if (opts.aclSubjectIds.length > 0) {
         params.push(opts.aclSubjectIds);
-        aclClause = `AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && $${params.length}::text[])`;
+        aclClause = `AND ${pageAclFilter('p', `$${params.length}`)}`;
       } else {
-        aclClause = 'AND p.acl_subject_ids IS NULL';
+        aclClause = `AND ${pageAclFilter('p', "ARRAY[]::text[]")}`;
       }
     }
     params.push(limit);
@@ -1582,14 +1583,14 @@ export class PostgresEngine implements BrainEngine {
     return this.withScopedReadTransaction(opts.sourceIds?.length ? opts.sourceIds : undefined, opts.sourceIds?.length ? undefined : opts.sourceId, tx => chunksImpl.getChunkWindows(scopedRead(this.engineSqlOn(tx)), requests, opts));
   }
 
-  async getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean }): Promise<Chunk[]> {
+  async getChunks(slug: string, opts?: { aclSubjectIds?: string[]; sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean; excludePrivate?: boolean; requireSafeChunks?: boolean; includeUnsealed?: boolean }): Promise<Chunk[]> {
     const sourceIds = opts?.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
     const sourceId = opts?.sourceId ?? 'default';
     const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
     return this.withScopedReadTransaction(sourceIds, sourceIds ? undefined : sourceId, tx => chunksImpl.getChunks(scopedRead(this.engineSqlOn(tx)), column, slug, { sourceIds, sourceId }, opts));
   }
 
-  async getChunkPage(slug: string, opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; fromIndex: number; limit: number }) {
+  async getChunkPage(slug: string, opts: { aclSubjectIds?: string[]; sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean; fromIndex: number; limit: number }) {
     const sourceIds = opts.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
     const sourceId = opts.sourceId ?? 'default';
     const column = (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name;
@@ -2016,7 +2017,7 @@ export class PostgresEngine implements BrainEngine {
     opts?: PageReadScope & { includeDeleted?: boolean },
   ): Promise<RawData[]> {
     const sql = this.sql;
-    const acl = opts?.aclSubjectIds === undefined ? sql`` : sql`AND (p.acl_subject_ids IS NULL OR p.acl_subject_ids && ${opts.aclSubjectIds}::text[])`;
+    const acl = opts?.aclSubjectIds === undefined ? sql`` : sql`AND EXISTS (SELECT 1 FROM (SELECT ${opts.aclSubjectIds}::text[] AS subjects) acl_reader WHERE ${sql.unsafe(pageAclFilter('p', 'acl_reader.subjects'))})`;
     const privacy = sql`${opts?.excludePrivate ? sql.unsafe(`AND ${privatePagesFilterFragment('p')}`) : sql``} ${acl}`;
     const alive = opts?.includeDeleted ? sql`` : sql`AND p.deleted_at IS NULL`; // raw_data follows the page soft-delete
     const sourceIds = opts?.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;

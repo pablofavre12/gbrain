@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 /**
  * `entity` with `names`: resolve a list of names, codes and aliases in one
  * call, the way a reader resolves the account codes and nicknames a batch of
@@ -66,7 +67,7 @@ async function lookupOne(engine: BrainEngine, sourceId: string, name: string, sc
   const bodies = new Map<string, string | null>([[row.slug, row.compiled_truth]]);
   if (siblingPages.length) {
     const sib = await engine.executeRaw<{ slug: string; source_id: string; compiled_truth: string | null }>(
-      `SELECT slug, source_id, ${boundedPrefixSql('compiled_truth')} AS compiled_truth FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL AND ($3::text[] IS NULL OR acl_subject_ids IS NULL OR acl_subject_ids && $3::text[])`,
+      `SELECT slug, source_id, ${boundedPrefixSql('compiled_truth')} AS compiled_truth FROM pages WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL AND ($3::text[] IS NULL OR ${pageAclFilter('pages', '$3')})`,
       [sourceId, siblingPages.map(p => p.slug),scope.aclSubjectIds ?? null]).catch(() => []);
     for (const s of await overlaidBoundedRows(engine, sib)) bodies.set(s.slug, s.compiled_truth);
   }

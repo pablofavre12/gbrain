@@ -1,3 +1,4 @@
+import { pageAclFilter } from '../search/page-acl.ts';
 import { listOpenLoops } from '../loops/loops-store.ts';
 /**
  * MEMORY_VERBS v1 — `entity(name)` card builder (zero LLM, p99 < 100ms).
@@ -288,7 +289,7 @@ export async function selectEntityCandidates(
           AND source_id = $1
           AND ( lower(title) = $2
              OR slug = ANY($3::text[])
-             OR slug LIKE $4 )${privatePredicate} AND ($5::text[] IS NULL OR acl_subject_ids IS NULL OR acl_subject_ids && $5::text[])`,
+             OR slug LIKE $4 )${privatePredicate} AND ($5::text[] IS NULL OR ${pageAclFilter('pages', '$5')})`,
       [sourceId, titleLc, exactSlugs, `%/${slug || trimmed}`, scope.aclSubjectIds ?? null],
     );
   } catch {
@@ -309,7 +310,7 @@ export async function selectEntityCandidates(
         `SELECT slug, source_id, title, type, frontmatter, ${boundedPrefixSql('compiled_truth')} AS compiled_truth, updated_at,
               GREATEST(last_retrieved_at, (SELECT r.last_retrieved_at FROM page_retrievals r WHERE r.page_id = pages.id)) AS last_retrieved_at
            FROM pages
-          WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])${privatePredicate} AND ($3::text[] IS NULL OR acl_subject_ids IS NULL OR acl_subject_ids && $3::text[])`,
+          WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])${privatePredicate} AND ($3::text[] IS NULL OR ${pageAclFilter('pages', '$3')})`,
         [sourceId, missing, scope.aclSubjectIds ?? null],
       );
       for (const r of extra) rowBySlug.set(r.slug, r);
@@ -518,7 +519,7 @@ async function assembleCard(
             AND expired_at IS NULL${remote ? ` AND visibility = 'world'` : ''}${excludePrivate ? ` AND ${privateProvenanceFilterFragment('facts')}` : ''}
             AND ($3::text[] IS NULL OR NOT EXISTS (SELECT 1 FROM pages acl_page
               WHERE acl_page.source_id=facts.source_id AND acl_page.slug IN (facts.source_markdown_slug,facts.entity_slug)
-              AND acl_page.acl_subject_ids IS NOT NULL AND NOT (acl_page.acl_subject_ids && $3::text[])))`,
+              AND NOT ${pageAclFilter('acl_page', '$3')}))`,
         [sourceId, factSlugs, aclSubjectIds ?? null],
       )
       .then(rs => Number(rs[0]?.n ?? 0))
