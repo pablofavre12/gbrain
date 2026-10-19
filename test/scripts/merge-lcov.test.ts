@@ -256,7 +256,7 @@ describe("merge: lane manifests", () => {
     expect(json.lanes.complete).toEqual([]);
   });
 
-  it("shard manifest with lcovCount != 1 → degraded (xargs-batching tripwire)", () => {
+  it("shard manifest with lcovCount != 1 → degraded (single report contract)", () => {
     const a = laneDir("man-two", LANE_A, { ...GOOD_MANIFEST, lcovCount: 2 });
     const out = outPaths("man-two");
     const res = runMerge(["--out-lcov", out.lcov, "--out-json", out.json, "--manifest-expect", "shard-1", a]);

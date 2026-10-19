@@ -83,7 +83,11 @@ describe("Cross-session recall test (PGLite)", () => {
   // `source` (the writer), not on the fact TEXT. Postgres parity in
   // test/e2e/facts-separation-postgres.test.ts.
   test('excludeAuditRows filters extraction audit checkpoint rows out of listFactsSince', async () => {
-    const before = new Date();
+    // Use the same clock and millisecond boundary as the Postgres fixture.
+    const [boundary] = await engine.executeRaw<{ stamp: Date | string }>(
+      "SELECT date_trunc('milliseconds', clock_timestamp()) AS stamp",
+    );
+    const before = boundary.stamp instanceof Date ? boundary.stamp : new Date(boundary.stamp);
     await engine.insertFact(
       {
         fact: 'EXTRACTION_COMPLETE',
@@ -135,7 +139,10 @@ describe("Cross-session recall test (PGLite)", () => {
   // substring/partial match was never at risk either way: `NOT IN` and
   // `source != ALL(...)` are both exact-match.)
   test('excludeAuditRows only excludes audit-SOURCED rows — a real fact whose exact text matches an audit marker string survives', async () => {
-    const before = new Date();
+    const [boundary] = await engine.executeRaw<{ stamp: Date | string }>(
+      "SELECT date_trunc('milliseconds', clock_timestamp()) AS stamp",
+    );
+    const before = boundary.stamp instanceof Date ? boundary.stamp : new Date(boundary.stamp);
     await engine.insertFact(
       {
         fact: 'EXTRACTION_COMPLETE',

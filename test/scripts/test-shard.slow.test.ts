@@ -238,20 +238,29 @@ describe('test-shard.sh — execution order contract', () => {
   // reached the shard process and cross-file pollution depended on the
   // runner's filesystem. Drive the real script with a fake partitioner
   // that reverses the sorted list, and the real Bun on tiny fixture files.
-  it('runs the shard files in the planned order', () => {
-    const { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('fs');
+  it.each([
+    { receipts: true, coverage: false },
+    { receipts: true, coverage: true },
+    { receipts: false, coverage: true },
+    { receipts: false, coverage: false },
+  ])('runs the shard files in the planned order (receipts=$receipts, coverage=$coverage)', ({ receipts, coverage }) => {
+    const { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('fs');
     const { tmpdir } = require('os');
     const { join } = require('path');
     const root = mkdtempSync(join(tmpdir(), 'gbrain-test-shard-order-'));
     try {
-      for (const dir of ['scripts/lib', 'test', 'evals', 'bin']) mkdirSync(join(root, dir), { recursive: true });
+      for (const dir of ['scripts/lib', 'src', 'test', 'evals', 'bin']) mkdirSync(join(root, dir), { recursive: true });
+      execFileSync('git', ['init', '-q', root]);
+      execFileSync('git', ['-C', root, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'fixture']);
       copyFileSync(SHARD_SH, join(root, 'scripts/test-shard.sh'));
       copyFileSync(resolve(REPO_ROOT, 'scripts/lib/test-env.sh'), join(root, 'scripts/lib/test-env.sh'));
+      writeFileSync(join(root, 'src/record.ts'),
+        `import { appendFileSync } from 'fs';\nexport function record(name: string) { appendFileSync(process.env.ORDER_LOG!, name + '\\n'); }\n`);
       const names = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'];
       for (const name of names) {
         writeFileSync(join(root, `test/${name}.test.ts`),
-          `import { test } from 'bun:test';\nimport { appendFileSync } from 'fs';\n` +
-          `test('${name}', () => { appendFileSync(process.env.ORDER_LOG!, '${name}\\n'); });\n`);
+          `import { test } from 'bun:test';\nimport { record } from '../src/record.ts';\n` +
+          `test('${name}', () => { record('${name}'); });\n`);
       }
       writeFileSync(join(root, 'bin/bun'), `#!/usr/bin/env bash
 set -eu
@@ -271,8 +280,8 @@ exec "$REAL_BUN" "$@"
         ORDER_LOG: join(root, 'order.log'),
         ARGV_LOG: join(root, 'argv.log'),
         GBRAIN_NO_SNAPSHOT: '1',
-        GBRAIN_TEST_RECEIPT_DIR: join(root, 'receipts'),
-        COVERAGE_DIR: '',
+        GBRAIN_TEST_RECEIPT_DIR: receipts ? join(root, 'receipts') : '',
+        COVERAGE_DIR: coverage ? join(root, 'coverage') : '',
       };
       const planned = execFileSync('bash', [join(root, 'scripts/test-shard.sh'), '--dry-run-list', '1', '1'], { cwd: root, encoding: 'utf-8', env })
         .split('\n').filter(Boolean);
@@ -281,19 +290,24 @@ exec "$REAL_BUN" "$@"
       const argv = readFileSync(join(root, 'argv.log'), 'utf-8').split('\n').filter((a: string) => a.endsWith('.test.ts'));
       expect(argv).toEqual(planned.map(f => `./${f}`));
       expect(readFileSync(join(root, 'order.log'), 'utf-8').split('\n').filter(Boolean)).toEqual([...names].reverse());
-      // Receipt mode forces the single-invocation xargs tripwire, and the
-      // receipt `.files` plus Bun's JUnit report keep the canonical bare
-      // names in planned order, so the ledger matches assigned to executed.
       const rawArgv = readFileSync(join(root, 'argv.log'), 'utf-8').split('\n');
-      expect(rawArgv.some((a: string) => a.startsWith('--reporter-outfile='))).toBe(true);
-      const receiptDir = join(root, 'receipts');
-      const id = 'unit--s1of1--primary';
-      expect(readFileSync(join(receiptDir, `${id}.files`), 'utf-8').split('\n').filter(Boolean)).toEqual(planned);
-      expect(readFileSync(join(receiptDir, `${id}.receipt`), 'utf-8')).toContain('exit=0');
-      const junit = readFileSync(join(receiptDir, `${id}.junit.xml`), 'utf-8');
-      const suites = [...junit.matchAll(/<testsuite name="([^"]+)"[^>]*file="([^"]+)"/g)].map(m => m[2]);
-      expect(suites).toEqual(planned);
-      expect([...junit.matchAll(/<testcase /g)]).toHaveLength(names.length);
+      expect(rawArgv.some((a: string) => a.startsWith('--reporter-outfile='))).toBe(receipts);
+      expect(rawArgv.includes('--coverage')).toBe(coverage);
+      if (receipts) {
+        // Both the assignment and the single report contain every file in order.
+        const receiptDir = join(root, 'receipts');
+        const id = 'unit--s1of1--primary';
+        expect(readFileSync(join(receiptDir, `${id}.files`), 'utf-8').split('\n').filter(Boolean)).toEqual(planned);
+        expect(readFileSync(join(receiptDir, `${id}.receipt`), 'utf-8')).toContain('exit=0');
+        const junit = readFileSync(join(receiptDir, `${id}.junit.xml`), 'utf-8');
+        const suites = [...junit.matchAll(/<testsuite name="([^"]+)"[^>]*file="([^"]+)"/g)].map(m => m[2]);
+        expect(suites).toEqual(planned);
+        expect([...junit.matchAll(/<testcase /g)]).toHaveLength(names.length);
+      }
+      if (coverage) {
+        expect(existsSync(join(root, 'coverage/shard/lcov.info'))).toBe(true);
+        expect(JSON.parse(readFileSync(join(root, 'coverage/lane-manifest.json'), 'utf-8'))).toMatchObject({ lcovCount: 1, complete: true });
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

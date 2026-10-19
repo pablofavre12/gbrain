@@ -44,6 +44,16 @@ async function handshake(mode: Mode, eager: boolean): Promise<{ initialize: stri
     SNAP_EAGER: eager ? '1' : '0', SNAP_SURFACE: mode.surface ?? '', SNAP_ACCESS: mode.access ?? '',
   });
   const proc = Bun.spawn([process.execPath, DRIVER], { cwd: parent, env, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' });
+  const started = Date.now();
+  let stderrBytes = 0;
+  let stderrTail = Buffer.alloc(0);
+  let readerError: unknown;
+  const stderrReader = (async () => {
+    for await (const chunk of proc.stderr) {
+      stderrBytes += chunk.byteLength;
+      stderrTail = Buffer.from(Buffer.concat([stderrTail, chunk]).subarray(-65_536));
+    }
+  })().catch(error => { readerError = error; });
   const responses = new Map<number, string>();
   const reader = (async () => {
     const decoder = new TextDecoder();
@@ -57,15 +67,18 @@ async function handshake(mode: Mode, eager: boolean): Promise<{ initialize: stri
         if (typeof msg.id === 'number') responses.set(msg.id, JSON.stringify(msg.result ?? msg.error));
       }
     }
-  })();
+  })().catch(error => { readerError = error; });
+  const diagnostic = (id: number) => `${mode.name}, ${eager ? 'eager' : 'manifest'}, response=${id}, elapsed=${Date.now() - started}ms, exit=${proc.exitCode}, stderrBytes=${stderrBytes}\n${stderrTail.toString('utf8')}`;
   const send = (msg: unknown) => { proc.stdin.write(JSON.stringify(msg) + '\n'); proc.stdin.flush(); };
   const waitFor = async (id: number) => {
     const deadline = Date.now() + 60_000;
     while (!responses.has(id)) {
-      if (proc.exitCode !== null) throw new Error(`driver exited ${proc.exitCode}: ${await new Response(proc.stderr).text()}`);
-      if (Date.now() > deadline) throw new Error(`no response ${id}`);
+      if (readerError) throw new Error(`driver stream failed: ${String(readerError)}; ${diagnostic(id)}`);
+      if (proc.exitCode !== null) throw new Error(`driver exited: ${diagnostic(id)}`);
+      if (Date.now() > deadline) throw new Error(`no response: ${diagnostic(id)}`);
       await Bun.sleep(10);
     }
+    if (readerError) throw new Error(`driver stream failed: ${String(readerError)}; ${diagnostic(id)}`);
     return responses.get(id)!;
   };
   try {
@@ -78,17 +91,24 @@ async function handshake(mode: Mode, eager: boolean): Promise<{ initialize: stri
   } finally {
     proc.kill('SIGKILL');
     await proc.exited;
-    await reader.catch(() => {});
+    await Promise.all([reader, stderrReader]);
+    if (readerError) throw new Error(`driver stream failed: ${String(readerError)}; ${diagnostic(2)}`);
   }
 }
 
 type Pair = { manifest: { initialize: string; tools: string }; eager: { initialize: string; tools: string } };
 let results: Pair[] = [];
 beforeAll(async () => {
-  results = await Promise.all(MODES.map(async mode => {
-    const [manifest, eager] = await Promise.all([handshake(mode, false), handshake(mode, true)]);
-    return { manifest, eager };
-  }));
+  results = [];
+  // Each pair compares the same real server paths. Twelve simultaneous cold
+  // PGLite boots can exhaust a small runner before any handshake responds.
+  for (const mode of MODES) {
+    const pair = await Promise.allSettled([handshake(mode, false), handshake(mode, true)]);
+    const [manifest, eager] = pair;
+    if (manifest.status === 'rejected') throw manifest.reason;
+    if (eager.status === 'rejected') throw eager.reason;
+    results.push({ manifest: manifest.value, eager: eager.value });
+  }
 }, 180_000);
 
 describe('stdio initialize + tools/list: manifest path == eager registry path', () => {

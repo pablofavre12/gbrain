@@ -33,10 +33,9 @@
  *     Duplicate lane identities, a SHA other than --sha (default HEAD),
  *     or an lcovCount unlike the files under that manifest also degrade.
  *     A manifest whose lane name contains 'shard' with lcovCount != 1
- *     marks degraded: the shard lane runs ONE bun process via xargs -x;
- *     a second bun process reusing the coverage dir would have OVERWRITTEN
- *     lcov.info, so any other count means the xargs-batching tripwire
- *     fired and line data was silently lost.
+ *     marks degraded: the shard lane runs ONE bun process with all paths.
+ *     This detects missing or extra files, not a report overwritten at
+ *     the same path; the runner itself must prevent batching.
  *   - JSON metrics count src/ files ONLY (test/, scripts/, node_modules
  *     records are kept in the merged out-lcov but excluded from
  *     totals/dirs/files). neverLoaded lists src/**\/*.ts files (non-test,
@@ -454,9 +453,8 @@ function main(): void {
     if (!Number.isInteger(m.lcovCount) || m.lcovCount! < 0 || m.lcovCount !== actualCount) {
       invalidate(`has lcovCount=${m.lcovCount ?? "missing"}, actual=${actualCount}`);
     }
-    // xargs-batching tripwire: a shard lane must have written EXACTLY ONE
-    // lcov.info (one bun process). Anything else means data was overwritten
-    // or never written.
+    // A shard lane must have written exactly one lcov.info. Counting files
+    // detects missing/extra reports, not overwrites at the same path.
     if (m.lane.includes("shard") && m.lcovCount !== 1) {
       warn(`shard lane '${m.lane}' has lcovCount=${m.lcovCount ?? "missing"} (expected 1) — marking degraded`);
       m.valid = false;

@@ -132,33 +132,23 @@ if [ "$SHARD_COUNT" -eq 0 ]; then
   exit 0
 fi
 
-# Convert newline-separated file list to argv. xargs handles the
-# whitespace correctly without word-splitting on spaces in paths.
-#
 # COVERAGE_DIR (opt-in): when set, run under bun's lcov coverage into
-# $COVERAGE_DIR/shard and write a lane manifest on success. xargs -x makes
-# an argv overflow FAIL LOUD instead of silently batching into a second bun
-# process — a second process reusing the same coverage dir OVERWRITES
-# lcov.info, silently losing the first batch's line data. BSD xargs only
-# accepts -x together with -n (GNU accepts both spellings), so we pass
-# -n 100000: far beyond any real shard's file count, it keeps everything in
-# ONE invocation while -x turns "args do not fit" into a hard error.
-# merge-lcov.ts's lcovCount!=1 manifest tripwire is the second line of
-# defense. When COVERAGE_DIR is empty/unset both arrays stay empty and the
-# exec line is byte-identical to the pre-coverage behavior.
+# $COVERAGE_DIR/shard and write a lane manifest on success. Pass every file
+# to one Bun process: batching would overwrite both lcov.info and JUnit.
+# A direct argv also fails on an OS argument-size limit instead of batching.
 COVERAGE_ARGS=()
-XARGS_FLAGS=()
 if [ -n "${COVERAGE_DIR:-}" ]; then
   COVERAGE_ARGS=(--coverage --coverage-reporter=lcov --coverage-dir="$COVERAGE_DIR/shard")
-  XARGS_FLAGS=(-n 100000 -x)
 fi
-# Receipts (X2): one JUnit report per bun process. A second xargs batch would
-# overwrite it the same way it overwrites lcov.info, so receipts also force
-# the single-invocation -x tripwire.
 shard_file_args=()
-while IFS= read -r f; do [ -n "$f" ] && shard_file_args+=("$f"); done <<< "$SHARD_FILES"
+shard_exec_args=()
+while IFS= read -r f; do
+  if [ -n "$f" ]; then
+    shard_file_args+=("$f")
+    shard_exec_args+=("./$f")
+  fi
+done <<< "$SHARD_FILES"
 receipt_begin primary "s${SHARD_INDEX}of${TOTAL_SHARDS}" "$SHARD_INDEX" "$TOTAL_SHARDS" "" "${shard_file_args[@]}"
-[ "${#RECEIPT_ARGS[@]}" -eq 0 ] || XARGS_FLAGS=(-n 100000 -x)
 # --max-concurrency mirrors the local runner: unbounded intra-process
 # concurrency under parallel PGLite boots produced real shard deaths (the
 # 22-minute matrix timeout in test.yml records 13 of them).
@@ -169,13 +159,13 @@ receipt_begin primary "s${SHARD_INDEX}of${TOTAL_SHARDS}" "$SHARD_INDEX" "$TOTAL_
 # order given. Bun still reports them as `test/x.test.ts`, so the log and
 # JUnit parsers see the same names.
 rc=0
-printf '%s\n' "$SHARD_FILES" | sed 's#^#./#' | xargs ${XARGS_FLAGS[@]+"${XARGS_FLAGS[@]}"} bun test --timeout=60000 --max-concurrency="${GBRAIN_TEST_MAX_CONCURRENCY:-4}" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} || rc=$?
+bun test --timeout=60000 --max-concurrency="${GBRAIN_TEST_MAX_CONCURRENCY:-4}" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} ${RECEIPT_ARGS[@]+"${RECEIPT_ARGS[@]}"} "${shard_exec_args[@]}" </dev/null || rc=$?
 receipt_end "$rc"
 
 # Lane manifest: written ONLY on a fully green run (complete:true means the
 # lcov data represents the whole shard). The real exit code is preserved
-# either way. lcovCount != 1 downstream (merge-lcov.ts) means the xargs -x
-# tripwire logic above was defeated somehow — merge marks the run degraded.
+# either way. An unexpected lcov file count marks the merge degraded;
+# it cannot detect an earlier report overwritten at the same path.
 if [ -n "${COVERAGE_DIR:-}" ] && [ "$rc" -eq 0 ]; then
   LCOV_COUNT=$(find "$COVERAGE_DIR" -name 'lcov.info' 2>/dev/null | grep -c '^' || true)
   printf '{"lane":"shard-%s","sha":"%s","lcovCount":%s,"complete":true}\n' \

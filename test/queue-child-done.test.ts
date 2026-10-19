@@ -793,6 +793,11 @@ describe('private queue recovery classification + lease hardening (lane A backfi
       queue: orphanQ, private_queue_owner_token: 'mix-token', private_queue_lease_ms: 1,
     });
     const legacyJob = await queue.add('legacy-private-waiting', {}, { queue: legacyQ });
+    // The mixed fixture needs an expired lease even when setup takes less than 1 ms.
+    await engine.executeRaw(
+      "UPDATE minion_jobs SET private_queue_lease_until = now() - interval '1 second' WHERE id = $1",
+      [orphanJob.id],
+    );
     await ageUpdatedAt([liveJob.id, orphanJob.id, legacyJob.id]);
 
     const result = await queue.reconcileOrphanedPrivateQueues();
