@@ -44,39 +44,24 @@ and prints it. In CI, each red job's step summary lists the failing tests with a
 
 ## CI runner capacity
 
-Repository-owned Linux validation jobs use ephemeral Ubicloud runners pinned to
-Ubuntu 24.04. The Ubicloud Managed Runners GitHub App must have access to this
-repository and active billing in its connected project; runner labels alone do
-not grant access. No Ubicloud API token is passed to workflow jobs.
+This fork uses GitHub-hosted Ubuntu 24.04 runners for Linux validation because
+it has no Ubicloud runners. Linux x64 jobs use `ubuntu-24.04`; native ARM64
+glibc and musl cells use `ubuntu-24.04-arm`. Both standard public-repository
+runners provide 4 vCPUs and 16 GB RAM. macOS, Windows, release publishing and
+the upstream-owned OSV reusable workflow retain their existing routing.
 
-| Workload | Runner | Capacity |
-| --- | --- | --- |
-| Unit shards, slow and eval jobs, BrainBench, admin browser, shared-skills compatibility, persistence soak, reconciliation crashes and read latency, native Linux cells, OpenClaw startup, JSONB parity, PR serial pool, E2E backend matrix, Tier 2, coverage reports and Semgrep | `ubicloud-standard-4-ubuntu-2404` | 4 vCPU, 16 GB RAM |
-| Nightly coverage serial pool, `verify`, PgBouncer/RLS deployment matrix | `ubicloud-standard-8-ubuntu-2404` | 8 vCPU, 32 GB RAM |
-| E2E Tier 1 (its CLI `init` spawns exceed their timeouts on 4 vCPUs), label-gated and nightly heavy-tests jobs | `ubicloud-standard-16-ubuntu-2404` | 16 vCPU, 64 GB RAM |
-| Label-gated heavy test suite | `ubicloud-standard-30-ubuntu-2404` | 30 vCPU, 120 GB RAM |
-| Native ARM64 glibc and musl tests | `ubicloud-standard-4-arm-ubuntu-2404` | 4 vCPU |
-| Selected E2E (one Bun process each), planning, status aggregation, dependency audit, gitleaks, security regressions and actionlint | `ubicloud-standard-2-ubuntu-2404` | 2 vCPU, 8 GB RAM |
+All jobs, matrices, services, assertions and timeouts remain in place. This
+routing change is not evidence of equivalent performance: upstream used
+8-vCPU runners for verify and pooled lanes, 16 for Tier 1 and several heavy
+jobs, and 30 for the heavy shell suite. In particular, upstream observed
+Tier 1 CLI initialization exceeding its deadlines on 4 vCPUs. Failures on the
+fork must be investigated against the actual job evidence; smaller runners
+do not justify skipped tests or raised thresholds.
 
-macOS and Windows matrices stay on GitHub-hosted runners. Release building and
-publishing also stay unchanged. The pinned upstream OSV reusable workflow does
-not expose a runner override, so its runner remains upstream-owned.
-
-Sizes come from measured CPU use, not guesses. Each Ubicloud project shares one
-vCPU quota between pull-request CI and agent `ci:ubicloud` VMs, so an oversized
-runner makes every other job wait, and an undersized one lengthens the PR
-critical path. A unit shard is one Bun process that averages 1.1-1.5 busy
-cores, yet on 2 vCPUs the unit shard mean rose from 542s to 608s on a full PR
-run and made Test the critical path, so unit shards stay on 4 vCPUs. On matched
-VMs a unit shard takes the same time on 4, 8 and 16 vCPUs; the serial pool and
-`verify` take the same time on 8 and 16 vCPUs (serial shard 2: 222s and 224s;
-277s on 4); the 2,500-write PGLite soak averages 1.3-1.8 busy cores and takes
-523s on 4 vCPUs and 500s on 16. Selected E2E workers run one file at a time and
-fit on 2 vCPUs. Re-measure with `scripts/ubicloud/ubi-runner.sh run -s standard-N`
-before resizing a runner: more CPU does not shorten a single-process job, and
-the decision rule is critical path first, vCPU-minutes second.
-`test/scripts/ci-runner-routing.test.ts` pins capacity and platform routing;
-`.github/actionlint.yaml` declares the exact custom runner labels.
+`test/scripts/ci-runner-routing.test.ts` pins the fork's routing and preserves
+native platform coverage. `.github/actionlint.yaml` needs no custom labels.
+The optional `ci:ubicloud` CLI remains available only for separately configured
+and authorized Ubicloud environments; Actions does not invoke it.
 
 ### Event parity
 
@@ -463,7 +448,8 @@ A sleeping machine kills the run with no signal, so teardown never runs: on Capy
 `ci:ubicloud` as a watched background operation. After any interrupted run, check
 `ubi-runner.sh list --mine` and reap leftovers with `down NAME` (or `gc HOURS`, own VMs only).
 
-The project quota is 512 vCPUs, shared with PR CI; a full gate takes 64, or 160 when it is free.
+Upstream's Ubicloud project quota is 512 vCPUs, shared with its PR CI; a full
+gate takes 64, or 160 when free. This fork's GitHub-hosted CI does not share it.
 In a multi-lane wave, lanes run `ci:ubicloud:diff` or targeted suites (`bun
 test <files>`, `--lanes`); only the integrator runs the full gate.
 
@@ -1278,8 +1264,8 @@ Line coverage is opt-in via `COVERAGE_DIR`: when set, the shell lanes
 pass `--coverage --coverage-reporter=lcov` to Bun; when unset, the exec line
 matches a non-coverage run. Every Bun process gets its own coverage
 directory (`$COVERAGE_DIR/shard`, `serial-$idx`, `e2e-$idx`) because a reused
-directory silently overwrites `lcov.info`; the shard runner pins xargs to one
-batch so an argv overflow fails loudly. Each coverage invocation atomically
+directory overwrites `lcov.info`. Shards pass all paths to one Bun process;
+argument overflow fails loudly. Each coverage invocation atomically
 creates its own `COVERAGE_DIR` and refuses an existing one, so a rerun needs a
 new path and cannot inherit another run's output. A green lane writes
 `$COVERAGE_DIR/lane-manifest.json` (`{lane, sha, lcovCount, complete}`); a red

@@ -1,5 +1,14 @@
 {
   "dependencies": {
+    ".github/workflows/e2e.yml": [
+      "test/snapshot-inputs-closure.test.ts"
+    ],
+    ".github/workflows/stress.yml": [
+      "test/snapshot-inputs-closure.test.ts"
+    ],
+    ".github/workflows/test.yml": [
+      "test/snapshot-inputs-closure.test.ts"
+    ],
     "test/**/*.serial.test.ts": [
       "test/scripts/serial-files.test.ts"
     ],

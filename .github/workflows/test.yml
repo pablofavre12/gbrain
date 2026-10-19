@@ -75,7 +75,7 @@ jobs:
   # cells) is covered by every push to master and the nightly Test schedule,
   # which both run scope=full.
   changes:
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -132,7 +132,7 @@ jobs:
   # Re-run checks for every event. Only dependencies and PGLite snapshots are cached.
   gitleaks:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -185,7 +185,7 @@ jobs:
 
   security-regressions:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
-    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubicloud-standard-2-ubuntu-2404' || matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -246,7 +246,7 @@ jobs:
   # expiring ignore entry needs Garry's approval.
   dependency-audit:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -308,8 +308,8 @@ jobs:
     # this into `test (1)` via `if: matrix.shard == 1`, which made shard 1
     # the slowest matrix worker). scripts/run-verify-parallel.sh fans out
     # the 20 checks via & + wait (~5s vs ~15-25s sequential).
-    # 8 vCPUs: measured 51s vs 48s on 16 and 58s on 4.
-    runs-on: ubicloud-standard-8-ubuntu-2404
+    # Standard fork runner; retain the upstream verify budgets.
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -333,7 +333,7 @@ jobs:
           path: |
             test/fixtures/pglite-snapshot.tar
             test/fixtures/pglite-snapshot.version
-          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/search/page-acl.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile
@@ -409,11 +409,8 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4]
-    # The pool is min(cpus, 4) processes: 8 vCPUs measured 222s for shard 2,
-    # the same as 16 (224s); 4 vCPUs took 277s. 4 vCPUs (C8): the shards
-    # finish in 2-3 minutes, far off the critical path, so the extra ~55s
-    # costs nothing while halving the lane's vCPU-minutes.
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    # The pool remains min(cpus, 4) processes on the standard fork runner.
+    runs-on: ubuntu-24.04
     # Keep the existing timeout headroom for memory-constrained runners,
     # bounded rescue attempts, and the machine-exclusive tail on shard 1.
     timeout-minutes: 25
@@ -443,7 +440,7 @@ jobs:
           path: |
             test/fixtures/pglite-snapshot.tar
             test/fixtures/pglite-snapshot.version
-          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/search/page-acl.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile
@@ -497,7 +494,7 @@ jobs:
     # the hard floor on shard-count scaling; a Phase-2 rewrite (spawn batching
     # + deleting the CI-gate-duplicated full-corpus test) cut it to ~72s
     # local, still far past the ~40s keep-in-matrix bar.
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -514,13 +511,13 @@ jobs:
           path: |
             test/fixtures/pglite-snapshot.tar
             test/fixtures/pglite-snapshot.version
-          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/search/page-acl.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
       - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
             test/fixtures/pglite-snapshot-default.tar
             test/fixtures/pglite-snapshot-default.version
-          key: pglite-snapshot-default-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
+          key: pglite-snapshot-default-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/search/page-acl.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile
@@ -576,7 +573,7 @@ jobs:
     # — a PR cannot rewrite the thing it's compared against. Exit 1 blocks the
     # merge until the regression is fixed or blessed (justification in the
     # updated baseline / fixture diff in corpus-bless mode).
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10  # ~15s hermetic run; matches the per-job-timeout hardening (#2254)
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -597,7 +594,7 @@ jobs:
           path: |
             test/fixtures/pglite-snapshot-default.tar
             test/fixtures/pglite-snapshot-default.version
-          key: pglite-snapshot-default-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
+          key: pglite-snapshot-default-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/search/page-acl.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile
@@ -619,7 +616,7 @@ jobs:
     # subdivisible without weakening the perf guarantee). Pulled out of the
     # matrix (see scripts/test-shard.sh) so a single 159s atom doesn't
     # dominate a shard's wallclock. Runs in parallel with the matrix.
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -636,7 +633,7 @@ jobs:
           path: |
             test/fixtures/pglite-snapshot.tar
             test/fixtures/pglite-snapshot.version
-          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/search/page-acl.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile
@@ -710,7 +707,7 @@ jobs:
     # 4 vCPUs: a shard is one bun process (1.1-1.5 busy cores on average), but
     # on 2 vCPUs the unit shard mean rose from 542s to 608s on PR #6013 and
     # made Test the PR critical path, so shards stay on 4.
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     # 22, not 15: under parallel PR load the PGLite WASM cold-starts stretch a
     # shard past 15 min while every test is still passing — the timeout then
     # cancels the job and the test-status gate reads it as a failure. 13 runs
@@ -737,15 +734,14 @@ jobs:
           path: |
             test/fixtures/pglite-snapshot.tar
             test/fixtures/pglite-snapshot.version
-          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/eligibility/sql.ts', 'src/core/engine-sql/fragment.ts', 'src/core/search/read-policy-sql.ts', 'src/core/search/page-acl.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts') }}
       - name: Install dependencies (bounded, retried once)
         timeout-minutes: 8
         run: bun scripts/ci-bun-install.ts --frozen-lockfile
       # Runner diagnostics (GBRA-79), before and after the shard: cores, load,
       # cumulative steal jiffies and the CPU model. A shard far above its
-      # predicted weight (test-shard.sh prints it) with high steal or a
-      # different model name is a slow or silently downgraded runner draw,
-      # not a test regression; the same shard at low steal is the tests.
+      # predicted weight (test-shard.sh prints it) needs both resource and
+      # failure evidence; CPU model variation alone does not classify a failure.
       - name: Runner diagnostics (before shard)
         shell: bash
         run: |
@@ -808,7 +804,7 @@ jobs:
   coverage-report:
     needs: [serial-tests, slow-entity-resolve-perf, slow-brainbench-e2e, test]
     if: ${{ always() && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base)) }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -910,7 +906,7 @@ jobs:
 
   admin-browser:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -958,7 +954,7 @@ jobs:
 
   shared-skills-compatibility:
     if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -992,7 +988,7 @@ jobs:
   executed-receipts:
     needs: [verify, serial-tests, slow-entity-resolve-perf, slow-brainbench-e2e, test, shared-skills-compatibility, persistence-validation]
     if: ${{ always() && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base)) }}
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -1048,7 +1044,7 @@ jobs:
     name: ${{ github.event_name == 'workflow_dispatch' && (inputs.native_only == true || inputs.race_hunt == true || inputs.stress_files != '' || inputs.stress_base != '') && 'full-suite-not-run' || 'test-status' }}
     needs: [gitleaks, security-regressions, dependency-audit, verify, serial-tests, slow-entity-resolve-perf, slow-brainbench-e2e, brainbench, test, native-locks, persistence-validation, admin-browser, shared-skills-compatibility, stress-changed-tests]
     if: ${{ always() && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base)) }}
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Aggregate result
@@ -1083,7 +1079,7 @@ jobs:
     name: Native-only result (full CI not run)
     if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.native_only == true }}
     needs: [native-locks]
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Record validation scope
